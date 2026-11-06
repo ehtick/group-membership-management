@@ -18,26 +18,63 @@ Sender Username
 .PARAMETER SenderPassword
 Sender Password
 
-.PARAMETER SyncCompletedCCEmailAddresses
-Comma separated list of email addresseses of secondary recipients to an email when the sync is complete, eg: abc@tenant.com, def@tenant.com
-
-.PARAMETER SyncDisabledCCEmailAddresses
-Comma separated list of email addresseses of secondary recipients to an email when the sync is disabled, eg: abc@tenant.com, def@tenant.com
-
 .PARAMETER SupportEmailAddresses
 Comma separated list of email addresseses of secondary recipients providing technical support, eg: abc@tenant.com, def@tenant.com
 
 .EXAMPLE
+
+$secureSenderUsername = ConvertTo-SecureString -AsPlainText -Force "<sender username>"
+$secureSecurePassword = ConvertTo-SecureString -AsPlainText -Force "<sender password>"
+$secureSupportEmailAddresses = ConvertTo-SecureString -AsPlainText -Force "<cc email addresses when sync is disabled>"
+
 Set-SenderRecipientCredentials	-SubscriptionName "<subscription name>" `
 								-SolutionAbbreviation "gmm" `
 								-EnvironmentAbbreviation "<env>" `
-								-SenderUsername "<sender username>" `
-								-SenderPassword "<sender password>" `
-								-SyncCompletedCCEmailAddresses "<cc email addresses when sync is completed>" `
-								-SyncDisabledCCEmailAddresses "<cc email addresses when sync is disabled>" `
-								-SupportEmailAddresses "<cc email addresses when sync is disabled>" `
+								-SecureSenderUsername $secureSenderUsername `
+								-SecureSenderPassword $secureSecurePassword `
+								-SecureSupportEmailAddresses $secureSupportEmailAddresses `
+								-GmmGraphAppHasMailApplicationPermissions $false `
 								-Verbose
+
 #>
+
+function Skip-SenderRecipientCredentials {
+	[CmdletBinding()]
+	param(
+		[Parameter(Mandatory=$True)]
+		[string] $SubscriptionName,
+		[Parameter(Mandatory=$True)]
+		[string] $SolutionAbbreviation,
+		[Parameter(Mandatory=$True)]
+		[string] $EnvironmentAbbreviation
+	)
+
+	$defaultValue = "not-set"
+	$defaultSecret = New-Object System.Security.SecureString
+	$defaultValue.ToCharArray() | ForEach-Object { $defaultSecret.AppendChar($_) }
+
+	Set-SenderRecipientCredentials `
+		-SubscriptionName $SubscriptionName `
+		-SolutionAbbreviation $SolutionAbbreviation `
+		-EnvironmentAbbreviation $EnvironmentAbbreviation `
+		-SecureSenderUsername $defaultSecret `
+		-SecureSenderPassword $defaultSecret `
+		-SecureSupportEmailAddresses $defaultValue `
+		-GmmGraphAppHasMailApplicationPermissions $false
+
+		$dataResourceGroupName = "$SolutionAbbreviation-data-$EnvironmentAbbreviation"
+		$appConfigName = "$SolutionAbbreviation-appConfig-$EnvironmentAbbreviation"
+		$appConfigObject = Get-AzAppConfigurationStore -ResourceGroupName $dataResourceGroupName -Name $appConfigName;
+
+		Set-AzAppConfigurationKeyValue -Endpoint $appConfigObject.Endpoint `
+										-Key "Mail:SkipMailNotifications" `
+										-Value "true" `
+										-ContentType "boolean" `
+										-Etag { tag1="Mail" }
+
+		Write-Host "Set Mail:SkipMailNotifications key with the value 'true'";
+}
+
 function Set-SenderRecipientCredentials {
 	[CmdletBinding()]
 	param(
@@ -48,15 +85,13 @@ function Set-SenderRecipientCredentials {
 		[Parameter(Mandatory=$True)]
 		[string] $EnvironmentAbbreviation,
         [Parameter(Mandatory=$True)]
-		[string] $SenderUsername,
+		[SecureString] $SecureSenderUsername,
 		[Parameter(Mandatory=$True)]
-		[string] $SenderPassword,
+		[SecureString] $SecureSenderPassword,
 		[Parameter(Mandatory=$False)]
-		[string] $SyncCompletedCCEmailAddresses,
+		[SecureString] $SecureSupportEmailAddresses,
 		[Parameter(Mandatory=$False)]
-		[string] $SyncDisabledCCEmailAddresses,
-		[Parameter(Mandatory=$False)]
-		[string] $SupportEmailAddresses,
+		[boolean] $GmmGraphAppHasMailApplicationPermissions,
 		[Parameter(Mandatory=$False)]
 		[string] $ErrorActionPreference = $Stop
 	)
@@ -68,7 +103,6 @@ function Set-SenderRecipientCredentials {
 	Add-AzAccountIfNeeded
 
 	Set-AzContext -SubscriptionName $SubscriptionName
-
 
 	. ($scriptsDirectory + '\Scripts\Install-AzModuleIfNeeded.ps1')
 	Install-AzModuleIfNeeded
@@ -85,47 +119,17 @@ function Set-SenderRecipientCredentials {
     Write-Verbose "Sender Username is $SenderUserName"
 
     $senderUsernameKeyVaultSecretName = "senderUsername"
-	$senderUsernameSecret = ConvertTo-SecureString -AsPlainText -Force  $SenderUserName
 	Set-AzKeyVaultSecret -VaultName $keyVault.VaultName `
 						 -Name $senderUsernameKeyVaultSecretName `
-						 -SecretValue $senderUsernameSecret
+						 -SecretValue $SecureSenderUsername
 	Write-Verbose "$senderUsernameKeyVaultSecretName added to vault..."
 
 	#region Store Sender Password secret in KeyVault
 	$senderPasswordKeyVaultSecretName = "senderPassword"
-	$senderPasswordSecret = ConvertTo-SecureString -AsPlainText -Force  $SenderPassword
 	Set-AzKeyVaultSecret -VaultName $keyVault.VaultName `
 						 -Name $senderPasswordKeyVaultSecretName `
-						 -SecretValue $senderPasswordSecret
+						 -SecretValue $SecureSenderPassword
 	Write-Verbose "$senderPasswordKeyVaultSecretName added to vault..."
-
-	if(!($SyncCompletedCCEmailAddresses))
-    {
-        $SyncCompletedCCEmailAddresses = "admin@$tenantName.onmicrosoft.com"
-    }
-
-	#region Store SyncCompletedCCEmailAddresses secret in KeyVault
-	$syncCompletedCCKeyVaultSecretName = "syncCompletedCCEmailAddresses"
-	$syncCompletedCCSecret = ConvertTo-SecureString -AsPlainText -Force  $SyncCompletedCCEmailAddresses
-	Set-AzKeyVaultSecret -VaultName $keyVault.VaultName `
-						 -Name $syncCompletedCCKeyVaultSecretName `
-						 -SecretValue $syncCompletedCCSecret
-	Write-Verbose "$syncCompletedCCKeyVaultSecretName added to vault..."
-
-	if(!($SyncDisabledCCEmailAddresses))
-    {
-        $SyncDisabledCCEmailAddresses = "admin@$tenantName.onmicrosoft.com"
-    }
-
-	#region Store SyncDisabledCCEmailAddresses secret in KeyVault
-	$syncDisabledCCKeyVaultSecretName = "syncDisabledCCEmailAddresses"
-	$syncDisabledCCSecret = ConvertTo-SecureString -AsPlainText -Force  $SyncDisabledCCEmailAddresses
-	Set-AzKeyVaultSecret -VaultName $keyVault.VaultName `
-						 -Name $syncDisabledCCKeyVaultSecretName `
-						 -SecretValue $syncDisabledCCSecret
-	Write-Verbose "$syncDisabledCCKeyVaultSecretName added to vault..."
-
-	#endregion
 
 	if(!($SupportEmailAddresses))
     {
@@ -134,12 +138,37 @@ function Set-SenderRecipientCredentials {
 
 	#region Store SupportEmailAddresses secret in KeyVault
 	$supportEmailAddressesSecretName = "supportEmailAddresses"
-	$supportEmailCCSecret = ConvertTo-SecureString -AsPlainText -Force  $SupportEmailAddresses
 	Set-AzKeyVaultSecret -VaultName $keyVault.VaultName `
 						 -Name $supportEmailAddressesSecretName `
-						 -SecretValue $supportEmailCCSecret
+						 -SecretValue $SecureSupportEmailAddresses
 	Write-Verbose "$supportEmailAddressesSecretName added to vault..."
 
 	#endregion
+
+	$dataResourceGroupName = "$SolutionAbbreviation-data-$EnvironmentAbbreviation"
+	$appConfigName = "$SolutionAbbreviation-appConfig-$EnvironmentAbbreviation"
+	$appConfigObject = Get-AzAppConfigurationStore -ResourceGroupName $dataResourceGroupName -Name $appConfigName;
+
+	#region If GMM Graph App has Application permission for Mail.Send, add app config value to indicate it
+	if($GmmGraphAppHasMailApplicationPermissions) {
+
+		Set-AzAppConfigurationKeyValue -Endpoint $appConfigObject.Endpoint `
+										-Key "Mail:IsMailApplicationPermissionGranted" `
+										-Value "true" `
+										-ContentType "boolean" `
+										-Etag { tag1="Mail" }
+
+		Write-Host "Updated Mail:IsMailApplicationPermissionGranted key with the value $isMailApplicationPermissionGranted";
+
+	}
+
+	Set-AzAppConfigurationKeyValue -Endpoint $appConfigObject.Endpoint `
+		-Key "Mail:SkipMailNotifications" `
+		-Value "false" `
+		-ContentType "boolean" `
+		-Etag { tag1="Mail" }
+
+	#endregion
+
 	Write-Verbose "Set-SenderRecipientCredentials completed."
 }

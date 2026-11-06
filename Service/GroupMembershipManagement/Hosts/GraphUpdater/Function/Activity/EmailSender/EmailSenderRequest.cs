@@ -1,15 +1,13 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using System;
+using Models.Notifications;
+using Services.Entities;
 
 namespace Hosts.GraphUpdater
 {
-    public class EmailSenderRequest
+    public class EmailSenderRequest : GraphUpdaterRequestBase
     {
-        public Guid RunId { get; set; }
-        public string ToEmail { get; set; }
-        public string ContentTemplate { get; set; }
+        public NotificationMessageType NotificationType { get; set; }
         public string[] AdditionalContentParams { get; set; }
-        public string CcEmail { get; set; }
     }
 }

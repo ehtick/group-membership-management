@@ -1,0 +1,100 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Microsoft.Extensions.Logging;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Repositories.Contracts.Helpers;
+using Repositories.Contracts.InjectConfig;
+using Models;
+using Models.AzureMaintenance;
+using Services.Contracts;
+
+namespace Hosts.AzureMaintenance
+{
+    public class OrchestratorFunction
+    {
+        private readonly IHandleInactiveJobsConfig _handleInactiveJobsConfig = null;
+        private readonly IAzureMaintenanceService _azureMaintenanceService = null;
+
+        public OrchestratorFunction(IHandleInactiveJobsConfig handleInactiveJobsConfig,
+            IAzureMaintenanceService azureMaintenanceService)
+        {
+            _handleInactiveJobsConfig = handleInactiveJobsConfig;
+            _azureMaintenanceService = azureMaintenanceService;
+        }
+
+        [Function(nameof(OrchestratorFunction))]
+        public async Task RunOrchestrator(
+            [OrchestrationTrigger] TaskOrchestrationContext context)
+        {
+            var logger = context.CreateReplaySafeLogger("AzureMaintenance.OrchestratorFunction");
+            var runId = context.NewGuid();
+
+            using (logger.BeginRunIdScope(runId))
+            {
+                logger.OrchestratorStarted(nameof(OrchestratorFunction), context.CurrentUtcDateTime);
+
+                await context.CallActivityAsync<int>(nameof(PurgeOldHistoryFunction), null);
+
+                if (_handleInactiveJobsConfig.HandleInactiveJobsEnabled)
+                {
+                    var inactiveSyncJobs = await context.CallActivityAsync<List<SyncJob>>(nameof(ReadSyncJobsFunction), null);
+                    var backUpJobs = await context.CallActivityAsync<List<PurgedSyncJob>>(nameof(BackUpInactiveJobsFunction), inactiveSyncJobs);
+
+                    if (inactiveSyncJobs != null && inactiveSyncJobs.Count > 0 && inactiveSyncJobs.Count == backUpJobs.Count)
+                    {
+                        await context.CallActivityAsync(nameof(RemoveInactiveJobsFunction), inactiveSyncJobs);
+
+                        // Pair each PurgedSyncJob with its original SyncJob (by TargetOfficeGroupId) so the email
+                        // sender can look up the original SyncJob.Id in SyncJobChanges (PurgedSyncJob.Id is a new
+                        // GUID and the SyncJobs row is already deleted at this point).
+                        var originalIdByGroupId = new Dictionary<System.Guid, System.Guid>();
+                        foreach (var original in inactiveSyncJobs)
+                        {
+                            originalIdByGroupId[original.TargetOfficeGroupId] = original.Id;
+                        }
+
+                        var processingTasks = new List<Task>();
+                        foreach (var backUpJob in backUpJobs)
+                        {
+                            originalIdByGroupId.TryGetValue(backUpJob.TargetOfficeGroupId, out var originalId);
+                            var processTask = context.CallActivityAsync(nameof(PurgingEmailSenderFunction), new PurgingEmailSenderRequest
+                            {
+                                RunId = runId,
+                                SyncJob = backUpJob,
+                                NotificationType = Models.Notifications.NotificationMessageType.InactiveSyncJobNotification,
+                                OriginalSyncJobId = originalId
+                            });
+                            processingTasks.Add(processTask);
+                        }
+                        await Task.WhenAll(processingTasks);
+                    }
+
+                    var jobsApproachingDeletion = await context.CallActivityAsync<List<SyncJob>>(nameof(GetWarningJobs), null);
+                    if (jobsApproachingDeletion != null && jobsApproachingDeletion.Count > 0)
+                    {
+                        var warningEmailTasks = new List<Task>();
+                        foreach (var jobApproachingDeletion in jobsApproachingDeletion)
+                        {
+                            var warningTask = context.CallActivityAsync(nameof(WarningEmailSenderFunction), new WarningEmailSenderRequest
+                            {
+                                RunId = runId,
+                                SyncJob = jobApproachingDeletion,
+                                NotificationType = Models.Notifications.NotificationMessageType.JobPurgingWarningNotification
+                            });
+                            warningEmailTasks.Add(warningTask);
+                        }
+                        await Task.WhenAll(warningEmailTasks);
+                    }
+
+                    await context.CallActivityAsync<int>(nameof(RemoveBackUpsFunction), null);
+                }
+
+                logger.OrchestratorCompleted(nameof(OrchestratorFunction), context.CurrentUtcDateTime);
+            }
+        }
+    }
+}

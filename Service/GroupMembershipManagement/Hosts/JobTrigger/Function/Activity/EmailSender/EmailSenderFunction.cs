@@ -1,10 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
+using JobTrigger.Activity.EmailSender;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
-using Repositories.Contracts;
+using Models;
+using Repositories.Contracts.Helpers;
 using Services.Contracts;
 using System;
 using System.Threading.Tasks;
@@ -13,22 +13,24 @@ namespace Hosts.JobTrigger
 {
     public class EmailSenderFunction
     {
-        private readonly ILoggingRepository _loggingRepository = null;
-        private readonly IJobTriggerService _jobTriggerService = null;
-        public EmailSenderFunction(ILoggingRepository loggingRepository, IJobTriggerService jobTriggerService)
+        private readonly ILogger<EmailSenderFunction> _logger;
+        private readonly IJobTriggerService _jobTriggerService;
+
+        public EmailSenderFunction(ILogger<EmailSenderFunction> logger, IJobTriggerService jobTriggerService)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
-            _jobTriggerService = jobTriggerService ?? throw new ArgumentNullException(nameof(jobTriggerService)); ;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _jobTriggerService = jobTriggerService ?? throw new ArgumentNullException(nameof(jobTriggerService));
         }
 
-        [FunctionName(nameof(EmailSenderFunction))]
-        public async Task SendEmail([ActivityTrigger] SyncJobGroup group, ILogger log)
+        [Function(nameof(EmailSenderFunction))]
+        public async Task SendEmailAsync([ActivityTrigger] EmailSenderRequest request)
         {
-            if (group != null)
+            var job = request.SyncJob;
+            using (_logger.BeginSyncJobScope(job))
             {
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(EmailSenderFunction)} function started", RunId = group.SyncJob.RunId });
-                await _jobTriggerService.SendEmailAsync(group.SyncJob, group.Name);
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(EmailSenderFunction)} function completed", RunId = group.SyncJob.RunId });
+                _logger.FunctionStarted(nameof(EmailSenderFunction));
+                await _jobTriggerService.SendEmailAsync(job, request.NotificationType, request.AdditionalContentParams);
+                _logger.FunctionCompleted(nameof(EmailSenderFunction));
             }
         }
     }

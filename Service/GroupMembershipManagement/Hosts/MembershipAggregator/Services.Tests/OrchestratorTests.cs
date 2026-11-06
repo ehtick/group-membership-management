@@ -1,0 +1,730 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Azure.Messaging.ServiceBus;
+using DIConcreteTypes;
+using Hosts.MembershipAggregator;
+using MembershipAggregator.Services.Entities;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Entities;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Models;
+using Models.SyncJobHistory;
+using Moq;
+using Repositories.Contracts;
+using Repositories.ServiceBusTopics;
+using Services.Contracts;
+using Services.Entities;
+using System;
+using System.Collections.Generic;
+using System.IO;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Services.Tests
+{
+    [TestClass]
+    public class OrchestratorTests
+    {
+        private const int SMALL = 400;
+
+        private SyncJob _syncJob;
+        private Group _group;
+        private MembershipAggregatorHttpRequest _membershipAggregatorHttpRequest;
+        private MembershipSubOrchestratorRequest _membershipSubOrchestratorRequest;
+        private MembershipSubOrchestratorResponse _membershipSubOrchestratorResponse;
+        private JobTrackerCompletionResult _lastJobTrackerCompletionResult;
+        private TelemetryClient _telemetryClient;
+
+        private JobTrackerEntity _jobTrackerEntity;
+        private Mock<IDatabaseSyncJobsRepository> _syncJobRepository;
+        private Mock<TaskOrchestrationContext> _durableContext;
+        private Mock<IServiceBusTopicsRepository> _serviceBusTopicsRepository;
+        private IOptions<MultiLaneConfig> _multilaneConfig;
+        private ServiceBusTopicsRepository _messageSplitterSender;
+        private Mock<ServiceBusSender> _serviceBusSender;
+        private Mock<TaskOrchestrationEntityFeature> _entityFeature;
+        private Mock<ISyncJobStatusService> _syncJobStatusService;
+
+        private Action<ServiceBusMessage> _onSendingMessage;
+
+        [TestInitialize]
+        public void SetupTest()
+        {
+            _jobTrackerEntity = new JobTrackerEntity();
+            _entityFeature = new Mock<TaskOrchestrationEntityFeature>();
+            _syncJobRepository = new Mock<IDatabaseSyncJobsRepository>();
+            _durableContext = new Mock<TaskOrchestrationContext>();
+            _telemetryClient = new TelemetryClient(new TelemetryConfiguration());
+            _serviceBusTopicsRepository = new Mock<IServiceBusTopicsRepository>();
+            _multilaneConfig = Options.Create(new MultiLaneConfig
+            {
+                IsEnabled = false,
+                Small = SMALL
+            });
+
+            _syncJobStatusService = new Mock<ISyncJobStatusService>();
+
+            _serviceBusSender = new Mock<ServiceBusSender>();
+            _serviceBusSender.Setup(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>(), It.IsAny<CancellationToken>()))
+                            .Callback<ServiceBusMessage, CancellationToken>((message, token) => _onSendingMessage?.Invoke(message));
+
+            _messageSplitterSender = new ServiceBusTopicsRepository(_serviceBusSender.Object);
+
+            _syncJobStatusService.Setup(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()))
+                                  .Returns(Task.CompletedTask);
+
+            var targetOfficeGroupId = Guid.NewGuid();
+            _syncJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                ThresholdPercentageForAdditions = 80,
+                ThresholdPercentageForRemovals = 20,
+                LastRunTime = DateTime.UtcNow.AddDays(-1),
+                Requestor = "user@domail.com",
+                RunId = Guid.NewGuid(),
+                Query = "[{\"type\":\"GroupMembership\",\"source\":\"9e9b029b-52a7-467a-94fb-325b6241022b\"},{\"type\":\"GroupOwnership\",\"source\":[\"GroupMembership\"]}]",
+                MembershipType = "GroupMembership"
+            };
+
+            _group = new Group
+            {
+                GroupId = targetOfficeGroupId,
+                SyncJobId = _syncJob.Id
+            };
+
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/file-path.json",
+                SyncJob = _syncJob,
+                PartNumber = 1,
+                PartsCount = 1,
+                IsDestinationPart = true
+            };
+
+            _membershipSubOrchestratorResponse = new MembershipSubOrchestratorResponse
+            {
+                FilePath = "http://file-path",
+                MembershipDeltaStatus = MembershipDeltaStatus.Ok
+            };
+
+            _syncJobRepository.Setup(x => x.GetSyncJobAsync(It.IsAny<Guid>()))
+                                .ReturnsAsync(() => _syncJob);
+
+            _durableContext.Setup(x => x.CreateReplaySafeLogger(It.IsAny<string>()))
+                            .Returns(NullLogger.Instance);
+
+            _durableContext.Setup(x => x.GetInput<MembershipAggregatorHttpRequest>())
+                            .Returns(() => _membershipAggregatorHttpRequest);
+
+            _durableContext.Setup(x => x.CallActivityAsync<Guid>(nameof(GetGroupFunction), It.IsAny<GetGroupRequest>(), It.IsAny<TaskOptions>()))
+                            .ReturnsAsync(_group.GroupId);
+
+            _durableContext.Setup(x => x.CallActivityAsync(nameof(TelemetryTrackerFunction), It.IsAny<TelemetryTrackerRequest>(), It.IsAny<TaskOptions>()))
+                    .Callback<TaskName, object, TaskOptions>(async (name, request, taskOptions) =>
+                    {
+                        var telemetryRequest = request as TelemetryTrackerRequest;
+                        await CallTelemetryTrackerFunctionAsync(telemetryRequest);
+                    });
+
+            _durableContext.Setup(x => x.CallActivityAsync(nameof(JobStatusUpdaterFunction), It.IsAny<JobStatusUpdaterRequest>(), It.IsAny<TaskOptions>()))
+                            .Callback<TaskName, object, TaskOptions>(async (name, request, taskOptions) =>
+                            {
+                                var updateRequest = request as JobStatusUpdaterRequest;
+                                await CallJobStatusUpdaterFunctionAsync(updateRequest);
+                            });
+
+            _durableContext.Setup(x => x.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>
+                                                (
+                                                    nameof(MembershipSubOrchestratorFunction),
+                                                    It.IsAny<MembershipSubOrchestratorRequest>(),
+                                                    It.IsAny<TaskOptions>())
+                                                )
+                            .Callback<TaskName, object, TaskOptions>((name, request, options) =>
+                            {
+                                _membershipSubOrchestratorRequest = request as MembershipSubOrchestratorRequest;
+                            })
+                            .ReturnsAsync(() => _membershipSubOrchestratorResponse);
+
+            _durableContext.Setup(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()))
+                           .Callback<TaskName, object, TaskOptions>(async (name, request, taskOptions) =>
+                           {
+                               var topicRequest = request as TopicMessageSenderRequest;
+                               await CallTopicMessageSenderFunctionAsync(topicRequest.MembershipHttpRequest);
+                           });
+
+            
+            _entityFeature.Setup(x => x.CallEntityAsync<JobTrackerCompletionResult>(
+                        It.IsAny<EntityInstanceId>(),
+                        nameof(JobTrackerEntity.RegisterPartAndCheckComplete),
+                        It.IsAny<object>(),
+                        It.IsAny<CallEntityOptions>()
+                       ))
+                    .Returns<EntityInstanceId, string, object, CallEntityOptions>(async (entityId, operationName, input, options) =>
+                    {
+                        var registration = input as JobTrackerRegistration;
+                        var realResult = await _jobTrackerEntity.RegisterPartAndCheckComplete(registration);
+                        _lastJobTrackerCompletionResult = realResult;
+                        return realResult;
+                    });
+
+            _durableContext.Setup(x => x.Entities).Returns(() => _entityFeature.Object);
+        }
+
+        [TestMethod]
+        public async Task HandleMissingGroupIdAsync()
+        {
+            var orchestratorFunction = new OrchestratorFunction();
+            _durableContext.Setup(x => x.CallActivityAsync<Guid>(nameof(GetGroupFunction), It.IsAny<GetGroupRequest>(), It.IsAny<TaskOptions>()))
+              .ReturnsAsync(Guid.Empty);
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(
+                                                                                                                                        It.IsAny<SyncJob>(),
+                                                                                                                                        It.Is<SyncStatus?>(status => status == SyncStatus.Error),
+                                                                                                                                        It.IsAny<SyncJobHistory>(),
+                                                                                                                                        It.IsAny<string>()), Times.Once());
+        }
+
+        [TestMethod]
+        public async Task TestJobWithSinglePartAsync()
+        {
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.AreEqual(
+                _membershipAggregatorHttpRequest.FilePath,
+                _lastJobTrackerCompletionResult.DestinationPart);
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Once());
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task TestMissingPartAsync()
+        {
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/file-path.json",
+                SyncJob = _syncJob,
+                PartNumber = 1,
+                PartsCount = 2,
+                IsDestinationPart = false
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.IsNull(_lastJobTrackerCompletionResult.DestinationPart);
+            _durableContext.Verify(
+                context => context.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>(
+                    nameof(MembershipSubOrchestratorFunction),
+                    It.IsAny<MembershipSubOrchestratorRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Never());
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task TestDestinationPartAsync()
+        {            
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/file-path.json",
+                SyncJob = _syncJob,
+                PartNumber = 1,
+                PartsCount = 1,
+                IsDestinationPart = true
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.IsNotNull(_lastJobTrackerCompletionResult.DestinationPart);
+            Assert.AreEqual(_membershipAggregatorHttpRequest.FilePath, _lastJobTrackerCompletionResult.DestinationPart);
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Once());
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task CompletedEntitySnapshotIsPassedToSubOrchestratorAsync()
+        {
+            await _jobTrackerEntity.RegisterPartAndCheckComplete(new JobTrackerRegistration
+            {
+                PartNumber = 1,
+                TotalParts = 2,
+                FilePath = "/source-part.json"
+            });
+
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/destination-part.json",
+                SyncJob = _syncJob,
+                PartNumber = 2,
+                PartsCount = 2,
+                IsDestinationPart = true
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.IsNotNull(_membershipSubOrchestratorRequest);
+            Assert.AreEqual(2, _membershipSubOrchestratorRequest.CompletedParts.Count);
+            Assert.AreEqual("/source-part.json", _membershipSubOrchestratorRequest.CompletedParts[1]);
+            Assert.AreEqual("/destination-part.json", _membershipSubOrchestratorRequest.CompletedParts[2]);
+            Assert.AreEqual("/destination-part.json", _membershipSubOrchestratorRequest.DestinationPart);
+        }
+
+        [TestMethod]
+        public async Task RejectInvalidPartRegistrationWhenPartNumberExceedsPartsCountAsync()
+        {
+            // Defense-in-depth: the orchestrator is the only legitimate producer of
+            // JobTrackerRegistration, so it must reject PartNumber > PartsCount.
+            // A malformed request (e.g., PartNumber=3, PartsCount=2) would otherwise
+            // inflate State.CompletedParts.Count past State.TotalParts and could
+            // trigger premature completion before all legitimate parts arrive.
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/file-path.json",
+                SyncJob = _syncJob,
+                PartNumber = 3,
+                PartsCount = 2,
+                IsDestinationPart = false
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+
+            await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                async () => await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            Assert.IsTrue(_lastJobTrackerCompletionResult.RegistrationRejected);
+
+            _entityFeature.Verify(x => x.CallEntityAsync<JobTrackerCompletionResult>(
+                                                It.IsAny<EntityInstanceId>(),
+                                                nameof(JobTrackerEntity.RegisterPartAndCheckComplete),
+                                                It.IsAny<object>(),
+                                                It.IsAny<CallEntityOptions>()),
+                                    Times.Once());
+
+            _durableContext.Verify(x => x.CallActivityAsync(
+                                                nameof(TopicMessageSenderFunction),
+                                                It.IsAny<TopicMessageSenderRequest>(),
+                                                It.IsAny<TaskOptions>()),
+                                    Times.Never());
+
+            _durableContext.Verify(x => x.CallActivityAsync(
+                                                nameof(JobStatusUpdaterFunction),
+                                                It.Is<JobStatusUpdaterRequest>(req => req.Status == SyncStatus.Error),
+                                                It.IsAny<TaskOptions>()),
+                                    Times.Once());
+        }
+
+        [TestMethod]
+        public async Task ConflictingEntityRegistrationRecordsErrorWithoutDispatchingAsync()
+        {
+            await _jobTrackerEntity.RegisterPartAndCheckComplete(new JobTrackerRegistration
+            {
+                PartNumber = 1,
+                TotalParts = 2,
+                FilePath = "/source-part.json"
+            });
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/different-source-part.json",
+                SyncJob = _syncJob,
+                PartNumber = 1,
+                PartsCount = 2,
+                IsDestinationPart = false
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            var exception = await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                () => orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            StringAssert.Contains(exception.Message, "part 1");
+            StringAssert.Contains(exception.Message, "/source-part.json");
+            StringAssert.Contains(exception.Message, "/different-source-part.json");
+            _durableContext.Verify(
+                context => context.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>(
+                    nameof(MembershipSubOrchestratorFunction),
+                    It.IsAny<MembershipSubOrchestratorRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TopicMessageSenderFunction),
+                    It.IsAny<TopicMessageSenderRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(JobStatusUpdaterFunction),
+                    It.Is<JobStatusUpdaterRequest>(request => request.Status == SyncStatus.Error),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TelemetryTrackerFunction),
+                    It.Is<TelemetryTrackerRequest>(request =>
+                        request.JobStatus == SyncStatus.Error &&
+                        request.ResultStatus == ResultStatus.Failure),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+        }
+
+        [TestMethod]
+        public async Task DuplicatePartPathRecordsErrorWithoutDispatchingAsync()
+        {
+            await _jobTrackerEntity.RegisterPartAndCheckComplete(new JobTrackerRegistration
+            {
+                PartNumber = 1,
+                TotalParts = 2,
+                FilePath = "/source-part.json"
+            });
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/source-part.json",
+                SyncJob = _syncJob,
+                PartNumber = 2,
+                PartsCount = 2,
+                IsDestinationPart = true
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            var exception = await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                () => orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            StringAssert.Contains(exception.Message, "part 2");
+            StringAssert.Contains(exception.Message, "part 1");
+            StringAssert.Contains(exception.Message, "/source-part.json");
+            _durableContext.Verify(
+                context => context.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>(
+                    nameof(MembershipSubOrchestratorFunction),
+                    It.IsAny<MembershipSubOrchestratorRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TopicMessageSenderFunction),
+                    It.IsAny<TopicMessageSenderRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(JobStatusUpdaterFunction),
+                    It.Is<JobStatusUpdaterRequest>(request => request.Status == SyncStatus.Error),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TelemetryTrackerFunction),
+                    It.Is<TelemetryTrackerRequest>(request =>
+                        request.JobStatus == SyncStatus.Error &&
+                        request.ResultStatus == ResultStatus.Failure),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+        }
+
+        [TestMethod]
+        public async Task ActivityOutOfMemoryFailureRecordsErrorWithoutDispatchingAsync()
+        {
+            var expectedFailure = new OutOfMemoryException("memory exhausted");
+            _durableContext
+                .Setup(context =>
+                    context.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>(
+                        nameof(MembershipSubOrchestratorFunction),
+                        It.IsAny<MembershipSubOrchestratorRequest>(),
+                        It.IsAny<TaskOptions>()))
+                .ThrowsAsync(expectedFailure);
+            var orchestratorFunction = new OrchestratorFunction();
+
+            var actualFailure = await Assert.ThrowsExceptionAsync<OutOfMemoryException>(
+                () => orchestratorFunction.RunOrchestratorAsync(
+                    _durableContext.Object));
+
+            Assert.AreSame(expectedFailure, actualFailure);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TopicMessageSenderFunction),
+                    It.IsAny<TopicMessageSenderRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(JobStatusUpdaterFunction),
+                    It.Is<JobStatusUpdaterRequest>(request =>
+                        request.Status == SyncStatus.Error),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TelemetryTrackerFunction),
+                    It.Is<TelemetryTrackerRequest>(request =>
+                        request.JobStatus == SyncStatus.Error &&
+                        request.ResultStatus == ResultStatus.Failure),
+                    It.IsAny<TaskOptions>()),
+                Times.Once);
+        }
+
+        [TestMethod]
+        public async Task RejectedRunCannotDispatchAfterRemainingPartArrivesAsync()
+        {
+            await _jobTrackerEntity.RegisterPartAndCheckComplete(new JobTrackerRegistration
+            {
+                PartNumber = 1,
+                TotalParts = 2,
+                FilePath = "/destination-part.json",
+                IsDestinationPart = true
+            });
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/second-destination-part.json",
+                SyncJob = _syncJob,
+                PartNumber = 2,
+                PartsCount = 2,
+                IsDestinationPart = true
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                () => orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            _membershipAggregatorHttpRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = "/source-part.json",
+                SyncJob = _syncJob,
+                PartNumber = 2,
+                PartsCount = 2,
+                IsDestinationPart = false
+            };
+
+            await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                () => orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            _durableContext.Verify(
+                context => context.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>(
+                    nameof(MembershipSubOrchestratorFunction),
+                    It.IsAny<MembershipSubOrchestratorRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TopicMessageSenderFunction),
+                    It.IsAny<TopicMessageSenderRequest>(),
+                    It.IsAny<TaskOptions>()),
+                Times.Never);
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(JobStatusUpdaterFunction),
+                    It.Is<JobStatusUpdaterRequest>(request => request.Status == SyncStatus.Error),
+                    It.IsAny<TaskOptions>()),
+                Times.Exactly(2));
+            _durableContext.Verify(
+                context => context.CallActivityAsync(
+                    nameof(TelemetryTrackerFunction),
+                    It.Is<TelemetryTrackerRequest>(request =>
+                        request.JobStatus == SyncStatus.Error &&
+                        request.ResultStatus == ResultStatus.Failure),
+                    It.IsAny<TaskOptions>()),
+                Times.Exactly(2));
+        }
+
+        [TestMethod]
+        public async Task TestNotSuccessMembershipDeltaStatusAsync()
+        {
+            _membershipSubOrchestratorResponse.MembershipDeltaStatus = MembershipDeltaStatus.Error;
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Never());
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task HandleFileNotFoundAsync()
+        {
+            _durableContext.Setup(x => x.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>
+                                               (
+                                                  nameof(MembershipSubOrchestratorFunction),
+                                                   It.IsAny<MembershipSubOrchestratorRequest>(),
+                                                   It.IsAny<TaskOptions>())
+                                               )
+                            .Throws<FileNotFoundException>();
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await Assert.ThrowsExceptionAsync<FileNotFoundException>(async () => await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Never());
+            _durableContext.Verify(x => x.CallActivityAsync(
+                                                            nameof(JobStatusUpdaterFunction),
+                                                            It.Is<JobStatusUpdaterRequest>(x => x.Status == SyncStatus.FileNotFound),
+                                                            It.IsAny<TaskOptions>()
+                                                           )
+                                            , Times.Once());
+
+        }
+
+        [TestMethod]
+        public async Task HandleUnexpectedExceptionAsync()
+        {
+            _durableContext.Setup(x => x.CallSubOrchestratorAsync<MembershipSubOrchestratorResponse>
+                                               (
+                                                  nameof(MembershipSubOrchestratorFunction),
+                                                   It.IsAny<MembershipSubOrchestratorRequest>(),
+                                                   It.IsAny<TaskOptions>())
+                                               )
+                            .Throws<Exception>();
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await Assert.ThrowsExceptionAsync<Exception>(async () => await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object));
+
+            _durableContext.Verify(x => x.CallActivityAsync(nameof(TopicMessageSenderFunction), It.IsAny<TopicMessageSenderRequest>(), It.IsAny<TaskOptions>()), Times.Never());
+            _durableContext.Verify(x => x.CallActivityAsync(
+                                                            nameof(JobStatusUpdaterFunction),
+                                                            It.Is<JobStatusUpdaterRequest>(x => x.Status == SyncStatus.Error),
+                                                            It.IsAny<TaskOptions>()
+                                                           )
+                                            , Times.Once());
+
+        }
+
+        [TestMethod]
+        public async Task SendNewJobGoesToSmallOrLargeBasedOnCountAsync()
+        {
+            _syncJob.LastRunTime = System.Data.SqlTypes.SqlDateTime.MinValue.Value;
+
+            _multilaneConfig = Options.Create(new MultiLaneConfig
+            {
+                IsEnabled = true,
+                Small = SMALL
+            });
+
+            // When onboarding (no prior run), we still classify by size only.
+            _membershipSubOrchestratorResponse.MembersToBeAdded = SMALL; // boundary small
+
+            var laneSize = string.Empty;
+            _onSendingMessage = message =>
+            {
+                laneSize = message.ApplicationProperties["LaneSize"].ToString();
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.AreEqual("Small", laneSize);
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task SendSmallJobToMessageSplitterTopicAsync()
+        {
+            _multilaneConfig = Options.Create(new MultiLaneConfig
+            {
+                IsEnabled = true,
+                Small = SMALL
+            });
+
+            _membershipSubOrchestratorResponse.MembersToBeAdded = 20;
+
+            _syncJob.LastRunTime = DateTime.UtcNow.AddDays(-1);
+
+            var laneSize = string.Empty;
+            _onSendingMessage = message =>
+            {
+                laneSize = message.ApplicationProperties["LaneSize"].ToString();
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.AreEqual("Small", laneSize);
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task SendLargeJobAtSmallBoundaryToMessageSplitterTopicAsync()
+        {
+            _multilaneConfig = Options.Create(new MultiLaneConfig
+            {
+                IsEnabled = true,
+                Small = SMALL
+            });
+
+            // larger than Small threshold should be Large since only Small/Large are supported
+            _membershipSubOrchestratorResponse.MembersToBeAdded = SMALL + 1;
+
+            _syncJob.LastRunTime = DateTime.UtcNow.AddDays(-1);
+
+            var laneSize = string.Empty;
+            _onSendingMessage = message =>
+            {
+                laneSize = message.ApplicationProperties["LaneSize"].ToString();
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.AreEqual("Large", laneSize);
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        [TestMethod]
+    public async Task SendLargeJobToMessageSplitterTopicAsync()
+        {
+            _multilaneConfig = Options.Create(new MultiLaneConfig
+            {
+                IsEnabled = true,
+                Small = SMALL
+            });
+
+            _membershipSubOrchestratorResponse.MembersToBeAdded = SMALL + 1;
+
+            _syncJob.LastRunTime = DateTime.UtcNow.AddDays(-1);
+
+            var laneSize = string.Empty;
+            _onSendingMessage = message =>
+            {
+                laneSize = message.ApplicationProperties["LaneSize"].ToString();
+            };
+
+            var orchestratorFunction = new OrchestratorFunction();
+            await orchestratorFunction.RunOrchestratorAsync(_durableContext.Object);
+
+            Assert.AreEqual("Large", laneSize);
+            _syncJobStatusService.Verify(x => x.UpdateJobStatusAsync(It.IsAny<SyncJob>(), It.IsAny<SyncStatus?>(), It.IsAny<SyncJobHistory>(), It.IsAny<string>()), Times.Never());
+        }
+
+        private async Task CallTelemetryTrackerFunctionAsync(TelemetryTrackerRequest request)
+        {
+            var telemetryTrackerFunction = new TelemetryTrackerFunction(NullLogger<TelemetryTrackerFunction>.Instance, _telemetryClient);
+            await telemetryTrackerFunction.TrackEventAsync(request);
+        }
+
+        private async Task CallJobStatusUpdaterFunctionAsync(JobStatusUpdaterRequest request)
+        {
+            var jobStatusUpdaterFunction = new JobStatusUpdaterFunction(NullLogger<JobStatusUpdaterFunction>.Instance, _syncJobRepository.Object, _syncJobStatusService.Object);
+            await jobStatusUpdaterFunction.UpdateJobStatusAsync(request);
+        }
+
+        private async Task CallTopicMessageSenderFunctionAsync(MembershipHttpRequest request)
+        {
+            
+            var topicMessageSenderRepository = new TopicMessageSenderService(NullLogger<TopicMessageSenderService>.Instance, _serviceBusTopicsRepository.Object, _messageSplitterSender, _multilaneConfig.Value);
+            var topicMessageSenderFunction = new TopicMessageSenderFunction(NullLogger<TopicMessageSenderFunction>.Instance, topicMessageSenderRepository);
+
+            await topicMessageSenderFunction.SendMessageAsync(new TopicMessageSenderRequest
+            {
+                MembershipHttpRequest = request,
+                SyncJob = request.SyncJob,
+                CurrentPart = 1,
+                TotalParts = 1
+            });
+        }
+    }
+}

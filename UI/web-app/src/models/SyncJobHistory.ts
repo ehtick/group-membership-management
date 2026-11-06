@@ -1,0 +1,19 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+export interface SyncJobHistory {
+  runId: string;
+  adfRunId?: string | null;
+  startTime: string | null;
+  endTime: string | null;
+  duration: number | null;
+  status: string;
+  beforeSyncUserCount?: number | null;
+  usersAdded: number | null;
+  usersRemoved: number | null;
+  afterSyncUserCount?: number | null;
+  updatedByFunction: string;
+  createdAt: string;
+  updatedAt: string;
+  customMessage?: string | null;
+}

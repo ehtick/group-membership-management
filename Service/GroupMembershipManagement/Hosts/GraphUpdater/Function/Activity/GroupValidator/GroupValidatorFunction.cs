@@ -1,10 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Polly;
-using Repositories.Contracts;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Models.Notifications;
 using Repositories.Contracts.InjectConfig;
 using Services.Contracts;
 using System;
@@ -15,56 +13,43 @@ namespace Hosts.GraphUpdater
     public class GroupValidatorFunction
     {
         private const int NumberOfGraphRetries = 5;
-        private const string SyncDisabledNoGroupEmailBody = "SyncDisabledNoGroupEmailBody";
-        private readonly ILoggingRepository _loggingRepository;
+        private readonly ILogger<GroupValidatorFunction> _logger;
         private readonly IGraphUpdaterService _graphUpdaterService;
         private readonly IEmailSenderRecipient _emailSenderAndRecipients;
 
-        public GroupValidatorFunction(ILoggingRepository loggingRepository, IGraphUpdaterService graphUpdaterService, IEmailSenderRecipient emailSenderAndRecipients)
+        public GroupValidatorFunction(ILogger<GroupValidatorFunction> logger, IGraphUpdaterService graphUpdaterService, IEmailSenderRecipient emailSenderAndRecipients)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _graphUpdaterService = graphUpdaterService ?? throw new ArgumentNullException(nameof(graphUpdaterService));
             _emailSenderAndRecipients = emailSenderAndRecipients ?? throw new ArgumentNullException(nameof(emailSenderAndRecipients));
         }
 
-        [FunctionName(nameof(GroupValidatorFunction))]
+        [Function(nameof(GroupValidatorFunction))]
         public async Task<bool> ValidateGroupAsync([ActivityTrigger] GroupValidatorRequest request)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(GroupValidatorFunction)} function started", RunId = request.RunId });
+            using var scope = _logger.BeginGraphUpdaterScope(request);
+            _logger.FunctionStarted(nameof(GroupValidatorFunction));
 
-            bool isExistingGroup = false;
-            var groupExistsResult = await _graphUpdaterService.GroupExistsAsync(request.GroupId, request.RunId);
+            var groupExistsResult = await _graphUpdaterService.GroupExistsAsync(request.GroupId);
 
-            if (groupExistsResult.Outcome == OutcomeType.Successful && groupExistsResult.Result)
+            if (groupExistsResult)
             {
-                await _loggingRepository.LogMessageAsync(new LogMessage { RunId = request.RunId, Message = $"Group with ID {request.GroupId} exists." });
-                isExistingGroup = true;
+                _logger.GroupExists(request.GroupId);
             }
             else
             {
-                if (groupExistsResult.Outcome == OutcomeType.Successful)
-                {
-                    await _loggingRepository.LogMessageAsync(new LogMessage { RunId = request.RunId, Message = $"Group with ID {request.GroupId} doesn't exist." });
-
-                    var syncJob = await _graphUpdaterService.GetSyncJobAsync(request.JobPartitionKey, request.JobRowKey);
-                    if (syncJob != null)
-                        await _graphUpdaterService.SendEmailAsync(
-                            syncJob.Requestor,
-                            SyncDisabledNoGroupEmailBody,
-                            new[] { request.GroupId.ToString(), _emailSenderAndRecipients.SupportEmailAddresses },
-                            request.RunId);
-                }
-                else if (groupExistsResult.FaultType == FaultType.ExceptionHandledByThisPolicy)
-                    await _loggingRepository.LogMessageAsync(new LogMessage { RunId = request.RunId, Message = $"Exceeded {NumberOfGraphRetries} while trying to determine if a group exists." });
-
-                if (groupExistsResult.FinalException != null)
-                    throw groupExistsResult.FinalException;
-
-                isExistingGroup = false;
+                _logger.GroupNotExists(request.GroupId);
+                var syncJob = await _graphUpdaterService.GetSyncJobAsync(request.SyncJob.Id);
+                if (syncJob != null)
+                    await _graphUpdaterService.SendEmailAsync(
+                        syncJob,
+                        NotificationMessageType.DestinationNotExistNotification,
+                        new[] { request.GroupId.ToString(), _emailSenderAndRecipients.SupportEmailAddresses, DisabledNotificationType.StatusDescriptions[NotificationMessageType.DestinationNotExistNotification], DateTime.UtcNow.ToString("o", System.Globalization.CultureInfo.InvariantCulture) }
+                        );
             }
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(GroupValidatorFunction)} function completed", RunId = request.RunId });
-            return isExistingGroup;
+            _logger.FunctionCompleted(nameof(GroupValidatorFunction));
+            return groupExistsResult;
         }
     }
 }

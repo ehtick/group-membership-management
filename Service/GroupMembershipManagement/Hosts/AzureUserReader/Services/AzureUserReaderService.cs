@@ -3,8 +3,9 @@
 
 using Azure;
 using Azure.Storage.Blobs.Models;
-using Entities;
-using Repositories.Contracts;
+using Hosts.AzureUserReader;
+using Models;
+using Microsoft.Extensions.Logging;
 using Repositories.Contracts.InjectConfig;
 using Services.Contracts;
 using Services.Entities;
@@ -21,26 +22,27 @@ namespace Services
     {
         private const string MemberIdsFileName = "memberids.csv";
 
-        private readonly IBlobClientFactory _blobClientFactory = null;
-        private readonly ILoggingRepository _loggingRepository = null;
-        private readonly IStorageAccountSecret _storageAccountSecret = null;
+        private readonly IBlobClientFactory _blobClientFactory;
+        private readonly ILogger<AzureUserReaderService> _logger;
+        private readonly IStorageAccountSecret _storageAccountSecret;
 
         public AzureUserReaderService(
             IStorageAccountSecret storageAccountSecret,
-            ILoggingRepository loggingRepository,
+            ILogger<AzureUserReaderService> logger,
             IBlobClientFactory blobClientFactory)
         {
             _storageAccountSecret = storageAccountSecret ?? throw new ArgumentNullException(nameof(storageAccountSecret));
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _blobClientFactory = blobClientFactory ?? throw new ArgumentNullException(nameof(blobClientFactory));
         }
 
         public async Task<IList<string>> GetPersonnelNumbersAsync(string containerName, string blobPath)
         {
-            var blob = await DownloadFileAsync(_storageAccountSecret.ConnectionString, containerName, blobPath);
-            var personnelNumbers = ExtractPersonnelNumbers(blob);
+            var uri = new Uri($"https://{_storageAccountSecret.AccountName}.blob.core.windows.net/{containerName}/{blobPath}");
+            var blob = await DownloadFileAsync(uri);
+            var personnelNumbers = ExtractPersonnelNumbers(blob).Where(x => !string.IsNullOrWhiteSpace(x)).ToList();
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Retrieved {personnelNumbers.Count} personnel numbers." });
+            _logger.PersonnelNumbersRetrieved(personnelNumbers.Count);
 
             return personnelNumbers;
         }
@@ -48,27 +50,19 @@ namespace Services
         public async Task UploadUsersMemberIdAsync(UploadRequest request)
         {
             var blobPath = $"{request.BlobTargetDirectory}/{MemberIdsFileName}";
-            var file = await DownloadFileIfExistsAsync(_storageAccountSecret.ConnectionString, request.ContainerName, blobPath);
-            var users = ExtractUsers(file);
-            var existingUserIds = new HashSet<string>(users.Select(x => x.PersonnelNumber));
-            var newUsers = request.Users.Where(x => !string.IsNullOrWhiteSpace(x.Id)).ToList();
+            var usersRetrieved = request.Users.Where(x => !string.IsNullOrWhiteSpace(x.Id)).ToList();
 
-            foreach (var user in newUsers)
-            {
-                if (!existingUserIds.Contains(user.PersonnelNumber))
-                    users.Add(user);
-            }
+            var uri = new Uri($"https://{_storageAccountSecret.AccountName}.blob.core.windows.net/{request.ContainerName}/{blobPath}");
+            await UploadFileAsync(uri, usersRetrieved);
 
-            await UploadFileAsync(_storageAccountSecret.ConnectionString, request.ContainerName, blobPath, users);
-
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Uploaded {newUsers.Count} new user ids." });
+            _logger.UserIdsUploaded(usersRetrieved.Count);
         }
 
-        private async Task<Stream> DownloadFileAsync(string connectionString, string containerName, string filePath)
+        private async Task<Stream> DownloadFileAsync(Uri blobPath)
         {
             int status;
             Response<BlobDownloadInfo> response = null;
-            var blobClient = _blobClientFactory.GetBlobClient(connectionString, containerName, filePath);
+            var blobClient = _blobClientFactory.GetBlobClient(blobPath);
 
             if (blobClient.Exists())
             {
@@ -77,9 +71,8 @@ namespace Services
             }
             else
             {
-                var message = $"File not found {filePath}.";
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = message });
-                throw new FileNotFoundException(message);
+                _logger.FileNotFound(blobPath);
+                throw new FileNotFoundException($"File not found {blobPath}.");
             }
 
             if (status >= 200 && status <= 299)
@@ -89,16 +82,15 @@ namespace Services
             else
             {
                 var rawResponse = response.GetRawResponse();
-                var message = $"An error occurred while downloading the file.\nStatusCode:{rawResponse.Status}\n{rawResponse.ReasonPhrase}";
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = message });
-                throw new DownloadFileException(message);
+                _logger.FileDownloadError(rawResponse.Status, rawResponse.ReasonPhrase);
+                throw new DownloadFileException($"An error occurred while downloading the file.\nStatusCode:{rawResponse.Status}\n{rawResponse.ReasonPhrase}");
             }
         }
 
-        private async Task<Stream> DownloadFileIfExistsAsync(string connectionString, string containerName, string filePath)
+        private async Task<Stream> DownloadFileIfExistsAsync(Uri blobPath)
         {
             Response<BlobDownloadInfo> response = null;
-            var blobClient = _blobClientFactory.GetBlobClient(connectionString, containerName, filePath);
+            var blobClient = _blobClientFactory.GetBlobClient(blobPath);
 
             if (blobClient.Exists())
             {
@@ -147,9 +139,9 @@ namespace Services
             return users;
         }
 
-        private async Task UploadFileAsync(string connectionString, string containerName, string filePath, List<GraphProfileInformation> users)
+        private async Task UploadFileAsync(Uri blobPath, List<GraphProfileInformation> users)
         {
-            var blobClient = _blobClientFactory.GetBlobClient(connectionString, containerName, filePath);
+            var blobClient = _blobClientFactory.GetBlobClient(blobPath);
             using var st = new StreamWriter(new MemoryStream());
             st.WriteLine("PersonnelNumber,AzureObjectId,UserPrincipalName");
             foreach (var user in users)

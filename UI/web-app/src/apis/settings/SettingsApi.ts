@@ -1,0 +1,65 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import { AxiosResponse } from 'axios';
+import { Setting } from '../../models/Setting';
+import { AlertBannerConfig } from '../../models/AlertBannerConfig';
+import { ApiBase } from '../ApiBase';
+import { ISettingsApi } from './ISettingsApi';
+
+
+export class SettingsApi extends ApiBase implements ISettingsApi {
+  public async fetchSettings(): Promise<Setting[]> {
+    const response = await this.httpClient.get<Setting[]>('/');
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async fetchSettingByKey(settingKey: string): Promise<Setting> {
+    const response = await this.httpClient.get<Setting>('/', {
+      params: {
+        key: settingKey,
+      },
+    });
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async patchSetting(setting: Setting): Promise<Setting> {
+    const response = await this.httpClient.patch<Setting, AxiosResponse<Setting>, string>(
+      `/${encodeURIComponent(setting.settingKey)}`,
+      JSON.stringify(setting.settingValue),
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async getSupportEmailAddress(): Promise<string> {
+    const response = await this.httpClient.get<string>('supportEmail');
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async getDefaultAIPrompt(): Promise<string> {
+    const response = await this.httpClient.get<string>('aiPrompt/defaults');
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async getAlertBanner(): Promise<AlertBannerConfig> {
+    const response = await this.httpClient.get<AlertBannerConfig>('alertBanner');
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+
+  public async patchAlertBanner(config: AlertBannerConfig): Promise<AlertBannerConfig> {
+    const response = await this.httpClient.patch<AlertBannerConfig, AxiosResponse<AlertBannerConfig>, AlertBannerConfig>(
+      'alertBanner',
+      config,
+      { headers: { 'Content-Type': 'application/json' } }
+    );
+    this.ensureSuccessStatusCode(response);
+    return response.data;
+  }
+};

@@ -1,10 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
+using Azure.Core;
 using Azure.Identity;
 using Azure.Security.KeyVault.Secrets;
-using Microsoft.Graph;
-using Microsoft.Graph.Auth;
-using Microsoft.Identity.Client;
 using System;
 using System.Security.Cryptography.X509Certificates;
 
@@ -12,48 +10,60 @@ namespace Common.DependencyInjection
 {
     public static class FunctionAppDI
     {
-        public static IAuthenticationProvider CreateAuthProviderFromCertificate(GraphCredentials creds)
+        public static TokenCredential CreateAuthenticationProvider(GraphCredentials credentials, AuthenticationType authenticationType)
         {
-            var confidentialClientApplication = ConfidentialClientApplicationBuilder
-            .Create(creds.ClientId)
-            .WithTenantId(creds.TenantId)
-            .WithCertificate(GetCertificate(creds.CertificateName, creds.KeyVaultName, creds.KeyVaultTenantId))
-            .Build();
+            TokenCredential tokenCredential;
+            switch (authenticationType)
+            {
+                default:
+                case AuthenticationType.Unknown:
+                    throw new Exception($"AuthenticationType is not valid, " +
+                                        $"verify GraphAPI:AuthenticationType setting has been properly set in your App Configuration.");
+                case AuthenticationType.ClientSecret:
+                    tokenCredential = CreateAuthProviderFromSecret(credentials);
+                    break;
+                case AuthenticationType.Certificate:
+                    tokenCredential = CreateAuthProviderFromCertificate(credentials);
+                    break;
+                case AuthenticationType.UserAssignedManagedIdentity:
+                    tokenCredential = CreateUserAssignedManagedIdentityCredential(credentials.UserAssignedManagedIdentityClientId);
+                    break;
+            }
 
-            return new ClientCredentialProvider(confidentialClientApplication);
+            return tokenCredential;
         }
 
-        public static IAuthenticationProvider CreateAuthProviderFromSecret(GraphCredentials creds)
+        public static TokenCredential CreateAuthProviderFromSecret(GraphCredentials creds)
         {
-            var confidentialClientApplication = ConfidentialClientApplicationBuilder
-            .Create(creds.ClientId)
-            .WithTenantId(creds.TenantId)
-            .WithClientSecret(creds.ClientSecret)
-            .Build();
-
-            return new ClientCredentialProvider(confidentialClientApplication);
+            return new ClientSecretCredential(creds.TenantId, creds.ClientId, creds.ClientSecret);
         }
 
-        public static IAuthenticationProvider CreateMailAuthProvider(GraphCredentials creds)
+        private static TokenCredential CreateAuthProviderFromCertificate(GraphCredentials creds)
         {
-            var publicClientApplication = PublicClientApplicationBuilder
-            .Create(creds.ClientId)
-            .WithTenantId(creds.TenantId)
-            .Build();
-
-            return new UsernamePasswordProvider(publicClientApplication);
+            return new ClientCertificateCredential(creds.TenantId, creds.ClientId, GetCertificate(creds.ClientCertificateName, creds.KeyVaultName));
         }
 
-        private static X509Certificate2 GetCertificate(string certificateName, string keyVaultName, string keyVaultTenantId)
+        public static TokenCredential CreateAuthProviderFromCertificate(string tenantId, string clientId, string certificateName, string KeyVaultName)
         {
-            var options = new DefaultAzureCredentialOptions();
-#if DEBUG
-            options.VisualStudioTenantId = keyVaultTenantId;
-#endif
+            return new ClientCertificateCredential(tenantId, clientId, GetCertificate(certificateName, KeyVaultName));
+        }
 
-            var defaultCredential = new DefaultAzureCredential(options);
+        public static TokenCredential CreateServiceAccountAuthProvider(GraphCredentials creds)
+        {
+            return new UsernamePasswordCredential(creds.ServiceAccountUserName, creds.ServiceAccountPassword, creds.TenantId, creds.ClientId);
+        }
+
+        public static TokenCredential CreateUserAssignedManagedIdentityCredential(string clientId)
+        {
+            return new ManagedIdentityCredential(clientId);
+        }
+
+        private static X509Certificate2 GetCertificate(string certificateName, string keyVaultName)
+        {
+            DefaultAzureCredential credential = new(DefaultAzureCredential.DefaultEnvironmentVariableName);
+
             var keyVaultBaseUrl = new Uri($"https://{keyVaultName}.vault.azure.net/");
-            var secretClient = new SecretClient(keyVaultBaseUrl, defaultCredential);
+            var secretClient = new SecretClient(keyVaultBaseUrl, credential);
             var privateKey = secretClient.GetSecret(certificateName);
             var privateKeyDecoded = Convert.FromBase64String(privateKey.Value.Value);
             var certificate = new X509Certificate2(privateKeyDecoded, (string)null, X509KeyStorageFlags.MachineKeySet);

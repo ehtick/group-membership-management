@@ -1,0 +1,97 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using System;
+using System.ComponentModel.DataAnnotations.Schema;
+
+namespace Models.SyncJobHistory
+{
+    /// <summary>
+    /// Represents the execution history of a sync job
+    /// </summary>
+    public class SyncJobHistory
+    {
+        /// <summary>
+        /// Gets or sets the unique identifier for the history entry
+        /// </summary>
+        public Guid Id { get; set; }
+
+        /// <summary>
+        /// Gets or sets the sync job identifier
+        /// </summary>
+        public Guid SyncJobId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the run identifier for this execution
+        /// </summary>
+        public Guid RunId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the start time of the job execution
+        /// </summary>
+        public DateTime? StartTime { get; set; }
+
+        /// <summary>
+        /// Gets or sets the end time of the job execution
+        /// </summary>
+        public DateTime? EndTime { get; set; }
+
+        /// <summary>
+        /// Gets or sets the duration of the job execution in seconds
+        /// </summary>
+        public int? Duration { get; set; }
+
+        /// <summary>
+        /// Gets or sets the final status of the job execution
+        /// </summary>
+        public string Status { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of users added during this execution
+        /// </summary>
+        public int? UsersAdded { get; set; }
+
+        /// <summary>
+        /// Gets or sets the number of users removed during this execution
+        /// </summary>
+        public int? UsersRemoved { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user count before the sync operation
+        /// </summary>
+        public int? BeforeSyncUserCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the user count after the sync operation
+        /// </summary>
+        public int? AfterSyncUserCount { get; set; }
+
+        /// <summary>
+        /// Gets or sets the ADF pipeline run identifier associated with this sync execution.
+        /// Null if the job has no SQL membership sources during this run.
+        /// </summary>
+        public Guid? AdfRunId { get; set; }
+
+        /// <summary>
+        /// Gets or sets the function that updated the job status
+        /// </summary>
+        public string UpdatedByFunction { get; set; }
+
+        /// <summary>
+        /// Gets or sets the timestamp when this history entry was created
+        /// </summary>
+        public DateTime CreatedAt { get; set; }
+
+        /// <summary>
+        /// Gets or sets the timestamp when this history entry was last updated
+        /// </summary>
+        public DateTime UpdatedAt { get; set; }
+
+        /// <summary>
+        /// Gets or sets an optional custom message associated with this run's ADF run.
+        /// Populated from the AdfRuns table at read time; not persisted on the history record.
+        /// </summary>
+        [NotMapped]
+        public string? CustomMessage { get; set; }
+
+    }
+}

@@ -1,7 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Graph;
+using Microsoft.Graph.Models;
+using Models;
+using Models.Notifications;
+using Models.ServiceBus;
 using Polly;
 using Repositories.Contracts;
 using Services.Contracts;
@@ -9,24 +11,27 @@ using Services.Entities;
 using System;
 using System.Collections.Generic;
 using System.Linq;
+using System.Text.Json;
 using System.Threading.Tasks;
+using Group = Microsoft.Graph.Models.Group;
 
 namespace Repositories.Mocks
 {
     public class MockGraphUpdaterService : IGraphUpdaterService
     {
-        IMailRepository _mailRepository;
+        IServiceBusQueueRepository _serviceBusQueueRepository;
 
         public Dictionary<Guid, Group> Groups { get; set; } = new Dictionary<Guid, Group>();
         public Dictionary<Guid, List<AzureADUser>> GroupsToUsers { get; set; } = new Dictionary<Guid, List<AzureADUser>>();
-        public Dictionary<(string, string), SyncJob> Jobs { get; set; } = new Dictionary<(string, string), SyncJob>();
+        public List<SyncJob> Jobs { get; set; } = new List<SyncJob>();
+        public Guid RunId { get; set; }
 
-        public MockGraphUpdaterService(IMailRepository mailRepository)
+        public MockGraphUpdaterService(IServiceBusQueueRepository serviceBusQueueRepository)
         {
-            _mailRepository = mailRepository ?? throw new ArgumentNullException(nameof(mailRepository));
+            _serviceBusQueueRepository = serviceBusQueueRepository ?? throw new ArgumentNullException(nameof(serviceBusQueueRepository));
         }
 
-        public Task<Services.Entities.UsersPageResponse> GetFirstMembersPageAsync(Guid groupId, Guid runId)
+        public Task<UsersPageResponse> GetFirstMembersPageAsync(Guid groupId, Guid runId)
         {
             throw new NotImplementedException();
         }
@@ -36,43 +41,45 @@ namespace Repositories.Mocks
             return await Task.FromResult(Groups[groupId].DisplayName);
         }
 
-        public Task<Services.Entities.UsersPageResponse> GetNextMembersPageAsync(string nextPageUrl, IGroupTransitiveMembersCollectionWithReferencesPage membersPage, Guid runId)
+        public Task<UsersPageResponse> GetNextMembersPageAsync(string nextPageUrl, Guid runId)
         {
             throw new NotImplementedException();
         }
 
-        public async Task<SyncJob> GetSyncJobAsync(string partitionKey, string rowKey)
+        public async Task<SyncJob> GetSyncJobAsync(Guid syncJobId)
         {
-            var result = Jobs.ContainsKey((partitionKey, rowKey)) ? Jobs[(partitionKey, rowKey)] : null;
-            return await Task.FromResult(result);
+            var job = Jobs.FirstOrDefault(x => x.Id == syncJobId);
+            return await Task.FromResult(job);
         }
 
-        public async Task<PolicyResult<bool>> GroupExistsAsync(Guid groupId, Guid runId)
+        public async Task<bool> GroupExistsAsync(Guid groupId)
         {
             var groupExists = Groups.ContainsKey(groupId);
-            var result = PolicyResult<bool>.Successful(groupExists, new Context());
-            return await Task.FromResult(result);
+            return await Task.FromResult(groupExists);
         }
 
-        public async Task SendEmailAsync(string toEmail, string contentTemplate, string[] additionalContentParams, Guid runId, string ccEmail = null, string emailSubject = null, string[] additionalSubjectParams = null)
+        public async Task SendEmailAsync( SyncJob syncJob, NotificationMessageType notificationType, string[] additionalContentParams)
         {
-            var message = new EmailMessage
+            var messageContent = new Dictionary<string, Object>
             {
-                AdditionalContentParams = additionalContentParams,
-                CcEmailAddresses = ccEmail,
-                Content = contentTemplate,
-                ToEmailAddresses = toEmail,
-                AdditionalSubjectParams = additionalSubjectParams
+                { "SyncJob", syncJob },
+                { "AdditionalContentParameters", additionalContentParams }
             };
+            var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(messageContent));
+            var message = new ServiceBusMessage
+            {
+                MessageId = $"{syncJob.Id}_{syncJob.RunId}_{notificationType}",
+                Body = body
+            };
+            message.ApplicationProperties.Add("MessageType", notificationType.ToString());
+            await _serviceBusQueueRepository.SendMessageAsync(message);
 
-            await _mailRepository.SendMailAsync(message, runId);
         }
 
-        public Task UpdateSyncJobStatusAsync(SyncJob job, SyncStatus status, bool isDryRun, Guid runId)
+        public Task UpdateSyncJobStatusAsync(SyncJob job, SyncStatus status, bool isDryRun, Guid runId, int? usersAdded, int? usersRemoved)
         {
             job.RunId = runId;
             job.Status = status.ToString();
-            job.Enabled = status != SyncStatus.Error;
             var isDryRunSync = job.IsDryRunEnabled || isDryRun;
 
             if (isDryRunSync)
@@ -80,17 +87,17 @@ namespace Repositories.Mocks
             else
                 job.LastRunTime = DateTime.UtcNow;
 
-            Jobs[(job.PartitionKey, job.RowKey)] = job;
+            Jobs[0] = job;
 
             return Task.CompletedTask;
         }
 
-        public Task<(GraphUpdaterStatus Status, int SuccessCount)> AddUsersToGroupAsync(ICollection<AzureADUser> members, Guid targetGroupId, Guid runId, bool isinitialSync)
+        public Task<(GraphUpdaterStatus Status, int SuccessCount, List<AzureADUser> UsersNotFound, List<AzureADUser> UsersAlreadyExist)> AddUsersToGroupAsync(ICollection<AzureADUser> members, Guid targetGroupId, Guid runId, bool isinitialSync)
         {
             throw new NotImplementedException();
         }
 
-        public Task<(GraphUpdaterStatus Status, int SuccessCount)> RemoveUsersFromGroupAsync(ICollection<AzureADUser> members, Guid targetGroupId, Guid runId, bool isinitialSync)
+        public Task<(GraphUpdaterStatus Status, int SuccessCount, List<AzureADUser> UsersNotFound)> RemoveUsersFromGroupAsync(ICollection<AzureADUser> members, Guid targetGroupId, Guid runId, bool isinitialSync)
         {
             throw new NotImplementedException();
         }
@@ -102,11 +109,21 @@ namespace Repositories.Mocks
             return Task.FromResult(isOwner);
         }
 
-        public Task<List<User>> GetGroupOwnersAsync(Guid groupObjectId, int top = 0)
+        public Task<List<AzureADUser>> GetGroupOwnersAsync(Guid groupObjectId, int top = 0)
         {
             var allOwners = Groups[groupObjectId].Owners;
             var userOwners = allOwners == null ? new List<User>() : allOwners.OfType<User>().ToList();
-            return Task.FromResult(userOwners);
+            return Task.FromResult(userOwners.Select(x => new AzureADUser { ObjectId = Guid.Parse(x.Id) }).ToList());
+        }
+
+        public Task SendEmailAsync(string toEmail, string contentTemplate, string[] additionalContentParams, SyncJob syncJob, string ccEmail, string emailSubject, string[] additionalSubjectParams)
+        {
+            throw new NotImplementedException();
+        }
+
+        public Task<Guid> GetGroupIdAsync(SyncJob syncJob)
+        {
+            throw new NotImplementedException();
         }
     }
 }

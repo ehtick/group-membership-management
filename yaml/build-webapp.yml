@@ -1,0 +1,149 @@
+parameters:
+- name: repoToCheckout
+  type: string
+- name: checkoutPath
+  type: string
+- name: buildRelease
+  type: boolean
+- name: runUITests
+  type: boolean
+  default: true
+
+stages:
+
+- stage: Build_WebAPP
+  dependsOn: Build_Common
+  jobs:
+  - job: Build_WebAPP
+    ${{ if parameters.buildRelease }}:
+      strategy:
+        maxParallel: 2
+        matrix:
+          debug:
+            BuildConfiguration: debug
+          release:
+            BuildConfiguration: release
+    ${{ else }}:
+      variables:
+        BuildConfiguration: 'debug'
+
+    steps:
+
+    - ${{ if ne(parameters.repoToCheckout, '') }}:
+      - checkout: ${{ parameters.repoToCheckout }}
+        path: ${{ parameters.checkoutPath }}
+
+    - task: UseNode@1
+      displayName: 'Use Node.js 23.1.0'
+      inputs:
+        version: '23.1.0'
+
+    - task: PowerShell@2
+      displayName: 'Run pnpm audit (osv-scanner)'
+      inputs:
+        targetType: inline
+        workingDirectory: 'UI/web-app'
+        script: |
+          # osv-scanner replaces pnpm audit while npm's legacy audit endpoint is retired (pnpm/pnpm#11265)
+          $osvVersion = "2.3.5"
+          $osvUrl = "https://github.com/google/osv-scanner/releases/download/v${osvVersion}/osv-scanner_windows_amd64.exe"
+          $osvPath = Join-Path $env:TEMP "osv-scanner.exe"
+          Write-Host "Downloading osv-scanner v${osvVersion}..."
+          Invoke-WebRequest -Uri $osvUrl -OutFile $osvPath
+          Write-Host "Scanning pnpm-lock.yaml for vulnerabilities..."
+          & $osvPath --lockfile=pnpm-lock.yaml
+        pwsh: true
+      condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
+
+    - ${{ if parameters.runUITests }}:
+      - task: PowerShell@2
+        displayName: 'Run UI unit tests with coverage'
+        inputs:
+          targetType: inline
+          workingDirectory: 'UI/web-app'
+          script: |
+            npx pnpm@10.34.4 install --frozen-lockfile
+            npx pnpm@10.34.4 run test:run --coverage
+            if ($LASTEXITCODE -ne 0) {
+              Write-Error "UI unit tests failed or coverage threshold not met."
+              exit 1
+            }
+          pwsh: true
+
+      - task: PowerShell@2
+        displayName: 'Clean node_modules after tests'
+        inputs:
+          targetType: inline
+          workingDirectory: 'UI/web-app'
+          script: |
+            Remove-Item -Path node_modules -Recurse -Force -ErrorAction SilentlyContinue
+          pwsh: true
+
+    - task: CopyFiles@2
+      displayName: 'Copy GmmUI webapp package'
+      inputs:
+        SourceFolder:  UI
+        Contents: |
+          **\web-app\**
+          !**\web-app\node_modules\**
+          !**\web-app\coverage\**
+          !**\web-app\test-results\**
+          !**\web-app\playwright-report\**
+        TargetFolder: '$(build.artifactstagingdirectory)/webapp_package/'
+
+    - task: PowerShell@2
+      displayName: 'Write app version to file'
+      inputs:
+        targetType: inline
+        workingDirectory: '$(build.artifactstagingdirectory)/webapp_package/web-app'
+        script: |
+          $versionFileName = "appVersion.txt"
+          $appVersion = "$(Build.BuildNumber)"
+          Set-Content -Path $versionFileName -Value $appVersion
+        pwsh: true
+
+    - task: NodeTool@0
+      displayName: 'Use Node.js 20.x'
+      inputs:
+        versionSpec: '20.x'
+
+    - task: PowerShell@2
+      displayName: 'Run Playwright tests (ui-mock)'
+      condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
+      inputs:
+        targetType: inline
+        workingDirectory: '$(build.artifactstagingdirectory)/webapp_package/web-app'
+        script: |
+          npm install -g pnpm
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install chromium
+
+          $env:PLAYWRIGHT_USE_MOCK_API = 'true'
+          $env:PLAYWRIGHT_TEST_TIMEOUT_MS = '20000'
+          pnpm exec playwright test --project=ui-mock
+        pwsh: true
+
+    - task: PowerShell@2
+      displayName: 'Clean node_modules from staging after Playwright'
+      condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
+      inputs:
+        targetType: inline
+        workingDirectory: '$(build.artifactstagingdirectory)/webapp_package/web-app'
+        script: |
+          Remove-Item -Path node_modules -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path test-results -Recurse -Force -ErrorAction SilentlyContinue
+          Remove-Item -Path playwright-report -Recurse -Force -ErrorAction SilentlyContinue
+        pwsh: true
+
+    - task: CopyFiles@2
+      displayName: 'Copy GmmUI webapp arm templates'
+      inputs:
+        SourceFolder: Service/GroupMembershipManagement/Hosts/UI
+        Contents: '**\Infrastructure\**'
+        TargetFolder: '$(build.artifactstagingdirectory)/webapp_arm_templates/UI'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish web app artifacts'
+      inputs:
+        PathtoPublish: '$(build.artifactstagingdirectory)'
+        ArtifactName: '$(Build.BuildNumber)_$(BuildConfiguration)'

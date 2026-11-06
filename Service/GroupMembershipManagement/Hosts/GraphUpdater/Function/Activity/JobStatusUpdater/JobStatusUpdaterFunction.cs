@@ -1,9 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Repositories.Contracts;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Models;
 using Services.Contracts;
 using System;
 using System.Threading.Tasks;
@@ -12,31 +11,32 @@ namespace Hosts.GraphUpdater
 {
     public class JobStatusUpdaterFunction
     {
-        private readonly ILoggingRepository _loggingRepository;
+        private readonly ILogger<JobStatusUpdaterFunction> _logger;
         private readonly IGraphUpdaterService _graphUpdaterService;
 
         public JobStatusUpdaterFunction(
-                        ILoggingRepository loggingRepository,
+                        ILogger<JobStatusUpdaterFunction> logger,
                         IGraphUpdaterService graphUpdaterService)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _graphUpdaterService = graphUpdaterService ?? throw new ArgumentNullException(nameof(graphUpdaterService));
         }
 
-        [FunctionName(nameof(JobStatusUpdaterFunction))]
+        [Function(nameof(JobStatusUpdaterFunction))]
         public async Task UpdateJobStatusAsync([ActivityTrigger] JobStatusUpdaterRequest request)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(JobStatusUpdaterFunction)} function started", RunId = request.RunId });
+            using var scope = _logger.BeginGraphUpdaterScope(request);
+            _logger.FunctionStarted(nameof(JobStatusUpdaterFunction));
 
-            var syncJob = await _graphUpdaterService.GetSyncJobAsync(request.JobPartitionKey, request.JobRowKey);
-            syncJob.ThresholdViolations = request.ThresholdViolations;
+            var syncJob = await _graphUpdaterService.GetSyncJobAsync(request.SyncJob.Id);
+            if (request.Status == SyncStatus.Idle && syncJob.IgnoreThresholdOnce) syncJob.IgnoreThresholdOnce = false;
 
             if (syncJob != null)
             {
-                await _graphUpdaterService.UpdateSyncJobStatusAsync(syncJob, request.Status, request.IsDryRun, request.RunId);
+                await _graphUpdaterService.UpdateSyncJobStatusAsync(syncJob, request.Status, false, request.SyncJob.RunId.GetValueOrDefault(), request.UsersAdded, request.UsersRemoved);
             }
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(JobStatusUpdaterFunction)} function completed", RunId = request.RunId });
+            _logger.FunctionCompleted(nameof(JobStatusUpdaterFunction));
         }
     }
 }

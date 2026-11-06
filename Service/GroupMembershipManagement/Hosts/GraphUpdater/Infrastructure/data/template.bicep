@@ -8,8 +8,30 @@ param environmentAbbreviation string
 @maxLength(3)
 param solutionAbbreviation string = 'gmm'
 
-@description('Enter tenant Id.')
-param tenantId string
+@description('Instance identifier')
+@allowed([
+  ''
+  'small'
+  'large'
+])
+param instanceIdentifier string = ''
 
-@description('Enter storage account name.')
-param storageAccountName string
+var instanceSuffix = empty(instanceIdentifier) ? '' : '-${instanceIdentifier}'
+var functionsStorageAccountName = take('fn${solutionAbbreviation}${environmentAbbreviation}${uniqueString(resourceGroup().id)}', 24)
+
+resource functionsStorageAccount 'Microsoft.Storage/storageAccounts@2022-05-01' existing = {
+  name: functionsStorageAccountName
+}
+
+resource blobServices 'Microsoft.Storage/storageAccounts/blobServices@2022-05-01' existing = {
+  parent: functionsStorageAccount
+  name: 'default'
+}
+
+resource appPackageContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2022-05-01' = {
+  parent: blobServices
+  name: 'graphupdater-app-package${instanceSuffix}'
+  properties: {
+    publicAccess: 'None'
+  }
+}

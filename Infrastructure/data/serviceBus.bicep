@@ -10,16 +10,57 @@ param sku string = 'Standard'
 @description('Location for the service bus.')
 param location string
 
-var authRuleResourceId = resourceId('Microsoft.ServiceBus/namespaces/authorizationRules', name, 'RootManageSharedAccessKey')
+@description('Data KeyVault name.')
+param keyVaultName string
 
-resource serviceBus 'Microsoft.ServiceBus/namespaces@2017-04-01' = {
+@description('Log Analytics Workspace Id.')
+param logAnalyticsWorkspaceId string
+
+resource serviceBus 'Microsoft.ServiceBus/namespaces@2022-10-01-preview' = {
   name: name
   location: location
   sku: {
     name: sku
   }
-  properties: {}
+  properties: {
+    minimumTlsVersion: '1.2'
+    disableLocalAuth: true
+  }
 }
 
-output rootManageSharedAccessKeyPrimaryKey string = listkeys(authRuleResourceId, '2017-04-01').primaryKey
-output rootManageSharedAccessKeyConnectionString string = listkeys(authRuleResourceId, '2017-04-01').primaryConnectionString
+module serviceBusSecrets 'keyVaultSecretsSecure.bicep' = {
+  name: 'serviceBusSecretsTemplate'
+  params: {
+    keyVaultName: keyVaultName
+    keyVaultSecrets: {
+      secrets: [
+        {
+          name: 'serviceBusFQN'
+          value: '${name}.servicebus.windows.net'
+        }
+      ]
+    }
+  }
+  dependsOn: [
+    serviceBus
+  ]
+}
+
+resource diagnosticSettings 'Microsoft.Insights/diagnosticSettings@2021-05-01-preview' = {
+  name: 'ServiceBus-diagnostics'
+  scope: serviceBus
+  properties: {
+    workspaceId:  logAnalyticsWorkspaceId
+    logs: [
+      {
+        category: null
+        categoryGroup: 'allLogs'
+        enabled: true
+        retentionPolicy: {
+          days: 0
+          enabled: false
+        }
+      }
+    ]
+  }
+}

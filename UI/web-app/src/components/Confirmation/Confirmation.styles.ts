@@ -1,0 +1,97 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import {
+    type IConfirmationStyleProps,
+    type IConfirmationStyles,
+} from './Confirmation.types';
+
+export const getStyles = (props: IConfirmationStyleProps): IConfirmationStyles => {
+    const { className, theme } = props;
+
+    return {
+        root: [{
+            paddingTop: 18,
+            paddingBottom: 18,
+            paddingLeft: 22,
+            paddingRight: 22,
+            borderRadius: 10,
+            borderTopLeftRadius: 0,
+            borderTopRightRadius: 0,
+            marginBottom: 12,
+            backgroundColor: theme.palette.white
+        }, className],
+        ConfirmationContainer: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 36,
+        },
+        cardHeader: {
+            display: 'flex',
+            flexDirection: 'row',
+            alignItems: 'space-between',
+        },
+        cardTitle: {
+            textTransform: "uppercase",
+            flex: 1,
+            fontSize: 16,
+            fontStyle: 'normal',
+            fontWeight: 600,
+            lineHeight: '22px',
+            color: theme.palette.themePrimary,
+        },
+        sectionDescription: {
+            fontSize: 14,
+            color: theme.palette.neutralSecondary,
+            marginBottom: 12,
+        },
+        itemTitle: {
+            fontSize: 14,
+            fontWeight: 600
+        },
+        itemData: {
+            paddingTop: 10,
+            fontSize: 14
+        },
+        businessJustificationLabel: {
+            display: 'flex',
+            flexDirection: 'column',
+            gap: 4,
+            paddingBottom: 8,
+        },
+        businessJustificationHelper: {
+            display: 'flex',
+            flexDirection: 'row',
+            alignItems: 'center',
+            gap: 6,
+            fontSize: 13,
+            fontWeight: 400,
+            color: theme.palette.neutralSecondary,
+        },
+        labelContainer: {
+            display: 'flex',
+            alignItems: 'center'
+        },
+        valuesDropdown: {
+            maxWidth: 500
+        },
+        dropdownTitle: {
+            borderRadius: 4,
+            borderStyle: 'solid',
+            borderWidth: 1,
+            borderColor: theme.palette.neutralQuaternary,
+            background: theme.palette.white,
+            maxWidth: 500
+        },
+        dropdownOptionContainer: {
+            display: 'flex',
+            flexDirection: 'column',
+            padding: 4
+        },
+        dropdownOptionEmail: {
+            fontSize: '12px',
+            color: theme.palette.neutralSecondary,
+            marginTop: '2px'
+        },
+    };
+};

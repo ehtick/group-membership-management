@@ -11,14 +11,38 @@ param location string
 ])
 param kind string = 'web'
 
+param ingestionMode string = 'LogAnalytics'
+
+param workspaceId string
+
+@description('Key vault name.')
+param keyVaultName string
+
 resource applicationInsights 'Microsoft.Insights/components@2020-02-02' = {
   kind: kind
   name: name
   location: location
   properties: {
     Application_Type: kind
+    IngestionMode: ingestionMode
+    WorkspaceResourceId: workspaceId
   }
 }
 
+module secureSecretsTemplate 'keyVaultSecretsSecure.bicep' = {
+  name: 'secureSecretsTemplate'
+  params: {
+    keyVaultName: keyVaultName
+    keyVaultSecrets: {
+      secrets: [
+        {
+          name: 'appInsightsConnectionString'
+          value: applicationInsights.properties.ConnectionString
+        }
+      ]
+    }
+  }
+}
+
+
 output appId string = reference(applicationInsights.id, '2015-05-01').AppId
-output instrumentationKey string = reference(applicationInsights.id, '2015-05-01').InstrumentationKey

@@ -1,14 +1,15 @@
 {
   "IsEncrypted": false,
   "Values": {
+    "AZURE_TOKEN_CREDENTIALS": "VisualStudioCredential",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "FUNCTIONS_WORKER_RUNTIME": "dotnet",
+    "AzureWebJobsStorage__credential": "managedidentity",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
     "logAnalyticsCustomerId": "",
-    "logAnalyticsPrimarySharedKey": "",
-    "jobsStorageAccountConnectionString": "",
-    "jobsTableName": "",
+    "ConnectionStrings:JobsContext": "",
+    "ConnectionStrings:JobsContextReadOnly": "",
     "jobSchedulerSchedule": "",
     "appConfigurationEndpoint": "https://gmm-appconfig-<env>.azconfig.io",
-    "APPINSIGHTS_INSTRUMENTATIONKEY": ""
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": ""
   }
 }

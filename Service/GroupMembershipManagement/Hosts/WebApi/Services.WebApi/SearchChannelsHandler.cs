@@ -1,0 +1,60 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Microsoft.Graph.Models;
+using Repositories.Contracts;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using Microsoft.Extensions.Logging;
+using ChannelDTO = WebApi.Models.DTOs.Channel;
+
+namespace Services
+{
+    public class SearchChannelsHandler : RequestHandlerBase<SearchChannelsRequest, SearchChannelsResponse>
+    {
+        private readonly ITeamsChannelRepository _teamsChannelRepository;
+        private readonly IGraphGroupRepository _graphGroupRepository;
+        public SearchChannelsHandler(ILogger<SearchChannelsHandler> logger,
+                              ITeamsChannelRepository teamsChannelRepository,
+                              IGraphGroupRepository graphGroupRepository) : base(logger)
+        {
+            _teamsChannelRepository = teamsChannelRepository ?? throw new ArgumentNullException(nameof(teamsChannelRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+        }
+
+        protected override async Task<SearchChannelsResponse> ExecuteCoreAsync(SearchChannelsRequest request)
+        {
+            var response = new SearchChannelsResponse();
+
+            // Only owners of the Team (or tenant writers) may enumerate its shared channels.
+            if (!(request.IsJobTenantWriter ||
+                  await _graphGroupRepository.IsEmailRecipientOwnerOfGroupAsync(request.UserIdentity, request.TeamId)))
+            {
+                throw new UnauthorizedAccessException("Searching channels requires ownership of the Team.");
+            }
+
+            int minQueryLength = 1;
+            if (string.IsNullOrEmpty(request.Query) || request.Query.Length < minQueryLength)
+            {
+                return response;
+            }
+
+            // Escape single quotes for OData string literals (a single quote is escaped by doubling it).
+            var safeQuery = request.Query.Replace("'", "''");
+            string filter = $"startswith(tolower(displayName),tolower('{safeQuery}'))";
+
+            var channels = await _teamsChannelRepository.SearchTeamsChannelsAsync(request.TeamId, filter);
+
+            foreach (var channel in channels)
+            {
+                if (channel.MembershipType != ChannelMembershipType.Private && channel.MembershipType != ChannelMembershipType.Standard)
+                {
+                    var dto = new ChannelDTO(request.TeamId, channel.Id!, channel.DisplayName!);
+                    response.Model.Add(dto);
+                }
+            }
+
+            return response;
+        }
+    }
+}

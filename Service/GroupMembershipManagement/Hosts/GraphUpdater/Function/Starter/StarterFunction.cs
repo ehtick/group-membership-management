@@ -1,226 +1,245 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
+using Azure.Messaging.ServiceBus;
+using DIConcreteTypes;
+using GraphUpdater.QueueMessageOrchestrator;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Options;
+using Models;
+using Models.ServiceBus;
+using Repositories.Contracts.Helpers;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
 using System.Text;
-using System.Threading;
+using System.Text.Json;
 using System.Threading.Tasks;
-using Entities;
-using Entities.ServiceBus;
-using Microsoft.Azure.ServiceBus;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Extensions.Configuration;
-using Newtonsoft.Json;
-using Polly;
-using Repositories.Contracts;
-using Services.Contracts;
-using Services.Entities;
 
 namespace Hosts.GraphUpdater
 {
     public class StarterFunction
     {
-        private const int MAX_RETRY_ATTEMPTS = 20;
-        private const int FIRST_RETRY_DELAY_IN_SECONDS = 10;
-        private readonly ILoggingRepository _loggingRepository = null;
-        private readonly IServiceBusMessageService _messageService = null;
-        private readonly IConfiguration _configuration = null;
-        private static ConcurrentDictionary<string, SessionTracker> _sessionsTracker = new ConcurrentDictionary<string, SessionTracker>();
+        private readonly ILogger<StarterFunction> _logger;
+        private readonly MembershipUpdaters _membershipUpdaters = null;
+        private readonly MultiLaneConfig _multilaneConfig = null;
+        private const string SUBSCRIPTION_PREFIX = "GraphUpdater";
+        private const string SMALL_SUBSCRIPTION_NAME = "GraphUpdater_small_1";
+        private const string SMALL_FUNCTION_NAME = $"{nameof(StarterFunction)}_small";
+        private const string LARGE_SUBSCRIPTION_NAME = "GraphUpdater_large_1";
+        private const string LARGE_FUNCTION_NAME = $"{nameof(StarterFunction)}_large";
 
-        public StarterFunction(ILoggingRepository loggingRepository, IServiceBusMessageService messageService, IConfiguration configuraion)
+        public StarterFunction(ILogger<StarterFunction> logger,
+            MembershipUpdaters membershipUpdaters,
+            IOptions<MultiLaneConfig> multilaneConfig)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
-            _messageService = messageService ?? throw new ArgumentNullException(nameof(messageService));
-            _configuration = configuraion ?? throw new ArgumentNullException(nameof(configuraion));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _membershipUpdaters = membershipUpdaters ?? throw new ArgumentNullException(nameof(membershipUpdaters));
+            _multilaneConfig = multilaneConfig?.Value ?? throw new ArgumentNullException(nameof(multilaneConfig));
         }
 
-        [FunctionName(nameof(StarterFunction))]
-        public async Task RunAsync(
-        [ServiceBusTrigger("%membershipQueueName%", Connection = "differenceQueueConnection", IsSessionsEnabled = true)] Message message,
-        [DurableClient] IDurableOrchestrationClient starter, IMessageSession messageSession)
+        [Function(SMALL_FUNCTION_NAME)]
+        public async Task RunSmallLaneAsync(
+           [ServiceBusTrigger("membershipupdaters", SMALL_SUBSCRIPTION_NAME, Connection = "gmmServiceBus")]
+            ServiceBusReceivedMessage message,
+           [DurableClient] DurableTaskClient client)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = nameof(StarterFunction) + " function started" });
-
-            var messageDetails = _messageService.GetMessageProperties(message);
-            var graphRequest = new GraphUpdaterFunctionRequest()
+            var groupMembership = JsonSerializer.Deserialize<GroupMembership>(Encoding.UTF8.GetString(message.Body));
+            var additionalProperties = new Dictionary<string, object>
             {
-                Message = Encoding.UTF8.GetString(messageDetails.Body),
-                MessageSessionId = messageDetails.SessionId,
-                MessageLockToken = messageDetails.LockToken
+                ["Instance"] = SMALL_SUBSCRIPTION_NAME,
+                ["MessageIndex"] = groupMembership.MessageIndex,
+                ["TotalMessageCount"] = groupMembership.TotalMessageCount
+            };
+            using var scope = _logger.BeginSyncJobScope(groupMembership.SyncJob, additionalProperties);
+
+            _logger.FunctionStarted(SMALL_FUNCTION_NAME);
+            var additionsInMessage = groupMembership.SourceMembers?.Where(x => x.MembershipAction == MembershipAction.Add).Distinct().Count() ?? 0;
+            var removalsInMessage = groupMembership.SourceMembers?.Where(x => x.MembershipAction == MembershipAction.Remove).Distinct().Count() ?? 0;
+            _logger.ProcessingMessage(message.MessageId, groupMembership.TotalMessageCount, additionsInMessage, removalsInMessage);
+
+            var request = new OrchestratorMultiLaneRequest
+            {
+                GroupMembership = groupMembership,
+                SubscriptionName = SMALL_SUBSCRIPTION_NAME,
+                LaneSize = "small",
+                TopicName = _membershipUpdaters.CurrentTopicName,
             };
 
-            var groupMembership = JsonConvert.DeserializeObject<GroupMembership>(graphRequest.Message);
+            await client.ScheduleNewOrchestrationInstanceAsync(nameof(OrchestratorMultiLaneFunction), request);
 
-            SetSessionTracker(messageDetails, groupMembership);
+            _logger.FunctionCompleted(SMALL_FUNCTION_NAME);
+        }
 
-            var source = new CancellationTokenSource();
-            var renew = RenewMessages(starter, messageSession, source, messageDetails.MessageId);
-            var instanceId = await starter.StartNewAsync(nameof(OrchestratorFunction), graphRequest);
-            var completedGroupMembershipMessages = default(List<GroupMembershipMessage>);
-            var isLastMessage = false;
-            var orchestratorRuntimeStatusCodesWorthRetrying = new OrchestrationRuntimeStatus[]
+        [Function(LARGE_FUNCTION_NAME)]
+        public async Task RunLargeLaneAsync(
+            [ServiceBusTrigger("membershipupdaters", LARGE_SUBSCRIPTION_NAME, Connection = "gmmServiceBus", IsSessionsEnabled = true)]
+             ServiceBusReceivedMessage message,
+            [DurableClient] DurableTaskClient client)
+        {
+            var groupMembership = JsonSerializer.Deserialize<GroupMembership>(Encoding.UTF8.GetString(message.Body));
+            var additionalProperties = new Dictionary<string, object>
             {
-                OrchestrationRuntimeStatus.ContinuedAsNew,
-                OrchestrationRuntimeStatus.Running,
-                OrchestrationRuntimeStatus.Pending
+                ["Instance"] = LARGE_SUBSCRIPTION_NAME,
+                ["MessageIndex"] = groupMembership.MessageIndex,
+                ["TotalMessageCount"] = groupMembership.TotalMessageCount
             };
+            using var scope = _logger.BeginSyncJobScope(groupMembership.SyncJob, additionalProperties);
 
-            var result = default(DurableOrchestrationStatus);
+            _logger.FunctionStarted(LARGE_FUNCTION_NAME);
+            var additionsInMessage = groupMembership.SourceMembers?.Where(x => x.MembershipAction == MembershipAction.Add).Distinct().Count() ?? 0;
+            var removalsInMessage = groupMembership.SourceMembers?.Where(x => x.MembershipAction == MembershipAction.Remove).Distinct().Count() ?? 0;
+            _logger.ProcessingMessage(message.MessageId, groupMembership.TotalMessageCount, additionsInMessage, removalsInMessage);
 
-            /*Understanding the Retry policy
-            We have a lot of sub-second sync execution so the first query would ensure we cater to those queries
-            We also have a lot of syncs that take less than 10 seconds. Having a exponetial backoff 1.25^1 would mean we would be waiting 90 seconds per sync instead of 10 seconds.
-            Hence the logic to ensure retryAttempt 1 is done after 10 seconds. Following this we go back to the exponetial backoff.
-             */
+            try
+            {
+                var instanceId = $"{groupMembership.RunId}_{message.SequenceNumber}";
+                var orchestratorStatus = await client.GetInstanceAsync(instanceId);
 
-            var retryPolicy = Policy
-                .HandleResult<DurableOrchestrationStatus>(status => orchestratorRuntimeStatusCodesWorthRetrying.Contains(status.RuntimeStatus))
-                .WaitAndRetryAsync(
-                    MAX_RETRY_ATTEMPTS,
-                    retryAttempt =>
+                if (orchestratorStatus == null)
+                {
+                    var request = new OrchestratorMultiLaneRequest
                     {
-                        if (retryAttempt == 1)
-                            return TimeSpan.FromSeconds(FIRST_RETRY_DELAY_IN_SECONDS);
-                        else
-                            return TimeSpan.FromMinutes(Math.Pow(1.25, retryAttempt - 1));
-                    }
-                );
-
-            await retryPolicy.ExecuteAsync(async () =>
-            {
-                result = await starter.GetStatusAsync(instanceId);
-                return result;
-            });
-
-            if (result.RuntimeStatus == OrchestrationRuntimeStatus.Failed || result.RuntimeStatus == OrchestrationRuntimeStatus.Terminated)
-            {
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Error: Status of instance {result.InstanceId} is {result.RuntimeStatus}. The error message is : {result.Output}" });
-
-                // stop renewing the message session
-                source.Cancel();
-            }
-            else
-            {
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Instance processing completed for {result.InstanceId}" });
-                var orchestratorResponseOutput = JsonConvert.DeserializeObject<GroupMembershipMessageResponse>(result.Output.ToString());
-                completedGroupMembershipMessages = orchestratorResponseOutput.CompletedGroupMembershipMessages;
-                isLastMessage = orchestratorResponseOutput.ShouldCompleteMessage;
-            }
-
-            if (isLastMessage)
-            {
-                var completedLockTokens = completedGroupMembershipMessages.Select(x => x.LockToken);
-                await messageSession.CompleteAsync(completedLockTokens);
-                await messageSession.CloseAsync();
-                source.Cancel();
-            }
-
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = nameof(StarterFunction) + " function completed" });
-        }
-
-        private static readonly TimeSpan _waitBetweenRenew = TimeSpan.FromSeconds(30);
-        private async Task RenewMessages(
-            IDurableOrchestrationClient starter,
-            IMessageSession messageSession,
-            CancellationTokenSource cancellationToken,
-            string messageId)
-        {
-            while (!cancellationToken.IsCancellationRequested)
-            {
-                var action = await TrackLastMessageTimeout(starter, messageSession, messageId);
-                if (action == SessionTrackerAction.Stop)
-                {
-                    break;
-                }
-
-                await messageSession.RenewSessionLockAsync();
-                await Task.Delay(_waitBetweenRenew);
-            }
-        }
-
-        private void SetSessionTracker(MessageInformation messageDetails, GroupMembership groupMembership)
-        {
-            if (_sessionsTracker.ContainsKey(messageDetails.SessionId))
-            {
-                var sessionTracker = _sessionsTracker[messageDetails.SessionId];
-                var lockTokens = sessionTracker.LockTokens;
-
-                lockTokens.Add(messageDetails.LockToken);
-                _sessionsTracker.TryUpdate(messageDetails.SessionId,
-                                            new SessionTracker
-                                            {
-                                                LastAccessTime = DateTime.UtcNow,
-                                                LatestMessageId = messageDetails.MessageId,
-                                                RunId = groupMembership.RunId,
-                                                LockTokens = lockTokens,
-                                                JobPartitionKey = groupMembership.SyncJobPartitionKey,
-                                                JobRowKey = groupMembership.SyncJobRowKey,
-                                                ReceivedLastMessage = groupMembership.IsLastMessage
-                                            },
-                                            sessionTracker
-                                           );
-            }
-            else
-            {
-                _sessionsTracker.TryAdd(messageDetails.SessionId,
-                                        new SessionTracker
-                                        {
-                                            LastAccessTime = DateTime.UtcNow,
-                                            LatestMessageId = messageDetails.MessageId,
-                                            RunId = groupMembership.RunId,
-                                            LockTokens = new List<string> { messageDetails.LockToken },
-                                            JobPartitionKey = groupMembership.SyncJobPartitionKey,
-                                            JobRowKey = groupMembership.SyncJobRowKey,
-                                            ReceivedLastMessage = groupMembership.IsLastMessage
-                                        });
-            }
-        }
-
-        private async Task<SessionTrackerAction> TrackLastMessageTimeout(IDurableOrchestrationClient starter, IMessageSession messageSession, string messageId)
-        {
-            if (_sessionsTracker.TryGetValue(messageSession.SessionId, out var sessionTracker))
-            {
-                if (sessionTracker.ReceivedLastMessage)
-                {
-                    return SessionTrackerAction.Continue;
-                }
-
-                if (messageId != sessionTracker.LatestMessageId)
-                {
-                    return SessionTrackerAction.Stop;
-                }
-
-                int.TryParse(_configuration["GraphUpdater:LastMessageWaitTimeout"], out int timeOut);
-                timeOut = timeOut == 0 ? 10 : timeOut;
-
-                var elapsedTime = DateTime.UtcNow - sessionTracker.LastAccessTime;
-                if (elapsedTime.TotalMinutes >= timeOut)
-                {
-                    _sessionsTracker.Remove(messageSession.SessionId, out _);
-                    await messageSession.CompleteAsync(sessionTracker.LockTokens);
-                    await messageSession.CloseAsync();
-
-                    var cancelationRequest = new GraphUpdaterFunctionRequest
-                    {
-                        IsCancelationRequest = true,
-                        MessageSessionId = messageSession.SessionId,
-                        Message = JsonConvert.SerializeObject(new GroupMembership
-                        {
-                            SyncJobPartitionKey = sessionTracker.JobPartitionKey,
-                            SyncJobRowKey = sessionTracker.JobRowKey,
-                            RunId = sessionTracker.RunId
-                        }),
+                        GroupMembership = groupMembership,
+                        SubscriptionName = LARGE_SUBSCRIPTION_NAME,
+                        LaneSize = "large",
+                        TopicName = _membershipUpdaters.CurrentTopicName,
                     };
 
-                    await starter.StartNewAsync(nameof(OrchestratorFunction), cancelationRequest);
-                    return SessionTrackerAction.Stop;
+                    await client.ScheduleNewOrchestrationInstanceAsync(nameof(OrchestratorMultiLaneFunction), request, new StartOrchestrationOptions { InstanceId = instanceId });
+                    await WaitForInstanceAsync(client, instanceId);
+
+                }
+                else if (orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Running
+                        || orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Pending)
+                {
+                    await WaitForInstanceAsync(client, instanceId);
+                }
+                else if (orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Completed
+                        || orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Terminated
+                        || orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Failed)
+
+                {
+                    _logger.MessageAlreadyProcessed(message.MessageId, message.SequenceNumber, orchestratorStatus.RuntimeStatus.ToString());
                 }
             }
+            catch (Exception ex)
+            {
+                _logger.StarterServiceBusError(ex, ex.Message);
+                throw;
+            }
 
-            return SessionTrackerAction.Continue;
+            _logger.FunctionCompleted(LARGE_FUNCTION_NAME);
+        }
+
+        [Function(nameof(StarterFunction))]
+        public async Task RunAsync(
+         [TimerTrigger("%triggerSchedule%")] TimerInfo myTimer,
+         [DurableClient] DurableTaskClient client)
+        {
+            // Handle the default GraphUpdater instance
+            if (_multilaneConfig.IsEnabled && string.IsNullOrWhiteSpace(_membershipUpdaters.CurrentLaneSize))
+            {
+                return;
+            }
+
+            // Handle the multilane GraphUpdater instances
+            if (!_multilaneConfig.IsEnabled && !string.IsNullOrWhiteSpace(_membershipUpdaters.CurrentLaneSize))
+            {
+                return;
+            }
+
+            if (_multilaneConfig.IsEnabled)
+            {
+                if (_multilaneConfig.TriggerDelay > 0)
+                {
+                    await Task.Delay(_multilaneConfig.TriggerDelay * 1000);
+                }
+
+                var starters = new List<Task>();
+                foreach (var instance in GetInstanceInformation())
+                {
+                    starters.Add(ProcessTimerAsync(client, instance));
+                }
+
+                await Task.WhenAny(starters);
+            }
+            else
+            {
+                await ProcessTimerAsync(client, SUBSCRIPTION_PREFIX);
+            }
+        }
+
+        private List<string> GetInstanceInformation()
+        {
+            var instancePrefix = _membershipUpdaters.CurrentLaneSize.ToLowerInvariant();
+            var laneCount = _membershipUpdaters.AvailableInstances["GroupMembership"][_membershipUpdaters.CurrentLaneSize].Instances;
+
+            var instances = new List<string>();
+            for (int i = 1; i <= laneCount; i++)
+            {
+                instances.Add($"{SUBSCRIPTION_PREFIX}_{instancePrefix}_{i}");
+            }
+
+            return instances;
+        }
+
+        private async Task ProcessTimerAsync(DurableTaskClient client, string subscriptionName)
+        {
+            _logger.FunctionStarted(nameof(StarterFunction));
+
+            var orchestrator = nameof(QueueMessageOrchestratorFunction);
+            var instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_{subscriptionName.ToLowerInvariant()}";
+            var orchestratorStatus = await client.GetInstanceAsync(instanceId);
+            var isRunning = orchestratorStatus != null
+                    && orchestratorStatus.RuntimeStatus != OrchestrationRuntimeStatus.Completed
+                    && orchestratorStatus.RuntimeStatus != OrchestrationRuntimeStatus.Terminated
+                    && orchestratorStatus.RuntimeStatus != OrchestrationRuntimeStatus.Failed;
+
+            if (!isRunning)
+            {
+                _logger.CallingOrchestrator(instanceId);
+
+                await client.ScheduleNewOrchestrationInstanceAsync(orchestrator, new QueueMessageOrchestratorRequest
+                {
+                    TopicName = _membershipUpdaters.CurrentTopicName,
+                    LaneSize = _membershipUpdaters.CurrentLaneSize,
+                    SubscriptionName = subscriptionName,
+                    IsMultiLaneEnabled = _multilaneConfig.IsEnabled
+                }, new StartOrchestrationOptions { InstanceId = instanceId });
+            }
+
+            _logger.FunctionCompleted(nameof(StarterFunction));
+        }
+
+        private async Task WaitForInstanceAsync(DurableTaskClient client, string instanceId)
+        {
+            var delay = TimeSpan.FromSeconds(1);
+            var maxDelay = TimeSpan.FromSeconds(30);
+
+            while (true)
+            {
+                await Task.Delay(delay);
+
+                var orchestratorStatus = await client.GetInstanceAsync(instanceId);
+                if (orchestratorStatus != null)
+                {
+                    // Only return when the orchestration has reached a terminal state.
+                    if (orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Completed
+                        || orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Terminated
+                        || orchestratorStatus.RuntimeStatus == OrchestrationRuntimeStatus.Failed)
+                    {
+                        return;
+                    }
+
+                    // Otherwise (Running/Pending/ContinuedAsNew), keep waiting.
+                }
+
+                // If status is null or non-terminal, continue waiting with backoff.
+                delay = TimeSpan.FromSeconds(Math.Min(delay.TotalSeconds * 1.5, maxDelay.TotalSeconds));
+            }
         }
     }
 }

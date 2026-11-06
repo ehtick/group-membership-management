@@ -81,16 +81,22 @@ function Set-ServicePrincipal {
     Write-Host "`n"
 
     $subscriptionId = Read-Host -Prompt "If you would like to use other subscription than '$($currentSubscription.Name)' `nprovide the subscription id, otherwise press enter to continue."
+    if ([string]::IsNullOrEmpty($subscriptionId)){
+        $subscriptionId = $currentSubscription.Id
+    }
+
     if ($subscriptionId)
     {
         Set-AzContext -SubscriptionId $subscriptionId
         $currentSubscription = (Get-AzContext).Subscription
         Write-Host "Selected subscription: $($currentSubscription.Name) -  $($currentSubscription.Id)"
     }
+    else {
+        Write-Host "No subscription has been selected."
+        return
+    }
 
     Write-Host "Please ensure you have ownership permissions on this subscription."
-
-    $scope = "/subscriptions/$($subscription.Id)"
 
     $servicePrincipalName = "$solutionAbbreviation-serviceconnection-$environmentAbbreviation";
 
@@ -111,7 +117,7 @@ function Set-ServicePrincipal {
     if($null -eq $servicePrincipal) {
         #region Create service principal
         Write-Host "The service principal is being created..."
-        $servicePrincipal = New-AzADServicePrincipal -Role "Owner" -Scope $scope -DisplayName $servicePrincipalName
+        $servicePrincipal = New-AzADServicePrincipal -Role "Owner" -DisplayName $servicePrincipalName
         Write-Host "The service principal has been created."
         #endregion
 
@@ -121,11 +127,5 @@ function Set-ServicePrincipal {
         Start-Sleep -Seconds 30
     }
 
-    Write-Host "Assigning service principal to resource groups..."
-    $resourceGroupTypes = "compute", "data", "prereqs"
-    foreach ($resourceGroupType in $resourceGroupTypes)
-    {
-        $resourceGroupName = "$solutionAbbreviation-$resourceGroupType-$environmentAbbreviation"
-        Set-Role -RoleDefinitionName "Contributor" -ResourceGroupName $resourceGroupName -ObjectId $servicePrincipal.Id
-    }
+    Write-Host "The service principal has propagated and is ready for use."
 }

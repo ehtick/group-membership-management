@@ -1,0 +1,28 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AZURE_TOKEN_CREDENTIALS": "VisualStudioCredential",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "graphCredentials:KeyVaultName": "",
+    "graphCredentials:KeyVaultTenantId": "",
+    "appConfigurationEndpoint": "",
+    "serviceBusSyncJobTopic": "",
+    "gmmServiceBus__fullyQualifiedNamespace": "<service_bus_namespace>.servicebus.windows.net",
+    "graphCredentials:ClientSecret": "",
+    "graphCredentials:ClientId": "",
+    "graphCredentials:TenantId": "",
+    "ConnectionStrings:JobsContext": "",
+    "ConnectionStrings:JobsContextReadOnly": "",
+    "senderAddress": "",
+    "senderPassword": "",
+    "supportEmailAddresses": "",
+    "membershipStorageAccountName": "",
+    "membershipContainerName": "",
+    "graphUpdaterUrl": "",
+    "graphUpdaterFunctionKey": "",
+    "serviceBusMembershipAggregatorQueue": "",
+    "serviceBusNotificationsQueue": ""
+  }
+}

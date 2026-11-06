@@ -1,0 +1,47 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Models.ThresholdNotifications;
+using Repositories.Contracts;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Threading.Tasks;
+
+namespace Repositories.Notifications.Tests
+{
+    public class MockNotificationRepository : INotificationRepository
+    {
+        public List<ThresholdNotification> ThresholdNotifications { get; set; } = new List<ThresholdNotification>();
+
+        public async Task<ThresholdNotification> GetThresholdNotificationByIdAsync(Guid notificationId)
+        {
+            var thresholdNotification = ThresholdNotifications.FirstOrDefault(x => x.Id == notificationId);
+            return await Task.FromResult(thresholdNotification);
+        }
+
+        public async Task SaveNotificationAsync(ThresholdNotification notification)
+        {
+            await Task.CompletedTask;
+        }
+
+        public async Task<ThresholdNotification> GetThresholdNotificationBySyncJobIdAsync(Guid syncJobId)
+        {
+            var thresholdNotification = ThresholdNotifications.FirstOrDefault(x => x.SyncJobId == syncJobId);
+            return await Task.FromResult(thresholdNotification);
+        }
+
+        public async Task<ThresholdNotification> GetLatestThresholdNotificationBySyncJobIdAsync(Guid syncJobId)
+        {
+            var thresholdNotification = ThresholdNotifications
+                .Where(x => x.SyncJobId == syncJobId)
+                .OrderByDescending(x => x.CreatedTime)
+                .FirstOrDefault();
+            return await Task.FromResult(thresholdNotification);
+        }
+
+        public Task UpdateNotificationStatusAsync(ThresholdNotification notification, ThresholdNotificationStatus status)
+        {
+            throw new NotImplementedException();
+        }
+    }
+}

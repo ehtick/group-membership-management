@@ -1,12 +1,18 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-using Entities;
+using Microsoft.ApplicationInsights;
+using Microsoft.Extensions.Logging;
 using Microsoft.Graph;
-using Newtonsoft.Json;
+using Microsoft.Graph.Models;
+using Microsoft.Kiota.Abstractions;
+using Models;
 using Polly;
+using Polly.Retry;
 using Polly.Wrap;
 using Repositories.Contracts;
+using Repositories.Contracts.Constants;
+using Repositories.Contracts.Helpers;
 using Repositories.Contracts.InjectConfig;
 using Services.Models;
 using System;
@@ -15,7 +21,7 @@ using System.Diagnostics;
 using System.Linq;
 using System.Net;
 using System.Net.Http;
-using System.Text;
+using System.Text.Json;
 using System.Threading.Tasks;
 
 namespace Repositories.GraphAzureADUsers
@@ -30,40 +36,28 @@ namespace Repositories.GraphAzureADUsers
         private const string UserPrincipalNameFieldName = "userPrincipalName";
 
         private readonly Dictionary<string, GraphProfileInformation> _cache;
-        private readonly IGraphServiceClient _graphClient;
-        private readonly ILoggingRepository _loggingRepository = null;
-        private readonly IGraphServiceAttemptsValue _maxGraphServiceAttempts;
+        private readonly GraphServiceClient _graphClient;
+        private readonly ILogger<GraphUserRepository> _logger;
+        private readonly IRetryPolicyProvider _retryPolicyProvider;
+        private readonly TelemetryClient _telemetryClient;
 
         public GraphUserRepository(
-                ILoggingRepository loggingRepository,
-                IGraphServiceClient graphClient,
-                IGraphServiceAttemptsValue maxGraphServiceAttempts
+                ILogger<GraphUserRepository> logger,
+                GraphServiceClient graphClient,
+                IRetryPolicyProvider retryPolicyProvider,
+                TelemetryClient telemetryClient
             )
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
             _graphClient = graphClient ?? throw new ArgumentNullException(nameof(graphClient));
             _cache = new Dictionary<string, GraphProfileInformation>();
-            _maxGraphServiceAttempts = maxGraphServiceAttempts;
-        }
-
-        public TimeSpan GetSleepDuration(int retryCount, DelegateResult<HttpResponseMessage> response, Context context)
-        {
-            var waitTime = response.Result.Headers.RetryAfter.Date.Value - DateTime.UtcNow;
-
-            _ = _loggingRepository.LogMessageAsync(new LogMessage
-            {
-                Message = $"Wait time set to {waitTime}",
-                RunId = null
-            });
-
-            return waitTime;
+            _retryPolicyProvider = retryPolicyProvider ?? throw new ArgumentNullException(nameof(retryPolicyProvider));
+            _telemetryClient = telemetryClient ?? throw new ArgumentNullException(nameof(telemetryClient));
         }
 
         public async Task<IList<GraphProfileInformation>> GetAzureADObjectIdsAsync(IList<string> personnelNumbers, Guid? runId)
         {
             if (personnelNumbers.Count == 0) return new List<GraphProfileInformation>();
-
-            var graphMemberIdPolicy = GetRetryPolicy(runId);
 
             IList<string> unprocessedPersonnelNumbers = new List<string>();
             var profiles = new List<GraphProfileInformation>();
@@ -86,10 +80,10 @@ namespace Repositories.GraphAzureADUsers
                 unprocessedPersonnelNumbers = personnelNumbers;
             }
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{unprocessedPersonnelNumbers.Count} out of {personnelNumbers.Count} need to be retrieved from graph.", RunId = runId });
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{_cache.Keys.Count} profiles exist in the cache.", RunId = runId });
+            _logger.LogInformationWithRunId(runId, $"{unprocessedPersonnelNumbers.Count} out of {personnelNumbers.Count} need to be retrieved from graph.");
+            _logger.LogInformationWithRunId(runId, $"{_cache.Keys.Count} profiles exist in the cache.");
 
-            var fields = string.Join(",", new[] { IdFieldName, PersonnelNumberFieldName, UserPrincipalNameFieldName });
+            var fields = new[] { IdFieldName, PersonnelNumberFieldName, UserPrincipalNameFieldName };
 
             // Graph currently limits batches to 10 requests per batch
             // Graph currently limits the number of conditions in a $filter expression to 20
@@ -106,107 +100,92 @@ namespace Repositories.GraphAzureADUsers
 
             while (pnQueue.Count > 0)
             {
-                using (var batchRequestContent = new BatchRequestContent())
+                var batchRequestContent = new BatchRequestContentCollection(_graphClient);
+
+                int limit = pnQueue.Count >= FILTER_CONDITION_LIMIT ? 10 : pnQueue.Count;
+
+                // add request steps
+                while (batchRequestContent.BatchRequestSteps.Count < BATCH_REQUEST_LIMIT && pnQueue.Count != 0)
                 {
-                    int limit = pnQueue.Count >= FILTER_CONDITION_LIMIT ? 10 : pnQueue.Count;
-
-                    // add request steps
-                    while (batchRequestContent.BatchRequestSteps.Count < BATCH_REQUEST_LIMIT && pnQueue.Count != 0)
+                    var requestPersonnelNumbers = new List<string>();
+                    limit = pnQueue.Count >= FILTER_CONDITION_LIMIT ? 10 : pnQueue.Count;
+                    for (var i = 0; i < limit; i++)
                     {
-                        var requestPersonnelNumbers = new List<string>();
-                        limit = pnQueue.Count >= FILTER_CONDITION_LIMIT ? 10 : pnQueue.Count;
-                        for (var i = 0; i < limit; i++)
+                        var personnelNumber = pnQueue.Dequeue();
+                        if (!string.IsNullOrEmpty(personnelNumber))
                         {
-                            requestPersonnelNumbers.Add(pnQueue.Dequeue());
-                        }
-
-                        // build filter expression
-                        var filter = $"(onPremisesImmutableId eq '{string.Join("' or onPremisesImmutableId eq '", requestPersonnelNumbers.ToArray())}')";
-                        var requestMessage = _graphClient.Users.Request().Filter(filter).Select(fields).WithPerRequestAuthProvider().GetHttpRequestMessage();
-                        requestsCreated++;
-
-                        batchRequestContent.AddBatchRequestStep(new BatchRequestStep($"{requestsCreated}", requestMessage, null));
-                    }
-
-                    // every 20 requests send a batch or if there are no more requests to make
-                    batchCount++;
-                    batchTimer.Start();
-
-                    HttpResponseMessage httpResponse = null;
-                    await graphMemberIdPolicy.ExecuteAsync(async () =>
-                    {
-                        var batchRequest = new HttpRequestMessage(HttpMethod.Post, "https://graph.microsoft.com/v1.0/$batch")
-                        {
-                            Content = batchRequestContent
-                        };
-                        await _graphClient.AuthenticationProvider.AuthenticateRequestAsync(batchRequest);
-
-                        httpResponse = await _graphClient.HttpProvider.SendAsync(batchRequest);
-
-                        await _loggingRepository.LogMessageAsync(new LogMessage
-                        {
-                            Message = $"Graph Response:"
-                                    + $"\nStatusCode {httpResponse.StatusCode}",
-                            RunId = runId
-                        });
-
-                        return httpResponse;
-                    });
-
-                    var batchResponse = new BatchResponseContent(httpResponse);
-
-                    // process each request in the batch
-                    foreach (var response in await batchResponse.GetResponsesAsync())
-                    {
-                        // request was successful
-                        if (response.Value.IsSuccessStatusCode)
-                        {
-                            var content = await response.Value.Content.ReadAsStringAsync();
-                            var oDataResponse = JsonConvert.DeserializeObject<ODataResponse<List<User>>>(content);
-
-                            // process each user
-                            foreach (var user in oDataResponse.Value)
-                            {
-                                var profile = new GraphProfileInformation
-                                {
-                                    Id = user.Id,
-                                    PersonnelNumber = user.OnPremisesImmutableId,
-                                    UserPrincipalName = user.UserPrincipalName
-                                };
-
-                                profiles.Add(profile);
-                                _cache.Add(profile.PersonnelNumber, profile);
-                            }
+                            requestPersonnelNumbers.Add(personnelNumber);
                         }
                         else
                         {
-                            await _loggingRepository.LogMessageAsync(new LogMessage
-                            {
-                                Message = $"Graph Request failures:"
-                                   + $"\nStatusCode {response.Value.StatusCode}"
-                                   + $"\nReasonPhrase {response.Value.ReasonPhrase}"
-                                   + $"\nRequestURI {batchRequestContent.BatchRequestSteps[response.Key].Request.RequestUri}",
-                                RunId = runId
-                            });
+                            _logger.LogInformationWithRunId(runId, "Skipped empty onPremisesImmutableId.");
                         }
                     }
 
-                    batchTimer.Stop();
-                    batchTimes.Add(batchTimer.Elapsed);
-
-                    await _loggingRepository.LogMessageAsync(new LogMessage
+                    // build filter expression
+                    var filter = $"(onPremisesImmutableId eq '{string.Join("' or onPremisesImmutableId eq '", requestPersonnelNumbers.ToArray())}')";
+                    var requestInformation = _graphClient.Users.ToGetRequestInformation(requestConfiguration =>
                     {
-                        Message = $"Graph Request: {batchCount} of {totalBatches}{Environment.NewLine}"
-                                    + $"    Batch Time Elapsed: {batchTimer.ElapsedMilliseconds} ms{Environment.NewLine}"
-                                    + $"    Total Time Elapsed: {jobTimer.Elapsed}{Environment.NewLine}"
-                                    + $"    Total Profile Count: {profiles.Count}{Environment.NewLine}"
-                                    + $"    Total Users Not Found: {(personnelNumbers.Count - pnQueue.Count) - profiles.Count}{Environment.NewLine}"
-                                    + $"    Total Queue Remaining: {pnQueue.Count}{Environment.NewLine}",
-                        RunId = runId
+                        requestConfiguration.QueryParameters.Select = fields;
+                        requestConfiguration.QueryParameters.Filter = filter;
                     });
+                    requestsCreated++;
 
-                    batchTimer.Reset();
+                    await batchRequestContent.AddBatchRequestStepAsync(requestInformation);
                 }
+
+                // every 20 requests send a batch or if there are no more requests to make
+                batchCount++;
+                batchTimer.Start();
+
+                var batchResponse = await _graphClient.Batch.PostAsync(batchRequestContent);
+
+                // process each request in the batch
+                var responseStatusCodes = await batchResponse.GetResponsesStatusCodesAsync();
+                var responses = await Task.WhenAll(responseStatusCodes.Select(async x => new KeyValuePair<string, HttpResponseMessage>(x.Key, await batchResponse.GetResponseByIdAsync(x.Key))));
+                foreach (var response in responses)
+                {
+                    await GraphTelemetryHelper.TrackResourceUnitsAsync(response.Value, QueryType.Other, runId, _logger, _telemetryClient);
+
+                    // request was successful
+                    if (response.Value.IsSuccessStatusCode)
+                    {
+                        var content = await response.Value.Content.ReadAsStringAsync();
+                        var oDataResponse = JsonSerializer.Deserialize<ODataResponse<List<GraphProfileInformation>>>(content);
+
+                        // process each user
+                        foreach (var user in oDataResponse.Value)
+                        {
+                            profiles.Add(user);
+                            _cache.Add(user.PersonnelNumber, user);
+                        }
+                    }
+                    else
+                    {
+                        _logger.LogWarningWithRunId(
+                            runId,
+                            $"Graph Request failures:"
+                            + $"\nStatusCode {response.Value.StatusCode}"
+                            + $"\nReasonPhrase {response.Value.ReasonPhrase}"
+                            + $"\nRequestURI {batchRequestContent.BatchRequestSteps[response.Key].Request.RequestUri}");
+                    }
+
+                    response.Value.Dispose();
+                }
+
+                batchTimer.Stop();
+                batchTimes.Add(batchTimer.Elapsed);
+
+                _logger.LogInformationWithRunId(
+                    runId,
+                    $"Graph Request: {batchCount} of {totalBatches}{Environment.NewLine}"
+                    + $"    Batch Time Elapsed: {batchTimer.ElapsedMilliseconds} ms{Environment.NewLine}"
+                    + $"    Total Time Elapsed: {jobTimer.Elapsed}{Environment.NewLine}"
+                    + $"    Total Profile Count: {profiles.Count}{Environment.NewLine}"
+                    + $"    Total Users Not Found: {(personnelNumbers.Count - pnQueue.Count) - profiles.Count}{Environment.NewLine}"
+                    + $"    Total Queue Remaining: {pnQueue.Count}{Environment.NewLine}");
+
+                batchTimer.Reset();
             }
 
             jobTimer.Stop();
@@ -214,42 +193,46 @@ namespace Repositories.GraphAzureADUsers
             return profiles;
         }
 
-        public async Task<List<GraphProfileInformation>> AddUsersAsync(List<User> users, Guid? runId)
+        public async Task<List<GraphProfileInformation>> AddUsersAsync(List<GraphUser> users, Guid? runId)
         {
-            var usersToProccess = new Queue<User>(users);
+            var usersToProcess = new Queue<GraphUser>(users);
             var profiles = new List<GraphProfileInformation>();
 
-            while (usersToProccess.Count > 0)
+            while (usersToProcess.Count > 0)
             {
-                var batchRequestContent = CreateBatchRequestContent(usersToProccess);
+                var batchRequestContent = await CreateBatchRequestContentAsync(usersToProcess);
 
                 if (batchRequestContent.BatchRequestSteps.Count == 0)
                 {
                     return profiles;
                 }
 
-                HttpResponseMessage httpResponse = await SendBatchRequestAsync(batchRequestContent, runId);
-                var batchResponse = new BatchResponseContent(httpResponse);
-                var allResponses = await batchResponse.GetResponsesAsync();
+                var batchResponse = await SendBatchRequestAsync(batchRequestContent);
+                var responseStatusCodes = await batchResponse.GetResponsesStatusCodesAsync();
+                var responses = await Task.WhenAll(responseStatusCodes.Select(async x => new KeyValuePair<string, HttpResponseMessage>(x.Key, await batchResponse.GetResponseByIdAsync(x.Key))));
+                var allResponses = responses.ToDictionary(x => x.Key, x => x.Value);
 
-                var profileResponses = await ProcessIndividualResponsesAsync(allResponses, batchRequestContent);
+                var profileResponses = await ProcessIndividualResponsesAsync(allResponses, runId);
                 profiles.AddRange(profileResponses.Profiles);
 
-                var newProfiles = await RetrySingleRequestsAsync(allResponses, new Queue<BatchRequestStep>(profileResponses.BatchSteps));
+                var usersToRetry = users.Where(u => profileResponses.UserIdsToRetry.Contains(u.OnPremisesImmutableId));
+                var newProfiles = await RetrySingleRequestsAsync(allResponses, new Queue<GraphUser>(usersToRetry), runId);
                 profiles.AddRange(newProfiles);
             }
 
             return profiles;
         }
 
-        private async Task<(List<GraphProfileInformation> Profiles, List<BatchRequestStep> BatchSteps)>
-            ProcessIndividualResponsesAsync(Dictionary<string, HttpResponseMessage> responses, BatchRequestContent batchRequestContent)
+        private async Task<(List<GraphProfileInformation> Profiles, List<string> UserIdsToRetry)>
+            ProcessIndividualResponsesAsync(Dictionary<string, HttpResponseMessage> responses, Guid? runId)
         {
             var profiles = new List<GraphProfileInformation>();
-            var stepsToRetry = new List<BatchRequestStep>();
+            var userIdsToRetry = new List<string>();
 
             foreach (var response in responses)
             {
+                await GraphTelemetryHelper.TrackResourceUnitsAsync(response.Value, QueryType.Other, runId, _logger, _telemetryClient);
+
                 if (response.Value.IsSuccessStatusCode)
                 {
                     var profile = await ExtractProfileAsync(response.Value, response.Key);
@@ -257,74 +240,65 @@ namespace Repositories.GraphAzureADUsers
                 }
                 else if (response.Value.StatusCode == HttpStatusCode.TooManyRequests)
                 {
-                    stepsToRetry.Add(batchRequestContent.BatchRequestSteps[response.Key]);
+                    userIdsToRetry.Add(response.Key);
                 }
                 else
                 {
                     await LogErrorAsync(response.Value, null);
                 }
+
+                response.Value.Dispose();
             }
 
             if (profiles.Count > 0)
             {
-                await _loggingRepository.LogMessageAsync(new LogMessage
-                {
-                    Message = $"Added {profiles.Count} new users.",
-                    RunId = null
-                });
+                _logger.LogInformationWithRunId(runId, $"Added {profiles.Count} new users.");
             }
 
-            if (stepsToRetry.Count > 0)
+            if (userIdsToRetry.Count > 0)
             {
-                await _loggingRepository.LogMessageAsync(new LogMessage
-                {
-                    Message = $"Too many requests. Requeueed {stepsToRetry.Count} requests.",
-                    RunId = null
-                });
+                _logger.LogWarningWithRunId(runId, $"Too many requests. Requeueed {userIdsToRetry.Count} requests.");
             }
 
-            return (profiles, stepsToRetry);
+            return (profiles, userIdsToRetry);
         }
 
-        private async Task<List<GraphProfileInformation>> RetrySingleRequestsAsync(Dictionary<string, HttpResponseMessage> responses, Queue<BatchRequestStep> stepsToRetry)
+        private async Task<List<GraphProfileInformation>> RetrySingleRequestsAsync(
+            Dictionary<string, HttpResponseMessage> responses,
+            Queue<GraphUser> usersToRetry,
+            Guid? runId)
         {
             var profiles = new List<GraphProfileInformation>();
 
-            if (stepsToRetry.Count > 0)
+            if (usersToRetry.Count > 0)
             {
                 var retryAfter = responses
                                         .Where(x => x.Value.Headers.RetryAfter != null && x.Value.Headers.RetryAfter.Delta.HasValue)
-                                        .Select(x => x.Value.Headers.RetryAfter.Delta.Value)
-                                        .Max();
+                                        .Select(x => x.Value.Headers.RetryAfter.Delta.Value);
 
-                var waitTime = (int)retryAfter.TotalMilliseconds + 30000;
+                var maxDelta = retryAfter.Any() ? retryAfter.Max() : TimeSpan.Zero;
 
-                await _loggingRepository.LogMessageAsync(new LogMessage
-                {
-                    Message = $"Waiting for {waitTime / 1000} seconds to continue.",
-                    RunId = null
-                });
+                var waitTime = (int)maxDelta.TotalMilliseconds + 30000;
+
+                _logger.LogInformationWithRunId(runId, $"Waiting for {waitTime / 1000} seconds to continue.");
 
                 await Task.Delay(waitTime);
             }
 
-            while (stepsToRetry.Count > 0)
+            while (usersToRetry.Count > 0)
             {
                 try
                 {
-                    var batchStep = stepsToRetry.Dequeue();
-                    var singleResponse = await SendSingleRequestAsync(batchStep.Request, null);
+                    var user = usersToRetry.Dequeue();
+                    var singleResponse = await SendSingleRequestAsync(user, null);
+                    await GraphTelemetryHelper.TrackResourceUnitsAsync(singleResponse, QueryType.Other, runId, _logger, _telemetryClient);
 
                     if (singleResponse.IsSuccessStatusCode)
                     {
-                        var profile = await ExtractProfileAsync(singleResponse, batchStep.RequestId);
+                        var profile = await ExtractProfileAsync(singleResponse, user.OnPremisesImmutableId);
                         profiles.Add(profile);
 
-                        await _loggingRepository.LogMessageAsync(new LogMessage
-                        {
-                            Message = $"Added new user.",
-                            RunId = null
-                        });
+                        _logger.LogInformationWithRunId(runId, "Added new user.");
                     }
                     else
                     {
@@ -333,29 +307,24 @@ namespace Repositories.GraphAzureADUsers
                 }
                 catch (Exception ex)
                 {
-                    await _loggingRepository.LogMessageAsync(new LogMessage
-                    {
-                        Message = $"Error sending single request:\n{ex.Message}",
-                        RunId = null
-                    });
+                    _logger.LogErrorWithRunId(runId, $"Error sending single request:\n{ex.Message}", ex);
                 }
             }
 
             return profiles;
         }
 
-        private BatchRequestContent CreateBatchRequestContent(Queue<User> usersToProccess)
+        private async Task<BatchRequestContentCollection> CreateBatchRequestContentAsync(Queue<GraphUser> usersToProccess)
         {
-            var batchRequestContent = new BatchRequestContent();
+            var batchRequestContent = new BatchRequestContentCollection(_graphClient);
+
+            while (batchRequestContent.BatchRequestSteps.Count < BATCH_REQUEST_LIMIT && usersToProccess.Count != 0)
             {
-                while (batchRequestContent.BatchRequestSteps.Count < BATCH_REQUEST_LIMIT && usersToProccess.Count != 0)
-                {
-                    var user = usersToProccess.Dequeue();
-                    var requestMessage = _graphClient.Users.Request().WithPerRequestAuthProvider().GetHttpRequestMessage();
-                    requestMessage.Content = new StringContent(JsonConvert.SerializeObject(user), Encoding.UTF8, "application/json");
-                    requestMessage.Method = HttpMethod.Post;
-                    batchRequestContent.AddBatchRequestStep(new BatchRequestStep($"{user.OnPremisesImmutableId}", requestMessage, null));
-                }
+                var graphUser = usersToProccess.Dequeue();
+                var user = MapUserDTOtoEntity(graphUser);
+                var postRequestInformation = _graphClient.Users.ToPostRequestInformation(user);
+                var requestMessage = await _graphClient.RequestAdapter.ConvertToNativeRequestAsync<HttpRequestMessage>(postRequestInformation);
+                batchRequestContent.AddBatchRequestStep(new BatchRequestStep($"{user.OnPremisesImmutableId}", requestMessage, null));
             }
 
             return batchRequestContent;
@@ -364,7 +333,7 @@ namespace Repositories.GraphAzureADUsers
         private async Task<GraphProfileInformation> ExtractProfileAsync(HttpResponseMessage response, string personnelNumber)
         {
             var content = await response.Content.ReadAsStringAsync();
-            var user = JsonConvert.DeserializeObject<User>(content);
+            var user = JsonSerializer.Deserialize<User>(content);
             var profile = new GraphProfileInformation
             {
                 Id = user.Id,
@@ -375,99 +344,148 @@ namespace Repositories.GraphAzureADUsers
             return profile;
         }
 
-        private async Task<HttpResponseMessage> SendSingleRequestAsync(HttpRequestMessage request, Guid? runId)
+        private async Task<HttpResponseMessage> SendSingleRequestAsync(GraphUser user, Guid? runId)
         {
-            var retryPolicy = GetRetryPolicy(runId);
+            var retryPolicy = GetHttpResponseMessageRetryPolicy(runId);
             HttpResponseMessage httpResponse = await retryPolicy.ExecuteAsync(async () =>
             {
-                return await _graphClient.HttpProvider.SendAsync(request);
-            });
-
-            return httpResponse;
-        }
-
-        private async Task<HttpResponseMessage> SendBatchRequestAsync(BatchRequestContent batchRequestContent, Guid? runId)
-        {
-            var retryPolicy = GetRetryPolicy(runId);
-            HttpResponseMessage httpResponse = await retryPolicy.ExecuteAsync(async () =>
-            {
-                var batchRequest = new HttpRequestMessage(HttpMethod.Post, "https://graph.microsoft.com/v1.0/$batch")
+                var nativeResponseHandler = new NativeResponseHandler();
+                var postRequest = _graphClient.Users.ToPostRequestInformation(MapUserDTOtoEntity(user), config =>
                 {
-                    Content = batchRequestContent
-                };
-
-                await _graphClient.AuthenticationProvider.AuthenticateRequestAsync(batchRequest);
-
-                var response = await _graphClient.HttpProvider.SendAsync(batchRequest);
-
-                await _loggingRepository.LogMessageAsync(new LogMessage
-                {
-                    Message = $"Graph Response:"
-                            + $"\nStatusCode {response.StatusCode}",
-                    RunId = runId
+                    config.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
                 });
 
-                return response;
+                await _graphClient.RequestAdapter.SendNoContentAsync(postRequest);
+                return nativeResponseHandler.Value as HttpResponseMessage;
             });
 
             return httpResponse;
         }
 
-        private AsyncPolicyWrap<HttpResponseMessage> GetRetryPolicy(Guid? runId)
+        private async Task<BatchResponseContentCollection> SendBatchRequestAsync(BatchRequestContentCollection batchRequestContent)
         {
-            HttpStatusCode[] httpsStatusCodesWithRetryAfterHeader = {
-                HttpStatusCode.TooManyRequests, // 429
-                HttpStatusCode.ServiceUnavailable // 503
-            };
+            return await _graphClient.Batch.PostAsync(batchRequestContent);
+        }
 
-            var retryAfterPolicy = Policy
-                            .HandleResult<HttpResponseMessage>(result =>
-                                httpsStatusCodesWithRetryAfterHeader.Contains(result.StatusCode) && result.Headers?.RetryAfter != null)
-                            .WaitAndRetryAsync(
-                                    _maxGraphServiceAttempts.MaxRetryAfterAttempts,
-                                    sleepDurationProvider: GetSleepDuration,
-                                    onRetryAsync: async (response, timeSpan, retryCount, context) =>
-                                    {
-                                        await _loggingRepository.LogMessageAsync(new LogMessage
-                                        {
-                                            Message = $"Throttled by Graph for the timespan: {timeSpan}. The retry count is {retryCount}.",
-                                            RunId = runId
-                                        });
-                                    });
-
-            HttpStatusCode[] httpStatusCodesWorthRetryingExponentially = {
-                HttpStatusCode.InternalServerError, // 500
-                HttpStatusCode.BadGateway, // 502
-                HttpStatusCode.ServiceUnavailable, // 503
-                HttpStatusCode.GatewayTimeout // 504
-            };
-
-            var exceptionHandlingPolicy = Policy
-                            .Handle<HttpRequestException>()
-                            .OrResult<HttpResponseMessage>(r => httpStatusCodesWorthRetryingExponentially.Contains(r.StatusCode))
-                            .WaitAndRetryAsync(
-                                _maxGraphServiceAttempts.MaxExceptionHandlingAttempts,
-                                retryAttempt => TimeSpan.FromSeconds(Math.Pow(2, retryAttempt)),
-                                onRetryAsync: async (timeSpan, retryCount, context) =>
-                                {
-                                    await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Exponential backoff {retryCount}.", RunId = runId });
-                                }
-                            );
+        private AsyncPolicyWrap<HttpResponseMessage> GetHttpResponseMessageRetryPolicy(Guid? runId)
+        {
+            var retryAfterPolicy = _retryPolicyProvider.CreateRetryAfterPolicy(runId);
+            var exceptionHandlingPolicy = _retryPolicyProvider.CreateExceptionHandlingPolicy(runId);
 
             return retryAfterPolicy.WrapAsync(exceptionHandlingPolicy);
+        }
+
+        protected AsyncRetryPolicy GetRetryPolicy(Guid? runId)
+        {
+            var retryLimit = 4;
+            var timeOutRetryLimit = 2;
+            var currentRetryIndex = 0;
+            var retryPolicy = Policy.Handle<ServiceException>(ex =>
+            {
+                if (ex.Message != null
+                    && ex.Message.Contains("The request timed out")
+                    && currentRetryIndex >= timeOutRetryLimit)
+                {
+                    return false;
+                }
+
+                return true;
+            })
+                    .WaitAndRetryAsync(
+                       retryCount: retryLimit,
+                       retryAttempt => TimeSpan.FromMinutes(2),
+                       onRetry: async (ex, waitTime, retryIndex, context) =>
+                       {
+                           currentRetryIndex = retryIndex;
+
+                           var currentLimit = retryLimit;
+                           if (ex.Message != null && ex.Message.Contains("The request timed out"))
+                           {
+                               currentLimit = timeOutRetryLimit;
+                           }
+
+                            _logger.LogWarningWithRunId(runId, $"Got a transient exception. Retrying. This was try {retryIndex} out of {currentLimit}.", ex);
+                       }
+                    );
+
+            return retryPolicy;
         }
 
         private async Task LogErrorAsync(HttpResponseMessage response, Guid? runId)
         {
             var content = await response.Content.ReadAsStringAsync();
-            await _loggingRepository.LogMessageAsync(new LogMessage
-            {
-                Message = $"Graph Request failures:"
-                   + $"\nStatusCode {response.StatusCode}"
-                   + $"\nReasonPhrase {response.ReasonPhrase}"
-                   + $"\nContent {content}",
-                RunId = runId
-            });
+            _logger.LogErrorWithRunId(
+                runId,
+                $"Graph Request failures:"
+                + $"\nStatusCode {response.StatusCode}"
+                + $"\nReasonPhrase {response.ReasonPhrase}"
+                + $"\nContent {content}");
         }
+
+        private User MapUserDTOtoEntity(GraphUser user)
+        {
+            return new User
+            {
+                DisplayName = user.DisplayName,
+                AccountEnabled = user.AccountEnabled,
+                PasswordProfile = new PasswordProfile { Password = user.Password },
+                MailNickname = user.MailNickname,
+                UsageLocation = user.UsageLocation,
+                UserPrincipalName = user.UserPrincipalName,
+                OnPremisesImmutableId = user.OnPremisesImmutableId
+            };
+        }
+
+        public async Task<int?> GetUsersCountAsync(Guid? runId)
+        {
+            int? users = null;
+            var retryPolicy = GetRetryPolicy(runId);
+            await retryPolicy.ExecuteAsync(async () =>
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+
+                await _graphClient.Users.GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.Headers.Add("ConsistencyLevel", "eventual");
+                    requestConfiguration.QueryParameters.Count = true;
+                    requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                });
+
+                if (nativeResponseHandler.Value is HttpResponseMessage nativeResponse)
+                {
+                    try
+                    {
+                        await GraphTelemetryHelper.TrackResourceUnitsAsync(nativeResponse, QueryType.Other, runId, _logger, _telemetryClient);
+
+                        if (nativeResponse.IsSuccessStatusCode)
+                        {
+                            var content = await nativeResponse.Content.ReadAsStringAsync();
+                            if (!string.IsNullOrEmpty(content))
+                            {
+                                using var document = JsonDocument.Parse(content);
+                                if (document.RootElement.TryGetProperty("@odata.count", out var countElement) && countElement.TryGetInt32(out var count))
+                                {
+                                    users = count;
+                                }
+                                else
+                                {
+                                    _logger.LogWarningWithRunId(runId, "@odata.count not found in Graph users count response.");
+                                }
+                            }
+                        }
+                        else
+                        {
+                            await LogErrorAsync(nativeResponse, runId);
+                        }
+                    }
+                    finally
+                    {
+                        nativeResponse.Dispose();
+                    }
+                }
+            });
+            return users;
+        }
+
     }
 }

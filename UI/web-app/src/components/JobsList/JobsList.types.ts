@@ -1,0 +1,59 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import {
+  type IStyle,
+  type IStyleFunctionOrObject,
+  type ITheme,
+} from '@fluentui/react';
+import type React from 'react';
+
+export interface IJobsListStyles {
+  root: IStyle;
+  enabled: IStyle;
+  disabled: IStyle;
+  titleContainer: IStyle;
+  title: IStyle;
+  actionRequiredIcon: IStyle;
+  pendingReviewIcon: IStyle;
+  rejectedIcon: IStyle;
+  tabContent: IStyle;
+  refresh: IStyle;
+  jobsList: IStyle;
+  footer: IStyle;
+  noMembershipsFoundText: IStyle;
+  errorMessageBar: IStyle;
+  readOnlyAccessMessageBar: IStyle;
+  header: IStyle;
+  manageMembershipButton: IStyle;
+  successStatus: IStyle;
+  errorStatus: IStyle;
+  chooseFileButton: IStyle;
+  jobsHeader: IStyle;
+  approvedJobsLabel: IStyle;
+  totalJobsLabel: IStyle;
+  ownerPicker: IStyle;
+  ownerPickerText: IStyle;
+  ownerPickerContainer: IStyle;
+  searchBox: IStyle;
+  searchBoxContainer: IStyle;
+  inputIcon: IStyle;
+}
+
+export interface IJobsListStyleProps {
+  className?: string;
+  theme: ITheme;
+}
+
+export interface IJobsListProps
+  extends React.AllHTMLAttributes<HTMLDivElement> {
+  /**
+   * Optional className to apply to the root of the component.
+   */
+  className?: string;
+
+  /**
+   * Call to provide customized styling that will layer on top of the variant rules.
+   */
+  styles?: IStyleFunctionOrObject<IJobsListStyleProps, IJobsListStyles>;
+};

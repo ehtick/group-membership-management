@@ -1,92 +1,141 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using System.Collections.Generic;
-using System.Threading.Tasks;
+
+using Hosts.JobScheduler;
+using Microsoft.Extensions.Logging;
+using Models;
 using Repositories.Contracts;
-using Microsoft.ApplicationInsights;
 using Services.Contracts;
 using System;
+using System.Collections.Generic;
 using System.Linq;
-using Services.Entities;
-using Newtonsoft.Json;
-using Repositories.Contracts.InjectConfig;
+using System.Text.Json;
+using System.Threading.Tasks;
 
 namespace Services
 {
-    public class JobSchedulingService : IJobSchedulingService {
+    public class JobSchedulingService : IJobSchedulingService
+    {
 
-        public readonly int START_TIME_DELAY_MINUTES;
-        public readonly int BUFFER_SECONDS;
-        public readonly int MINUTES_IN_HOUR = 60;
-        public readonly int SECONDS_IN_MINUTE = 60;
+        private const int MINUTES_IN_HOUR = 60;
+        private const int SECONDS_IN_MINUTE = 60;
 
-        private readonly ISyncJobRepository _syncJobRepository;
+
+        private readonly IDatabaseSyncJobsRepository _databaseSyncJobsRepository;
         private readonly IRuntimeRetrievalService _runtimeRetrievalService;
-        private readonly ILoggingRepository _loggingRepository;
+        private readonly ILogger<JobSchedulingService> _logger;
 
         public JobSchedulingService(
-            IJobSchedulerConfig jobSchedulerConfig,
-            ISyncJobRepository syncJobRepository,
+            IDatabaseSyncJobsRepository databaseSyncJobsRepository,
             IRuntimeRetrievalService runtimeRetrievalService,
-            ILoggingRepository loggingRepository)
+            ILogger<JobSchedulingService> logger)
         {
-            START_TIME_DELAY_MINUTES = jobSchedulerConfig.StartTimeDelayMinutes;
-            BUFFER_SECONDS = jobSchedulerConfig.DelayBetweenSyncsSeconds;
-            _syncJobRepository = syncJobRepository;
+            _databaseSyncJobsRepository = databaseSyncJobsRepository;
             _runtimeRetrievalService = runtimeRetrievalService;
-            _loggingRepository = loggingRepository;
+            _logger = logger;
         }
 
-        public async Task<List<SchedulerSyncJob>> GetAllSyncJobsAsync(bool includeFutureStartDates = false)
+        public async Task<List<DistributionSyncJob>> ResetJobsAsync(List<DistributionSyncJob> jobs, int daysToAddForReset)
         {
-            var message = "Getting enabled sync jobs" + (includeFutureStartDates ? " including those with future StartDate values" : "");
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = message });
+            var newStartTime = DateTime.UtcNow.AddDays(daysToAddForReset);
 
-            var schedulerSyncJobs = new List<SchedulerSyncJob>();
-            var jobs = _syncJobRepository.GetSyncJobsAsync(SyncStatus.All, false, false);
-            await foreach (var job in jobs)
+            List<DistributionSyncJob> jobsToReschedule = ExcludeInProgressJobsFromWriteBack(jobs);
+
+            _logger.UpdatingJobsScheduledDate(jobsToReschedule.Count, newStartTime);
+
+            List<DistributionSyncJob> updatedJobs = ResetJobStartTimes(jobsToReschedule, newStartTime);
+
+            _logger.UpdatedJobsScheduledDate(updatedJobs.Count, newStartTime);
+
+            return updatedJobs;
+        }
+
+        public async Task<List<DistributionSyncJob>> DistributeJobsAsync(List<DistributionSyncJob> jobs, int startTimeDelayMinutes, int delayBetweenSyncsSeconds, bool prioritizeThresholdJobs = false)
+        {
+            _logger.DistributingJobs(jobs.Count, prioritizeThresholdJobs);
+
+            // Distribute over the full set first so the load/concurrency math counts all jobs, then filter.
+            List<DistributionSyncJob> updatedJobs = await DistributeJobStartTimesAsync(jobs, startTimeDelayMinutes, delayBetweenSyncsSeconds, prioritizeThresholdJobs);
+
+            List<DistributionSyncJob> jobsToReschedule = ExcludeInProgressJobsFromWriteBack(updatedJobs);
+
+            _logger.DistributedJobs(jobsToReschedule.Count);
+
+            return jobsToReschedule;
+        }
+
+        // Excludes InProgress/StuckInProgress jobs from the ScheduledDate write-back so JobScheduler does not
+        // push their ScheduledDate forward, which would hide them from JobTrigger stuck-job detection.
+        private List<DistributionSyncJob> ExcludeInProgressJobsFromWriteBack(List<DistributionSyncJob> jobs)
+        {
+            List<DistributionSyncJob> jobsToReschedule = jobs
+                .Where(job => job.Status != SyncStatus.InProgress.ToString()
+                           && job.Status != SyncStatus.StuckInProgress.ToString())
+                .ToList();
+
+            int skippedCount = jobs.Count - jobsToReschedule.Count;
+            if (skippedCount > 0)
             {
-                if (includeFutureStartDates || job.StartDate.CompareTo(DateTime.UtcNow) < 0)
-                {
-                    var serializedJob = JsonConvert.SerializeObject(job);
-                    SchedulerSyncJob schedulerJob = JsonConvert.DeserializeObject<SchedulerSyncJob>(serializedJob);
-                    schedulerSyncJobs.Add(schedulerJob);
-                }
+                _logger.SkippingInProgressJobsFromScheduledDateUpdate(skippedCount);
             }
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Found {schedulerSyncJobs.Count} jobs to update" });
-            return schedulerSyncJobs;
+            return jobsToReschedule;
         }
 
-        public async Task UpdateSyncJobsAsync(List<SchedulerSyncJob> updatedSyncJobs)
+        public async Task<List<SyncJob>> GetSyncJobsAsync()
         {
-            await _syncJobRepository.UpdateSyncJobsAsync(updatedSyncJobs);
+            var includeFutureScheduledJobs = true;
+            var jobs = await _databaseSyncJobsRepository.GetSyncJobsAsync(includeFutureScheduledJobs, SyncStatus.Idle, SyncStatus.InProgress, SyncStatus.StuckInProgress);
+            return jobs.ToList();
         }
 
-        public List<SchedulerSyncJob> ResetJobStartTimes(List<SchedulerSyncJob> schedulerSyncJobs, DateTime newStartTime, bool includeFutureStartDates = false)
+        public async Task BatchUpdateSyncJobsAsync(IEnumerable<UpdateMergeSyncJob> updatedSyncJobs)
         {
-            List<SchedulerSyncJob> updatedSyncJobs = schedulerSyncJobs.Select(job => {
-                if (includeFutureStartDates || job.StartDate.CompareTo(newStartTime) < 0)
-                    job.StartDate = newStartTime;
+            var jobs = MapUpdateMergeSyncJobsToEntities(updatedSyncJobs);
+            await _databaseSyncJobsRepository.BatchUpdateSyncJobsAsync(jobs);
+        }
+
+        private SyncJob MapUpdateMergeSyncJobToEntity(UpdateMergeSyncJob updateMergeSyncJob)
+        {
+            return new SyncJob
+            {
+                Id = updateMergeSyncJob.Id,
+                ScheduledDate = updateMergeSyncJob.ScheduledDate
+            };
+        }
+
+        private List<SyncJob> MapUpdateMergeSyncJobsToEntities(IEnumerable<UpdateMergeSyncJob> jobs)
+        {
+            return jobs.Select(x => MapUpdateMergeSyncJobToEntity(x)).ToList();
+        }
+
+        public List<DistributionSyncJob> ResetJobStartTimes(List<DistributionSyncJob> syncJobsToReset, DateTime newStartTime)
+        {
+            List<DistributionSyncJob> updatedSyncJobs = syncJobsToReset.Select(job =>
+            {
+                job.ScheduledDate = newStartTime;
                 return job;
             }).ToList();
 
             return updatedSyncJobs;
         }
 
-        public async Task<List<SchedulerSyncJob>> DistributeJobStartTimesAsync(List<SchedulerSyncJob> schedulerSyncJobs)
+        public async Task<List<DistributionSyncJob>> DistributeJobStartTimesAsync(
+            List<DistributionSyncJob> syncJobsToDistribute,
+            int startTimeDelayMinutes,
+            int bufferBetweenSyncsSeconds,
+            bool prioritizeThresholdJobs = false)
         {
             // Get all runtimes for destination groups
-            List<Guid> groupIds = schedulerSyncJobs.Select(job => job.TargetOfficeGroupId).ToList();
-            Dictionary<Guid, double> runtimeMap = await _runtimeRetrievalService.GetRuntimesInSeconds(groupIds);
+            Dictionary<string, double> runtimeMap = await _runtimeRetrievalService.GetRunTimesInSecondsAsync();
 
             // Get a period to syncs mapping
-            Dictionary<int, List<SchedulerSyncJob>> periodToJobs = new Dictionary<int, List<SchedulerSyncJob>>();
-            foreach (SchedulerSyncJob job in schedulerSyncJobs)
+            Dictionary<int, List<DistributionSyncJob>> periodToJobs = new Dictionary<int, List<DistributionSyncJob>>();
+            foreach (DistributionSyncJob job in syncJobsToDistribute)
             {
-                if (!periodToJobs.ContainsKey(job.Period)) {
-                    periodToJobs.Add(job.Period, new List<SchedulerSyncJob>() { job });
+                if (!periodToJobs.ContainsKey(job.Period))
+                {
+                    periodToJobs.Add(job.Period, new List<DistributionSyncJob>() { job });
                 }
                 else
                 {
@@ -95,55 +144,75 @@ namespace Services
             }
 
 
-            List<SchedulerSyncJob> updatedJobs = new List<SchedulerSyncJob>();
+            List<DistributionSyncJob> updatedJobs = new List<DistributionSyncJob>();
             // Distribute jobs for each period
             foreach (int period in periodToJobs.Keys)
             {
                 var jobsForPeriod = periodToJobs[period];
 
-                List<SchedulerSyncJob> updatedJobsForPeriod = await DistributeJobStartTimesForPeriod(jobsForPeriod, period, runtimeMap);
+                List<DistributionSyncJob> updatedJobsForPeriod = await DistributeJobStartTimesForPeriod(jobsForPeriod, period, startTimeDelayMinutes, bufferBetweenSyncsSeconds, runtimeMap, prioritizeThresholdJobs);
                 updatedJobs.AddRange(updatedJobsForPeriod);
             }
 
             return updatedJobs;
         }
 
-        private async Task<List<SchedulerSyncJob>> DistributeJobStartTimesForPeriod(
-            List<SchedulerSyncJob> schedulerSyncJobs, 
+        private async Task<List<DistributionSyncJob>> DistributeJobStartTimesForPeriod(
+            List<DistributionSyncJob> jobsToDistribute,
             int periodInHours,
-            Dictionary<Guid, double> runtimeMap)
+            int startTimeDelayMinutes,
+            int bufferBetweenSyncsSeconds,
+            Dictionary<string, double> runtimeMap,
+            bool prioritizeThresholdJobs = false)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Calculating distribution for jobs with period {periodInHours}" });
+            _logger.CalculatingDistribution(periodInHours);
 
-            HashSet<Guid> groupIdsForPeriod = new HashSet<Guid>(schedulerSyncJobs.ConvertAll(job => job.TargetOfficeGroupId));
-            runtimeMap = new Dictionary<Guid, double>(runtimeMap.Where(entry => groupIdsForPeriod.Contains(entry.Key)));
+            HashSet<string> groupDestinationsForPeriod = new HashSet<string>(jobsToDistribute.ConvertAll(job => job.Id.ToString()));
+            runtimeMap = new Dictionary<string, double>(runtimeMap.Where(entry => groupDestinationsForPeriod.Contains(entry.Key) || entry.Key == "Default"));
 
-            // Sort sync jobs by Status, LastRunTime
-            schedulerSyncJobs.Sort();
+            // Set the prioritization flag on all jobs before sorting
+            foreach (var job in jobsToDistribute)
+            {
+                job.PrioritizeThresholdJobs = prioritizeThresholdJobs;
+            }
 
-            double totalTimeInSeconds = runtimeMap.Values.Sum();
+            if (prioritizeThresholdJobs)
+            {
+                _logger.SortingWithThresholdPrioritization();
+            }
+            else
+            {
+                _logger.SortingWithoutThresholdPrioritization();
+            }
 
-            int concurrencyNumber = (int) Math.Ceiling(totalTimeInSeconds / (periodInHours * MINUTES_IN_HOUR * SECONDS_IN_MINUTE));
+            // Sort sync jobs by Status, LastRunTime and (optionally) ThresholdPercentages
+            jobsToDistribute.Sort();
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Calculated {concurrencyNumber} thread count for jobs with period {periodInHours}" });
+            double totalTimeInSeconds = runtimeMap.Values.Sum() + (jobsToDistribute.Count - runtimeMap.Count) * runtimeMap["Default"]
+                                      + jobsToDistribute.Count * bufferBetweenSyncsSeconds;
+
+            int concurrencyNumber = (int)Math.Ceiling(totalTimeInSeconds / (periodInHours * MINUTES_IN_HOUR * SECONDS_IN_MINUTE));
+
+            _logger.CalculatedThreadCount(concurrencyNumber, periodInHours);
 
             List<DateTime> jobThreads = new List<DateTime>(concurrencyNumber);
-            DateTime startTime = DateTime.UtcNow.AddMinutes(START_TIME_DELAY_MINUTES);
-            for(int index = 0; index < concurrencyNumber; index++)
+            DateTime startTime = DateTime.UtcNow.AddMinutes(startTimeDelayMinutes);
+            for (int index = 0; index < concurrencyNumber; index++)
             {
                 jobThreads.Add(startTime);
             }
 
-            List<SchedulerSyncJob> updatedSyncJobs = new List<SchedulerSyncJob>();
-            foreach(SchedulerSyncJob job in schedulerSyncJobs)
+            List<DistributionSyncJob> updatedSyncJobs = new List<DistributionSyncJob>();
+            foreach (DistributionSyncJob job in jobsToDistribute)
             {
                 DateTime earliestTime = jobThreads.Min();
 
-                var serializedJob = JsonConvert.SerializeObject(job);
-                SchedulerSyncJob updatedJob = JsonConvert.DeserializeObject<SchedulerSyncJob>(serializedJob);
+                var serializedJob = JsonSerializer.Serialize(job);
+                var updatedJob = JsonSerializer.Deserialize<DistributionSyncJob>(serializedJob);
 
-                updatedJob.StartDate = earliestTime;
-                DateTime updatedTime = earliestTime.AddSeconds(runtimeMap[updatedJob.TargetOfficeGroupId] + BUFFER_SECONDS);
+                updatedJob.ScheduledDate = earliestTime;
+                var groupRuntime = runtimeMap.ContainsKey(job.Id.ToString()) ? runtimeMap[job.Id.ToString()] : runtimeMap["Default"];
+                DateTime updatedTime = earliestTime.AddSeconds(groupRuntime + bufferBetweenSyncsSeconds);
                 int index = jobThreads.IndexOf(earliestTime);
                 jobThreads[index] = updatedTime;
 

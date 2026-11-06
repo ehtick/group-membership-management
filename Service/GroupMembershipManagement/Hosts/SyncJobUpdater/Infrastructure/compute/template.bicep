@@ -1,0 +1,219 @@
+@description('Enter an abbreviation for the solution.')
+@minLength(2)
+@maxLength(3)
+param solutionAbbreviation string = 'gmm'
+
+@description('Classify the types of resources in this resource group.')
+@allowed([
+  'prereqs'
+  'data'
+  'compute'
+])
+param resourceGroupClassification string = 'compute'
+
+@description('Enter an abbreviation for the environment.')
+@minLength(2)
+@maxLength(6)
+param environmentAbbreviation string
+
+@description('Tenant id.')
+param tenantId string
+
+@description('Function authentication app client id.')
+param functionAuthAppClientId string
+param enableFunctionAuthentication bool = false
+
+@description('Service plan name.')
+param servicePlanName string = '${solutionAbbreviation}-${resourceGroupClassification}-${environmentAbbreviation}-${substring(uniqueString(subscription().id,'SyncJobUpdater'),0,8)}'
+
+@description('Resource location.')
+param location string
+
+@description('Enter function app name.')
+param functionAppName string = '${solutionAbbreviation}-${resourceGroupClassification}-${environmentAbbreviation}'
+
+@description('Function app kind.')
+@allowed([
+  'functionapp'
+  'linux'
+  'container'
+  'functionapp,linux'
+])
+param functionAppKind string = 'functionapp,linux'
+
+@description('Service plan sku')
+param servicePlanSku string = 'FC1'
+
+@description('Name of the resource group where the \'prereqs\' key vault is located.')
+param prereqsKeyVaultName string = '${solutionAbbreviation}-prereqs-${environmentAbbreviation}'
+
+@description('Name of the resource group where the \'prereqs\' key vault is located.')
+param prereqsKeyVaultResourceGroup string = '${solutionAbbreviation}-prereqs-${environmentAbbreviation}'
+
+@description('Name of the \'data\' key vault.')
+param dataKeyVaultName string = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+
+@description('Name of the resource group where the \'data\' resources are located.')
+param dataResourceGroup string = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+
+@description('Provides the endpoint for the app configuration resource.')
+param appConfigurationEndpoint string = 'https://${solutionAbbreviation}-appconfig-${environmentAbbreviation}.azconfig.io'
+
+@description('Flag to indicate if the deployment should set RBAC permissions.')
+param setRBACPermissions bool = false
+
+@description('When true, attaches the function app to a delegated subnet for VNET integration (FC1 / Microsoft.App/environments). Default false preserves pre-feature behavior.')
+param enableVnetIntegration bool = false
+
+@description('Resource ID of the delegated subnet for VNET integration. Required when enableVnetIntegration is true; ignored otherwise.')
+param virtualNetworkSubnetId string = ''
+
+@description('FunctionAppLogs diagnostic export destination: workspace (default) sends logs to the Log Analytics workspace, storage sends them to a dedicated storage account this deployment provisions in the data resource group, and none disables the export.')
+@allowed([
+  'workspace'
+  'storage'
+  'none'
+])
+param functionAppLogsDestination string = 'workspace'
+
+@description('Name of the storage account that receives FunctionAppLogs when functionAppLogsDestination is storage. Set by the deployment, not a customer input.')
+param functionAppLogsStorageAccountName string = ''
+
+module servicePlanTemplate 'servicePlan.bicep' = {
+  name: 'servicePlanTemplate-SyncJobUpdater'
+  params: {
+    name: servicePlanName
+    sku: servicePlanSku
+    location: location
+  }
+}
+
+var serviceBusFQN = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'serviceBusFQN')
+var serviceBusSyncJobTopic = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'serviceBusSyncJobTopic')
+var graphAppClientId = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'graphAppClientId')
+var graphAppClientSecret = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'graphAppClientSecret')
+var graphAppCertificateName = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'graphAppCertificateName')
+var graphAppTenantId = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'graphAppTenantId')
+var senderUsername = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'senderUsername')
+var senderPassword = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'senderPassword')
+var supportEmailAddresses = resourceId(subscription().subscriptionId, prereqsKeyVaultResourceGroup, 'Microsoft.KeyVault/vaults/secrets', prereqsKeyVaultName, 'supportEmailAddresses')
+var syncJobUpdaterStorageAccountName = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'jobsStorageAccountName')
+var appInsightsConnectionString = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'appInsightsConnectionString')
+var jobsMSIConnectionString = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'jobsMSIConnectionString')
+var replicaJobsMSIConnectionString = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'replicaJobsMSIConnectionString')
+var graphUserAssignedManagedIdentityClientId = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'graphUserAssignedManagedIdentityClientId')
+var serviceBusNotificationsQueue = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'serviceBusNotificationsQueue')
+var serviceBusSyncJobUpdaterQueue = resourceId(subscription().subscriptionId, dataResourceGroup, 'Microsoft.KeyVault/vaults/secrets', dataKeyVaultName, 'serviceBusSyncJobUpdaterQueue')
+
+var appSettings = {
+  logAnalyticsCustomerId: 'notused'
+  logAnalyticsPrimarySharedKey: 'notused'
+  AZURE_TOKEN_CREDENTIALS: 'ManagedIdentityCredential'
+  // Debug for verbose troubleshooting; above Information blanks the dashboards
+  Logging__ApplicationInsights__LogLevel__Default: 'Information'
+  AzureWebJobsStorage__accountName: storageAccountNameReader.outputs.value
+  AzureWebJobsStorage__credential: 'managedidentity'
+  AzureFunctionsJobHost__extensions__durableTask__hubName: '${solutionAbbreviation}compute${environmentAbbreviation}SyncJobUpdater'
+  AzureFunctionsWebHost__hostid: 'SyncJobUpdater'
+  AzureFunctionsJobHost__extensions__durableTask__extendedSessionsEnabled: 'True'
+  APPLICATIONINSIGHTS_CONNECTION_STRING: '@Microsoft.KeyVault(SecretUri=${reference(appInsightsConnectionString, '2019-09-01').secretUriWithVersion})'
+  serviceBusSyncJobTopic: '@Microsoft.KeyVault(SecretUri=${reference(serviceBusSyncJobTopic, '2019-09-01').secretUriWithVersion})'
+  gmmServiceBus__fullyQualifiedNamespace: '@Microsoft.KeyVault(SecretUri=${reference(serviceBusFQN, '2019-09-01').secretUriWithVersion})'
+  graphCredentials__ClientCertificateName: '@Microsoft.KeyVault(SecretUri=${reference(graphAppCertificateName, '2019-09-01').secretUriWithVersion})'
+  graphCredentials__ClientSecret: '@Microsoft.KeyVault(SecretUri=${reference(graphAppClientSecret, '2019-09-01').secretUriWithVersion})'
+  graphCredentials__ClientId: '@Microsoft.KeyVault(SecretUri=${reference(graphAppClientId, '2019-09-01').secretUriWithVersion})'
+  graphCredentials__TenantId: '@Microsoft.KeyVault(SecretUri=${reference(graphAppTenantId, '2019-09-01').secretUriWithVersion})'
+  graphCredentials__KeyVaultName: prereqsKeyVaultName
+  graphCredentials__KeyVaultTenantId: tenantId
+  ConnectionStrings__JobsContext: '@Microsoft.KeyVault(SecretUri=${reference(jobsMSIConnectionString, '2019-09-01').secretUriWithVersion})'
+  ConnectionStrings__JobsContextReadOnly: '@Microsoft.KeyVault(SecretUri=${reference(replicaJobsMSIConnectionString, '2019-09-01').secretUriWithVersion})'
+  senderAddress: '@Microsoft.KeyVault(SecretUri=${reference(senderUsername, '2019-09-01').secretUriWithVersion})'
+  senderPassword: '@Microsoft.KeyVault(SecretUri=${reference(senderPassword, '2019-09-01').secretUriWithVersion})'
+  supportEmailAddresses: '@Microsoft.KeyVault(SecretUri=${reference(supportEmailAddresses, '2019-09-01').secretUriWithVersion})'
+  syncJobUpdaterStorageAccountName: '@Microsoft.KeyVault(SecretUri=${reference(syncJobUpdaterStorageAccountName, '2019-09-01').secretUriWithVersion})'
+  appConfigurationEndpoint: appConfigurationEndpoint
+  graphCredentials__UserAssignedManagedIdentityClientId: '@Microsoft.KeyVault(SecretUri=${reference(graphUserAssignedManagedIdentityClientId, '2019-09-01').secretUriWithVersion})'
+  serviceBusNotificationsQueue: '@Microsoft.KeyVault(SecretUri=${reference(serviceBusNotificationsQueue, '2019-09-01').secretUriWithVersion})'
+  serviceBusSyncJobUpdaterQueue: '@Microsoft.KeyVault(SecretUri=${reference(serviceBusSyncJobUpdaterQueue, '2019-09-01').secretUriWithVersion})'
+}
+
+
+resource dataKeyVault 'Microsoft.KeyVault/vaults@2023-07-01' existing = {
+  name: dataKeyVaultName
+  scope: resourceGroup(dataResourceGroup)
+}
+
+module userAssignedManagedIdentityNameReader 'keyVaultReader.bicep' = {
+  name: 'uamiNameReader-SyncJobUpdater'
+  params: {
+    value: dataKeyVault.getSecret('graphUserAssignedManagedIdentityName')
+  }
+  dependsOn: [
+    dataKeyVault
+  ]
+}
+
+module storageAccountNameReader 'keyVaultReader.bicep' = {
+  name: 'storageAccountNameReader-SyncJobUpdater'
+  params: {
+    value: dataKeyVault.getSecret('functionsStorageAccountName')
+  }
+  dependsOn: [
+    dataKeyVault
+  ]
+}
+
+var appPackageContainerName = 'syncjobupdater-app-package'
+
+
+resource graphUAMI 'Microsoft.ManagedIdentity/userAssignedIdentities@2023-07-31-preview' existing = {
+  name: userAssignedManagedIdentityNameReader.outputs.value
+  scope: resourceGroup(dataResourceGroup)
+}
+
+module existingLogAnalyticsWorkspace 'logAnalyticsWorkspace.bicep' = {
+  name: 'existingLogAnalyticsWorkspace-sju'
+  scope: resourceGroup('${solutionAbbreviation}-data-${environmentAbbreviation}')
+  params: {
+    environmentAbbreviation: environmentAbbreviation
+    resourceGroupClassification: 'data'
+    solutionAbbreviation: solutionAbbreviation
+  }
+}
+
+@description('Maximum instance count.')
+param maxInstanceCount int = 10
+
+module functionAppTemplate_SyncJobUpdater 'functionApp.bicep' = {
+  name: 'functionAppTemplate-SyncJobUpdater'
+  params: {
+    maxInstanceCount: maxInstanceCount
+    enableVnetIntegration: enableVnetIntegration
+    functionAppLogsDestination: functionAppLogsDestination
+    functionAppLogsStorageAccountName: functionAppLogsStorageAccountName
+    virtualNetworkSubnetId: virtualNetworkSubnetId
+    name: '${functionAppName}-SyncJobUpdater'
+    kind: functionAppKind
+    location: location
+    servicePlanName: servicePlanName
+    appSettings: appSettings
+    appPackageContainerName: appPackageContainerName
+    functionAuthAppClientId: functionAuthAppClientId
+    enableFunctionAuthentication: enableFunctionAuthentication
+    userManagedIdentities:{
+      '${graphUAMI.id}' : {}
+    }
+    logAnalyticsWorkspaceId: existingLogAnalyticsWorkspace.outputs.workspaceId
+    prereqsKeyVaultName: prereqsKeyVaultName
+    prereqsKeyVaultResourceGroup: prereqsKeyVaultResourceGroup
+    dataKeyVaultName: dataKeyVaultName
+    dataKeyVaultResourceGroup: dataResourceGroup
+    setRBACPermissions: setRBACPermissions
+    storageAccountName: storageAccountNameReader.outputs.value
+    dataResourceGroup: dataResourceGroup
+  }
+  dependsOn: [
+    servicePlanTemplate
+    graphUAMI
+  ]
+}

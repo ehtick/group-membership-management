@@ -1,0 +1,19 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Models;
+using Services.Entities;
+
+namespace Hosts.MembershipAggregator
+{
+    public class JobStatusUpdaterRequest
+    {
+        public required SyncJob SyncJob { get; init; }
+        public required int CurrentPart { get; init; }
+        public required int TotalParts { get; init; }
+        public required SyncStatus Status { get; init; }
+        public required bool IsDryRun { get; init; }
+        public required bool IsNoOpSync { get; init; }
+        public int? ProposedUsersAdded { get; init; }
+        public int? ProposedUsersRemoved { get; init; }
+    }
+}

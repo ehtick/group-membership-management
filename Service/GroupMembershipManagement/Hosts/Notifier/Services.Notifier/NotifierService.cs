@@ -1,0 +1,578 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Hosts.Notifier;
+using Models;
+using Models.Notifications;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+using Repositories.Contracts;
+using Repositories.Contracts.DestinationResolution;
+using Services.Notifier.Contracts;
+using System;
+using System.Globalization;
+using System.Linq;
+using Repositories.Contracts.InjectConfig;
+using Models.ThresholdNotifications;
+using Services.Contracts;
+using Microsoft.ApplicationInsights;
+using System.Text.Json;
+using Models.Entities;
+using System.Net.Http;
+using System.Net;
+using Models.ServiceBus;
+using Models.Helpers;
+using Microsoft.Extensions.Logging;
+
+namespace Services.Notifier
+{
+    public class NotifierService : INotifierService
+    {
+        private readonly ILogger<NotifierService> _logger;
+        private readonly IMailRepository _mailRepository;
+        private readonly IMailConfig _mailConfig;
+        private readonly IEmailSenderRecipient _emailSenderAndRecipients;
+        private readonly ILocalizationRepository _localizationRepository;
+        private readonly INotificationRepository _notificationRepository;
+        private readonly IGraphGroupRepository _graphGroupRepository;
+        private readonly TelemetryClient _telemetryClient;
+        private readonly INotificationTypesRepository _notificationTypesRepository;
+        private readonly IJobNotificationsRepository _jobNotificationRepository;
+        private readonly IThresholdConfig _thresholdConfig;
+        private readonly IGMMResources _gmmResources;
+        private readonly IServiceBusQueueRepository _serviceBusQueueRepository;
+        private readonly IDestinationResolver _destinationResolver;
+        private readonly IDatabaseSettingsRepository _databaseSettingsRepository;
+
+        public NotifierService(
+            ILogger<NotifierService> logger,
+            IMailRepository mailRepository,
+            IMailConfig mailConfig,
+            IEmailSenderRecipient emailSenderAndRecipients,
+            ILocalizationRepository localizationRepository,
+            INotificationRepository notificationRepository,
+            IGraphGroupRepository graphGroupRepository,
+            INotificationTypesRepository notificationTypesRepository,
+            IJobNotificationsRepository jobNotificationRepository,
+            IThresholdConfig thresholdConfig,
+            IGMMResources gmmResources,
+            IServiceBusQueueRepository serviceBusQueueRepository,
+            IDestinationResolver destinationResolver,
+            IDatabaseSettingsRepository databaseSettingsRepository,
+            TelemetryClient telemetryClient)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _mailRepository = mailRepository ?? throw new ArgumentNullException(nameof(mailRepository));
+            _mailConfig = mailConfig ?? throw new ArgumentNullException(nameof(mailConfig));
+            _emailSenderAndRecipients = emailSenderAndRecipients ?? throw new ArgumentNullException(nameof(emailSenderAndRecipients));
+            _localizationRepository = localizationRepository ?? throw new ArgumentNullException(nameof(localizationRepository));
+            _notificationRepository = notificationRepository ?? throw new ArgumentNullException(nameof(notificationRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+            _notificationTypesRepository = notificationTypesRepository ?? throw new ArgumentNullException(nameof(notificationTypesRepository));
+            _jobNotificationRepository = jobNotificationRepository ?? throw new ArgumentNullException(nameof(jobNotificationRepository));
+            _thresholdConfig = thresholdConfig ?? throw new ArgumentNullException(nameof(thresholdConfig));
+            _gmmResources = gmmResources ?? throw new ArgumentException(nameof(gmmResources));
+            _serviceBusQueueRepository = serviceBusQueueRepository ?? throw new ArgumentNullException(nameof(_serviceBusQueueRepository));
+            _destinationResolver = destinationResolver ?? throw new ArgumentNullException(nameof(destinationResolver));
+            _databaseSettingsRepository = databaseSettingsRepository ?? throw new ArgumentNullException(nameof(databaseSettingsRepository));
+            _telemetryClient = telemetryClient ?? throw new ArgumentNullException(nameof(telemetryClient));
+        }
+
+        public async Task<Guid> GetGroupIdAsync(SyncJob syncJob)
+        {
+            var destination = await _destinationResolver.ResolveAsync(syncJob);
+            return destination switch
+            {
+                ResolvedGroupDestination groupDestination => groupDestination.ObjectId,
+                ResolvedTeamsChannelDestination channelDestination => channelDestination.TeamObjectId,
+                _ => Guid.Empty
+            };
+        }
+
+        public async Task<string> GetChannelIdAsync(SyncJob syncJob)
+        {
+            var destination = await _destinationResolver.ResolveAsync(syncJob);
+            return destination is ResolvedTeamsChannelDestination channelDestination ? channelDestination.ChannelId : string.Empty;
+        }
+
+        public async Task SendThresholdEmailAsync(ThresholdNotification notification)
+        {
+            bool isNotificationDisabled = await IsNotificationDisabledAsync(notification.SyncJobId, NotificationMessageType.ThresholdNotification);
+
+            if (isNotificationDisabled)
+            {
+                _logger.NotificationDisabled(NotificationMessageType.ThresholdNotification.ToString(), notification.Id, notification.TargetOfficeGroupId);
+                return;
+            }
+            _logger.SendingEmail();
+
+            var groupName = await _graphGroupRepository.GetGroupNameAsync(notification.TargetOfficeGroupId);
+            var owners = await _graphGroupRepository.GetGroupOwnersAsync(notification.TargetOfficeGroupId);
+            var ownerEmails = string.Join(";", owners.Where(x => !string.IsNullOrWhiteSpace(x.Mail)).Select(x => x.Mail));
+
+            var cardState = notification.CardState;
+
+            string subjectKey = cardState == ThresholdNotificationCardState.DisabledCard
+                ? "SyncThresholdDisablingJobEmailSubject"
+                : "SyncThresholdEmailSubject";
+
+            string subject = _localizationRepository.TranslateSetting(subjectKey, groupName);
+
+            string emailContent = null;
+            if (cardState == ThresholdNotificationCardState.DisabledCard)
+            {
+                var additionsExceeded =
+                    notification.ThresholdPercentageForAdditions > 0
+                    && notification.ChangePercentageForAdditions >= notification.ThresholdPercentageForAdditions;
+                var removalsExceeded =
+                    notification.ThresholdPercentageForRemovals > 0
+                    && notification.ChangePercentageForRemovals >= notification.ThresholdPercentageForRemovals;
+
+                string direction;
+                if (additionsExceeded && removalsExceeded) direction = "Both";
+                else if (removalsExceeded) direction = "Decrease";
+                else direction = "Increase";
+
+                // Threshold Exceeded sends a styled informational email (no OAM card); owners resolve via the take-action dialog.
+                var routingMessage = new EmailMessage
+                {
+                    Content = NotificationConstants.SyncJobDisabledEmailBody,
+                    SyncJobId = notification.SyncJobId,
+                    DestinationGroupName = groupName,
+                    AdditionalContentParams = new[]
+                    {
+                        groupName ?? string.Empty,
+                        notification.TargetOfficeGroupId.ToString(),
+                        _emailSenderAndRecipients?.SupportEmailAddresses ?? string.Empty,
+                        _gmmResources?.LearnMoreAboutGMMUrl ?? string.Empty,
+                        DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture),
+                        notification.ChangeQuantityForAdditions.ToString(CultureInfo.InvariantCulture),
+                        notification.ChangeQuantityForRemovals.ToString(CultureInfo.InvariantCulture),
+                        notification.ChangePercentageForAdditions.ToString("0.##", CultureInfo.InvariantCulture),
+                        notification.ChangePercentageForRemovals.ToString("0.##", CultureInfo.InvariantCulture),
+                        notification.ThresholdPercentageForAdditions.ToString(CultureInfo.InvariantCulture),
+                        notification.ThresholdPercentageForRemovals.ToString(CultureInfo.InvariantCulture),
+                        direction
+                    }
+                };
+                emailContent = await _mailRepository.BuildStyledFallbackEmailHtmlAsync(routingMessage);
+            }
+
+            if (string.IsNullOrEmpty(emailContent))
+            {
+                // Plain informational fallback (no interactive card); owners resolve via the run history deep link.
+                var uiUrlSetting = await _databaseSettingsRepository.GetSettingByKeyAsync(SettingKey.UIUrl);
+                var runHistoryUrl = UiUrlBuilder.BuildJobDetailsUrl(
+                    uiUrlSetting?.SettingValue,
+                    notification.SyncJobId,
+                    includeHistory: true);
+
+                var fallbackHTMLContent = _localizationRepository.TranslateSetting(NotificationConstants.ThresholdNotificationFallbackBody,
+                    WebUtility.HtmlEncode(groupName ?? string.Empty),
+                    WebUtility.HtmlEncode(notification.TargetOfficeGroupId.ToString()),
+                    WebUtility.HtmlEncode(notification.ThresholdPercentageForAdditions.ToString()),
+                    WebUtility.HtmlEncode(notification.ThresholdPercentageForRemovals.ToString()),
+                    WebUtility.HtmlEncode(runHistoryUrl ?? string.Empty));
+
+                var htmlTemplate = @"<html>
+                <head>
+                  <meta http-equiv=""Content-Type"" content=""text/html; charset=utf-8"">
+                </head>
+                <body>
+                <pre>{0}</pre>
+                </body>
+                </html>";
+
+                emailContent = string.Format(htmlTemplate, fallbackHTMLContent);
+            }
+
+            var message = new EmailMessage
+            {
+                Subject = subject,
+                Content = emailContent,
+                SenderAddress = _emailSenderAndRecipients.SenderAddress,
+                SenderPassword = _emailSenderAndRecipients.SenderPassword,
+                ToEmailAddresses = ownerEmails,
+                CcEmailAddresses = _emailSenderAndRecipients.SupportEmailAddresses,
+                IsHTML = true
+            };
+
+            var response = await _mailRepository.SendMailAsync(message, null);
+
+            if (response != null && response.StatusCode != HttpStatusCode.Accepted)
+            {
+                var messageContent = new Dictionary<string, Object>
+                {
+                    { "MessageBody", message.Content },
+                    { "MessageType", NotificationMessageType.ThresholdNotification.ToString() },
+                    { "HttpStatusCode", response.StatusCode.ToString() },
+                    { "ReasonPhrase", response.ReasonPhrase.ToString() }
+                };
+                var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(messageContent));
+                var failedMessage = new ServiceBusMessage
+                {
+                    MessageId = $"{notification.Id}_{notification.SyncJobId}_{NotificationMessageType.ThresholdNotification}",
+                    Body = body
+                };
+                await _serviceBusQueueRepository.SendMessageAsync(failedMessage);
+            }
+            else if (response != null && !_mailConfig.SkipEmailNotifications)
+            {
+                // Only count the notification as sent when the mail was accepted and delivery was not skipped.
+                TrackSentNotificationEvent(notification.TargetOfficeGroupId);
+                _logger.SentEmail();
+            }
+        }
+
+        public async Task UpdateNotificationStatusAsync(Models.ThresholdNotifications.ThresholdNotification notification, ThresholdNotificationStatus status)
+        {
+            await _notificationRepository.UpdateNotificationStatusAsync(notification, status);
+        }
+
+        private void TrackSentNotificationEvent(Guid groupId)
+        {
+            var sentNotificationEvent = new Dictionary<string, string>
+            {
+                { "TargetGroupId", groupId.ToString() }
+            };
+            _telemetryClient.TrackEvent("NotificationSent", sentNotificationEvent);
+        }
+
+        public async Task<Models.ThresholdNotifications.ThresholdNotification> CreateActionableNotificationFromContentAsync(string messageBody)
+        {
+            var messageContent = NotificationMessageContentParser.ParseMessageBody(messageBody);
+            var job = NotificationMessageContentParser.GetRequiredValue<SyncJob>(messageContent, "SyncJob");
+            var threshold = NotificationMessageContentParser.GetRequiredValue<ThresholdResult>(messageContent, "ThresholdResult");
+            var sendDisableJobNotification = NotificationMessageContentParser.GetRequiredValue<bool>(messageContent, "SendDisableJobNotification");
+            var notification = await CreateActionableNotification(threshold, job, sendDisableJobNotification);
+            return notification;
+        }
+        private (SyncJob job, string[] additionalContentParameters) ParseMessageContentAsync(string messageBody)
+        {
+            var messageContent = NotificationMessageContentParser.ParseMessageBody(messageBody);
+            var job = NotificationMessageContentParser.GetRequiredValue<SyncJob>(messageContent, "SyncJob");
+            var additionalContentParameters = NotificationMessageContentParser.GetOptionalStringArray(messageContent, "AdditionalContentParameters");
+
+            return (job, additionalContentParameters);
+        }
+        public async Task SendEmailAsync(string messageType, string messageBody, string messageTitle, string subjectTemplate, string contentTemplate)
+        {
+            var (job, additionalContentParameters) = ParseMessageContentAsync(messageBody);
+            var groupId = job.TargetOfficeGroupId;
+
+            if (!Enum.TryParse<NotificationMessageType>(messageType, true, out var messageTypeEnum))
+            {
+                _logger.NotificationTypeNotExist(messageType);
+                return;
+            }
+            bool isNotificationDisabled = await IsNotificationDisabledAsync(job.Id, messageTypeEnum);
+
+            if (isNotificationDisabled)
+            {
+                _logger.NotificationDisabled(messageType, job.Id, groupId);
+                return;
+            }
+            string ownerEmails = null;
+            string ccAddress = _emailSenderAndRecipients.SupportEmailAddresses;
+
+            if (!NotificationConstants.DestinationNotExistContent.Equals(contentTemplate, StringComparison.InvariantCultureIgnoreCase))
+            {
+                var owners = await _graphGroupRepository.GetGroupOwnersAsync(groupId);
+                ownerEmails = string.Join(";", owners.Where(x => !string.IsNullOrWhiteSpace(x.Mail)).Select(x => x.Mail));
+            }
+
+            var message = new EmailMessage
+            {
+                Title = messageTitle,
+                Subject = subjectTemplate,
+                Content = contentTemplate,
+                SenderAddress = _emailSenderAndRecipients.SenderAddress,
+                SenderPassword = _emailSenderAndRecipients.SenderPassword,
+                ToEmailAddresses = ownerEmails ?? job.Requestor,
+                CcEmailAddresses = ccAddress,
+                AdditionalContentParams = additionalContentParameters,
+                SyncJobId = job.Id
+            };
+
+            if (messageType.Equals("NoDataNotification", StringComparison.InvariantCultureIgnoreCase))
+            {
+                message.AdditionalSubjectParams = additionalContentParameters;
+            }
+            var response =  await _mailRepository.SendMailAsync(message, job.RunId);
+
+            if (response != null && response.StatusCode != HttpStatusCode.Accepted) {
+                var messageContent = new Dictionary<string, Object>
+                {
+                    { "MessageBody", messageBody },
+                    { "MessageType", messageType },
+                    { "HttpStatusCode", response.StatusCode.ToString() },
+                    { "ReasonPhrase", response.ReasonPhrase.ToString() }
+                };
+                var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(messageContent));
+                var failedMessage = new ServiceBusMessage
+                {
+                    MessageId = $"{job.Id}_{job.RunId}_{messageType}",
+                    Body = body
+                };
+                await _serviceBusQueueRepository.SendMessageAsync(failedMessage);
+            }
+        }
+
+        public async Task<bool> IsNotificationDisabledAsync(Guid jobId, NotificationMessageType messageType)
+        {
+            var notificationType = await _notificationTypesRepository.GetNotificationTypeByNotificationTypeNameAsync(messageType);
+
+            if (notificationType == null)
+            {
+                _logger.NoNotificationTypeIdFound(messageType.ToString());
+                return false;
+            }
+
+            // Global suppression (notificationType.Disabled) is now handled pre-consumption
+            // in StarterFunction via message deferral. This method only checks per-job suppression.
+
+            return await _jobNotificationRepository.IsNotificationDisabledForJobAsync(jobId, notificationType.Id);
+        }
+
+        public async Task<AzureADGroup> ParseDestinationAsync(SyncJob syncJob)
+        {
+            var groupId = await GetGroupIdAsync(syncJob);
+            var channelId = await GetChannelIdAsync(syncJob);
+
+            if (syncJob.MembershipType == MembershipTypes.TeamsChannelMembership.ToString())
+            {
+                return new AzureADTeamsChannel
+                {
+                    Type = syncJob.MembershipType,
+                    ObjectId = groupId,
+                    ChannelId = channelId
+                };
+            }
+            else if (syncJob.MembershipType == MembershipTypes.GroupMembership.ToString())
+            {
+                return new AzureADGroup
+                {
+                    Type = syncJob.MembershipType,
+                    ObjectId = groupId
+                };
+            }
+            else
+            {
+                return null;
+            }
+        }
+        private async Task<Models.ThresholdNotifications.ThresholdNotification> CreateActionableNotification(ThresholdResult threshold, SyncJob job, bool sendDisableJobNotification)
+        {
+            var groupId = await GetGroupIdAsync(job);
+            var thresholdNotification = await _notificationRepository.GetThresholdNotificationBySyncJobIdAsync(job.Id);
+
+            if (thresholdNotification == null)
+            {
+                thresholdNotification = new ThresholdNotification
+                {
+                    Id = Guid.NewGuid(),
+                    SyncJobId = job.Id,
+                    ChangePercentageForAdditions = threshold.IncreaseThresholdPercentage,
+                    ChangePercentageForRemovals = threshold.DecreaseThresholdPercentage,
+                    ChangeQuantityForAdditions = threshold.DeltaToAddCount,
+                    ChangeQuantityForRemovals = threshold.DeltaToRemoveCount,
+                    CreatedTime = DateTime.UtcNow,
+                    Resolution = ThresholdNotificationResolution.Unresolved,
+                    ResolvedBy = string.Empty,
+                    ResolvedTime = DateTime.FromFileTimeUtc(0),
+                    Status = ThresholdNotificationStatus.Triggered,
+                    CardState = ThresholdNotificationCardState.DisabledCard,
+                    TargetOfficeGroupId = groupId,
+                    ThresholdPercentageForAdditions = job.ThresholdPercentageForAdditions,
+                    ThresholdPercentageForRemovals = job.ThresholdPercentageForRemovals
+                };
+            }
+            else
+            {
+                thresholdNotification.ChangePercentageForAdditions = threshold.IncreaseThresholdPercentage;
+                thresholdNotification.ChangePercentageForRemovals = threshold.DecreaseThresholdPercentage;
+                thresholdNotification.ChangeQuantityForAdditions = threshold.DeltaToAddCount;
+                thresholdNotification.ChangeQuantityForRemovals = threshold.DeltaToRemoveCount;
+                thresholdNotification.ThresholdPercentageForAdditions = job.ThresholdPercentageForAdditions;
+                thresholdNotification.ThresholdPercentageForRemovals = job.ThresholdPercentageForRemovals;
+                thresholdNotification.Status = ThresholdNotificationStatus.Triggered;
+
+                thresholdNotification.CardState = ThresholdNotificationCardState.DisabledCard;
+            }
+
+            await _notificationRepository.SaveNotificationAsync(thresholdNotification);
+            return thresholdNotification;
+        }
+        private (SyncJob job, ThresholdResult threshold, bool sendDisableJobNotification, string groupName) ParseNormalThresholdMessageContent(string messageBody)
+        {
+            var messageContent = NotificationMessageContentParser.ParseMessageBody(messageBody);
+            var job = NotificationMessageContentParser.GetRequiredValue<SyncJob>(messageContent, "SyncJob");
+            var threshold = NotificationMessageContentParser.GetRequiredValue<ThresholdResult>(messageContent, "ThresholdResult");
+            var sendDisableJobNotification = NotificationMessageContentParser.GetRequiredValue<bool>(messageContent, "SendDisableJobNotification");
+            var groupName = NotificationMessageContentParser.GetRequiredString(messageContent, "GroupName");
+            return (job, threshold, sendDisableJobNotification, groupName);
+        }
+
+        public async Task SendNormalThresholdEmailAsync(string messageBody)
+        {
+            var (job, threshold, sendDisableJobNotification, groupName) = ParseNormalThresholdMessageContent(messageBody);
+            var groupId = await GetGroupIdAsync(job);
+            bool isNotificationDisabled = await IsNotificationDisabledAsync(job.Id, NotificationMessageType.NormalThresholdNotification);
+
+            if (isNotificationDisabled)
+            {
+                _logger.NotificationDisabled(NotificationMessageType.NormalThresholdNotification.ToString(), job.Id, groupId);
+                return;
+            }
+            var emailSubject = NotificationConstants.SyncThresholdEmailSubject;
+
+            string contentTemplate;
+            string[] additionalContent;
+            string[] additionalSubjectContent = new[] { groupName };
+
+            var thresholdEmail = GetNormalThresholdEmail(groupName, threshold, job, groupId);
+            contentTemplate = thresholdEmail.ContentTemplate;
+            additionalContent = thresholdEmail.AdditionalContent;
+
+            var recipients = _emailSenderAndRecipients.SupportEmailAddresses;
+
+            if (!string.IsNullOrWhiteSpace(job.Requestor))
+            {
+                var recipientList = await GetThresholdRecipientsAsync(job.Requestor, groupId);
+                if (recipientList.Count > 0)
+                    recipients = string.Join(",", recipientList);
+            }
+
+            if (sendDisableJobNotification)
+            {
+                emailSubject = NotificationConstants.SyncThresholdDisablingJobEmailSubject;
+                contentTemplate = NotificationConstants.SyncJobDisabledEmailBody;
+                additionalContent = new[]
+                {
+                    groupName,
+                    groupId.ToString(),
+                    _emailSenderAndRecipients.SupportEmailAddresses,
+                    _gmmResources.LearnMoreAboutGMMUrl,
+                    DateTime.UtcNow.ToString("o", CultureInfo.InvariantCulture)
+                };
+            }
+            var message = new EmailMessage
+            {
+                Subject = emailSubject,
+                Content = contentTemplate,
+                SenderAddress = _emailSenderAndRecipients.SenderAddress,
+                SenderPassword = _emailSenderAndRecipients.SenderPassword,
+                ToEmailAddresses = recipients,
+                CcEmailAddresses = _emailSenderAndRecipients.SupportEmailAddresses,
+                AdditionalContentParams = additionalContent,
+                AdditionalSubjectParams = additionalSubjectContent,
+                SyncJobId = job.Id
+            };
+            var response = await _mailRepository.SendMailAsync(message, job.RunId);
+
+            if (response != null && response.StatusCode != HttpStatusCode.Accepted)
+            {
+                var messageContent = new Dictionary<string, Object>
+                {
+                    { "MessageBody", messageBody },
+                    { "MessageType", NotificationMessageType.NormalThresholdNotification },
+                    { "HttpStatusCode", response.StatusCode.ToString() },
+                    { "ReasonPhrase", response.ReasonPhrase.ToString() }
+                };
+                var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(messageContent));
+                var failedMessage = new ServiceBusMessage
+                {
+                    MessageId = $"{job.Id}_{job.RunId}_{NotificationMessageType.NormalThresholdNotification}",
+                    Body = body
+                };
+                await _serviceBusQueueRepository.SendMessageAsync(failedMessage);
+            }
+        }
+        private (string ContentTemplate, string[] AdditionalContent) GetNormalThresholdEmail(string groupName, ThresholdResult threshold, SyncJob job, Guid groupId)
+        {
+            string increasedThresholdMessage;
+            string decreasedThresholdMessage;
+            string contentTemplate = NotificationConstants.SyncThresholdBothEmailBody;
+            string[] additionalContent;
+
+            increasedThresholdMessage = _localizationRepository.TranslateSetting(
+                                                        NotificationConstants.IncreaseThresholdMessage,
+                                                        job.ThresholdPercentageForAdditions.ToString(),
+                                                        threshold.IncreaseThresholdPercentage.ToString("F2"));
+
+            decreasedThresholdMessage = _localizationRepository.TranslateSetting(
+                                               NotificationConstants.DecreaseThresholdMessage,
+                                               job.ThresholdPercentageForRemovals.ToString(),
+                                               threshold.DecreaseThresholdPercentage.ToString("F2"));
+
+            if (threshold.IsAdditionsThresholdExceeded && threshold.IsRemovalsThresholdExceeded)
+            {
+                additionalContent = new[]
+                {
+                      groupId.ToString(),
+                      groupName,
+                      $"{increasedThresholdMessage}\n{decreasedThresholdMessage}",
+                      _gmmResources.LearnMoreAboutGMMUrl,
+                      _emailSenderAndRecipients.SupportEmailAddresses
+                };
+            }
+            else if (threshold.IsAdditionsThresholdExceeded)
+            {
+                additionalContent = new[]
+                {
+                      groupId.ToString(),
+                      groupName,
+                      $"{increasedThresholdMessage}\n",
+                      _gmmResources.LearnMoreAboutGMMUrl,
+                      _emailSenderAndRecipients.SupportEmailAddresses
+                    };
+            }
+            else
+            {
+                additionalContent = new[]
+                {
+                      groupId.ToString(),
+                      groupName,
+                      $"{decreasedThresholdMessage}\n",
+                      _gmmResources.LearnMoreAboutGMMUrl,
+                      _emailSenderAndRecipients.SupportEmailAddresses
+                };
+            }
+
+            return (contentTemplate, additionalContent);
+        }
+        private async Task<List<string>> GetThresholdRecipientsAsync(string requestors, Guid targetOfficeGroupId)
+        {
+            var recipients = new List<string>();
+            var emails = requestors.Split(',', StringSplitOptions.RemoveEmptyEntries).Distinct().ToList();
+
+            foreach (var email in emails)
+            {
+                if (await IsEmailRecipientOwnerOfGroupAsync(email, targetOfficeGroupId))
+                {
+                    recipients.Add(email);
+                }
+            }
+
+            if (recipients.Count > 0) return recipients;
+
+            var top = _thresholdConfig.MaximumNumberOfThresholdRecipients > 0 ? _thresholdConfig.MaximumNumberOfThresholdRecipients + 1 : 0;
+            var owners = await GetGroupOwnersAsync(targetOfficeGroupId, top);
+
+            if (owners.Count <= _thresholdConfig.MaximumNumberOfThresholdRecipients || _thresholdConfig.MaximumNumberOfThresholdRecipients == 0)
+            {
+                recipients.AddRange(owners.Where(x => !string.IsNullOrWhiteSpace(x.Mail)).Select(x => x.Mail));
+            }
+
+            return recipients;
+        }
+        private async Task<bool> IsEmailRecipientOwnerOfGroupAsync(string email, Guid groupObjectId)
+        {
+            return await _graphGroupRepository.IsEmailRecipientOwnerOfGroupAsync(email, groupObjectId);
+        }
+        private async Task<List<AzureADUser>> GetGroupOwnersAsync(Guid groupObjectId, int top = 0)
+        {
+            return await _graphGroupRepository.GetGroupOwnersAsync(groupObjectId, top);
+        }
+    }
+}

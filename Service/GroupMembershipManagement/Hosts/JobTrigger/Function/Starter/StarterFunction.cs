@@ -1,11 +1,8 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask.Client;
 using Microsoft.Extensions.Logging;
-using Repositories.Contracts;
-using Services.Contracts;
 using System;
 using System.Threading.Tasks;
 
@@ -13,21 +10,23 @@ namespace Hosts.JobTrigger
 {
     public class StarterFunction
     {
-        private readonly ILoggingRepository _loggingRepository = null;
-        public StarterFunction(ILoggingRepository loggingRepository)
+        private readonly ILogger<StarterFunction> _logger;
+
+        public StarterFunction(ILogger<StarterFunction> logger)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        [FunctionName(nameof(StarterFunction))]
+
+        [Function(nameof(StarterFunction))]
         public async Task Run(
             [TimerTrigger("%jobTriggerSchedule%")] TimerInfo myTimer,
-            [DurableClient] IDurableOrchestrationClient starter,
-            ILogger log)
+            [DurableClient] DurableTaskClient starter)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(StarterFunction)} function started" });
-            await starter.StartNewAsync(nameof(OrchestratorFunction), null);
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(StarterFunction)} function completed" });
+            _logger.FunctionStarted(nameof(StarterFunction));
+            await starter.ScheduleNewOrchestrationInstanceAsync(nameof(OrchestratorFunction), null);
+            _logger.FunctionCompleted(nameof(StarterFunction));
         }
     }
 }
+

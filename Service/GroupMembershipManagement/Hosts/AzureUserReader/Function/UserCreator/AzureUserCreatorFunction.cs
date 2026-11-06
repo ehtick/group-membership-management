@@ -1,10 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Graph;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.Extensions.Logging;
+using Models;
 using Repositories.Contracts;
 using System;
 using System.Collections.Generic;
@@ -15,35 +14,43 @@ namespace Hosts.AzureUserReader
 {
     public class AzureUserCreatorFunction
     {
-        private readonly IGraphUserRepository _graphUserRepository = null;
-        private readonly ILoggingRepository _loggingRepository = null;
+        private readonly IGraphUserRepository _graphUserRepository;
+        private readonly ILogger<AzureUserCreatorFunction> _logger;
 
-        public AzureUserCreatorFunction(IGraphUserRepository graphUserRepository, ILoggingRepository loggingRepository)
+        public AzureUserCreatorFunction(IGraphUserRepository graphUserRepository, ILogger<AzureUserCreatorFunction> logger)
         {
             _graphUserRepository = graphUserRepository ?? throw new ArgumentNullException(nameof(graphUserRepository));
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
         }
 
-        [FunctionName(nameof(AzureUserCreatorFunction))]
+        [Function(nameof(AzureUserCreatorFunction))]
         public async Task<List<GraphProfileInformation>> AddUsersAsync([ActivityTrigger] AzureUserCreatorRequest request)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(AzureUserCreatorFunction)} function started" });
+            _logger.FunctionStarted(nameof(AzureUserCreatorFunction));
 
-            var newUsers = request.PersonnelNumbers.Select(x => new User
+            if (request == null || request.TenantInformation == null)
             {
-                DisplayName = $"{request.TenantInformation.EmailPrefix} {x}",
-                AccountEnabled = true,
-                PasswordProfile = new PasswordProfile { Password = PasswordGenerator.GeneratePassword() },
-                MailNickname = $"{request.TenantInformation.EmailPrefix}{x}",
-                UsageLocation = request.TenantInformation.CountryCode,
-                UserPrincipalName = $"{request.TenantInformation.EmailPrefix}{x}@{request.TenantInformation.TenantDomain}",
-                OnPremisesImmutableId = x
-            })
-            .ToList();
+                _logger.RequestOrTenantInfoNull(nameof(AzureUserCreatorFunction));
+                throw new ArgumentNullException(request == null ? nameof(request) : nameof(request.TenantInformation));
+            }
+
+            var newUsers = request.PersonnelNumbers
+                .Where(x => long.TryParse(x, out _))
+                .Select(x => new GraphUser
+                {
+                    DisplayName = $"{request.TenantInformation.EmailPrefix} {x}",
+                    AccountEnabled = true,
+                    Password = PasswordGenerator.GeneratePassword(),
+                    MailNickname = $"{request.TenantInformation.EmailPrefix}{x}",
+                    UsageLocation = request.TenantInformation.CountryCode,
+                    UserPrincipalName = $"{request.TenantInformation.EmailPrefix}{x}@{request.TenantInformation.TenantDomain}",
+                    OnPremisesImmutableId = x
+                })
+                .ToList();
 
             var newProfiles = await _graphUserRepository.AddUsersAsync(newUsers, null);
 
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(AzureUserCreatorFunction)} function completed" });
+            _logger.FunctionCompleted(nameof(AzureUserCreatorFunction));
 
             return newProfiles;
         }

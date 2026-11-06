@@ -1,14 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
+using Services.Entities;
 using System;
 
 namespace Hosts.GraphUpdater
 {
-    public class GroupValidatorRequest
+    public class GroupValidatorRequest : GraphUpdaterRequestBase
     {
-        public Guid RunId { get; set; }
         public Guid GroupId { get; set; }
-        public string JobPartitionKey { get; set; }
-        public string JobRowKey { get; set; }
     }
 }

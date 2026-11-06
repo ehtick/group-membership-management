@@ -1,0 +1,36 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using System;
+using System.Collections.Generic;
+
+namespace Models
+{
+    public class SettingConstants
+    {
+        public static readonly Dictionary<SettingKey, Guid> SettingIds = new Dictionary<SettingKey, Guid>
+        {
+            { SettingKey.DashboardUrl, Guid.Parse("63BA3339-639A-4104-AC63-E1376F0445C9") },
+            { SettingKey.OutlookWarningUrl, Guid.Parse("DFF1D616-E1E7-4642-B37F-FDE617158A90")},
+            { SettingKey.PrivacyPolicyUrl, Guid.Parse("6328107C-7332-47D1-A29C-CF9A49109AB0")},
+            { SettingKey.UIUrl, Guid.Parse("446FDA16-C27B-4E0C-BF4D-5E563F47FC61")},
+            { SettingKey.CanReviewOwnSubmissions, Guid.Parse("F901FC06-E92E-4361-B4CF-7F7283FB312B")},
+            { SettingKey.CreateGroupFeatureEnabled, Guid.Parse("A4B0C3E1-7F8D-4E9F-9A2C-5B6A0B8D7F1B") },
+            { SettingKey.IsBusinessJustificationRequired, Guid.Parse("CDE677B2-F55C-4AD8-AB09-DE59F87AA5EE") },
+            { SettingKey.IsDisclaimerEnabled, Guid.Parse("99D83E89-9507-4DC5-AC22-C8962B936B67") },
+            { SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, Guid.Parse("B2C4E6F8-1A3D-4C7E-9F2B-5A8C0D6E9F2A") },
+            { SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, Guid.Parse("E5F7A9B1-2C4D-6E8F-0A1B-3C5D7E9F1A2B") },
+            { SettingKey.IsAITitleEnabled, Guid.Parse("F1E2D3C4-B5A6-7890-1234-56789ABCDEF0") },
+            { SettingKey.IsAICopilotEnabled, Guid.Parse("A1B2C3D4-E5F6-7890-ABCD-EF1234567890") },
+            { SettingKey.CopilotTemperature, Guid.Parse("C3D4E5F6-A7B8-9012-CDEF-123456789012") },
+            { SettingKey.CopilotTopP, Guid.Parse("D4E5F6A7-B8C9-0123-DEF0-234567890123") },
+            { SettingKey.CopilotInstructions, Guid.Parse("E5F6A7B8-C9D0-1234-EF01-345678901234") },
+            { SettingKey.CopilotSuggestedPrompts, Guid.Parse("F6A7B8C9-D0E1-2345-F012-456789012345") },
+            { SettingKey.IsAISearchForUserEnabled, Guid.Parse("A7B8C9D0-E1F2-3456-0123-567890123456") },
+            { SettingKey.IsAIRunExplanationEnabled, Guid.Parse("FCC646D4-5EB9-4753-88F9-6450806AD3C6") },
+            { SettingKey.AlertBannerConfig, Guid.Parse("B8C9D0E1-F2A3-4567-1234-67890123456A") },
+            { SettingKey.IsPerPartAutoApprovalEnabled, Guid.Parse("9FFEAFBA-4C71-4CFF-8422-DEBAB380C552") },
+            { SettingKey.IsAIRejectionFeedbackRefinementEnabled, Guid.Parse("C9D0E1F2-A3B4-5678-2345-789012345678") }
+        };
+    }
+}

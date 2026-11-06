@@ -1,0 +1,373 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Hosts.WebApi;
+using Microsoft.ApplicationInsights;
+using Models;
+using Models.ServiceBus;
+using Models.SyncJobChange;
+using Repositories.Contracts;
+using Repositories.Contracts.InjectConfig;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using Services.WebApi.Validators;
+using System.Net;
+using System.Text.Encodings.Web;
+using System.Text.Json;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.DependencyInjection;
+using NewSyncJobDTO = WebApi.Models.DTOs.NewSyncJob;
+
+namespace Services
+{
+    public class PostJobHandler : RequestHandlerBase<PostJobRequest, PostJobResponse>
+    {
+        private const int DEFAULT_PERIOD = 24;
+        private readonly ILogger<PostJobHandler> _logger;
+        private readonly IDatabaseSyncJobsRepository _syncJobRepository;
+        private readonly IDatabaseDestinationAttributesRepository _destinationAttributesRepository;
+        private readonly IDatabaseTitlesRepository _titlesRepository;
+        private readonly IGraphGroupRepository _graphGroupRepository;
+        private readonly ISyncJobChangeRepository _syncJobChangeRepository;
+        private readonly IDatabaseSettingsRepository _databaseSettingsRepository;
+        private readonly IPendingConfigurationConfig _pendingConfigurationConfig;
+        private readonly IServiceBusQueueRepository _serviceBusQueueRepository;
+        private readonly TelemetryClient _telemetryClient;
+        private readonly IServiceBusQueueRepository? _autoApproverQueueRepository;
+
+        public PostJobHandler(
+            ILogger<PostJobHandler> logger,
+            IDatabaseSyncJobsRepository syncJobRepository,
+            IDatabaseDestinationAttributesRepository destinationAttributesRepository,
+            IDatabaseTitlesRepository titlesRepository,
+            IGraphGroupRepository graphGroupRepository,
+            ISyncJobChangeRepository syncJobChangeRepository,
+            IDatabaseSettingsRepository databaseSettingsRepository,
+            IPendingConfigurationConfig pendingConfigurationConfig,
+            IServiceBusQueueRepository serviceBusQueueRepository,
+            TelemetryClient telemetryClient,
+            [FromKeyedServices("AutoApprover")] IServiceBusQueueRepository? autoApproverQueueRepository = null) : base(logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _syncJobRepository = syncJobRepository ?? throw new ArgumentNullException(nameof(syncJobRepository));
+            _destinationAttributesRepository = destinationAttributesRepository ?? throw new ArgumentNullException(nameof(destinationAttributesRepository));
+            _titlesRepository = titlesRepository ?? throw new ArgumentNullException(nameof(titlesRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+            _syncJobChangeRepository = syncJobChangeRepository ?? throw new ArgumentNullException(nameof(syncJobChangeRepository));
+            _databaseSettingsRepository = databaseSettingsRepository ?? throw new ArgumentNullException(nameof(databaseSettingsRepository));
+            _pendingConfigurationConfig = pendingConfigurationConfig ?? throw new ArgumentNullException(nameof(pendingConfigurationConfig));
+            _serviceBusQueueRepository = serviceBusQueueRepository ?? throw new ArgumentNullException(nameof(serviceBusQueueRepository));
+            _telemetryClient = telemetryClient ?? throw new ArgumentNullException(nameof(telemetryClient));
+            _autoApproverQueueRepository = autoApproverQueueRepository;
+        }
+
+        protected override async Task<PostJobResponse> ExecuteCoreAsync(PostJobRequest request)
+        {
+            var response = new PostJobResponse();
+            
+            try
+            {
+                var newSyncJobEntity = MapSyncJobDTOtoEntity(request.NewSyncJob);
+
+                // Validate TeamsChannel jobs for a channel id and exact duplicate destination.
+                if (newSyncJobEntity.MembershipType == MembershipTypes.TeamsChannelMembership.ToString())
+                {
+                    var channelId = newSyncJobEntity.Channel?.ChannelId;
+                    if (string.IsNullOrEmpty(channelId))
+                    {
+                        response.StatusCode = HttpStatusCode.BadRequest;
+                        response.ErrorCode = "MissingChannelId";
+                        response.Message = "TeamsChannel sync requires a specific channel. To sync the Team itself, use the GroupMembership path.";
+                        return response;
+                    }
+
+                    var existingChannelJob = await _syncJobRepository.GetSyncJobByTeamIdAndChannelIdAsync(newSyncJobEntity.Channel.GroupId, channelId);
+                    if (existingChannelJob != null)
+                    {
+                        // Authorize ownership before returning duplicate-destination details.
+                        var isChannelGroupOwner = await _graphGroupRepository.IsEmailRecipientOwnerOfGroupAsync(request.UserIdentity, newSyncJobEntity.Channel.GroupId);
+                        if (!(isChannelGroupOwner || request.IsJobTenantWriter))
+                        {
+                            response.StatusCode = HttpStatusCode.Forbidden;
+                            return response;
+                        }
+
+                        response.StatusCode = HttpStatusCode.Conflict;
+                        response.ErrorCode = "DuplicateDestination";
+                        response.Message = "A sync job for this channel already exists.";
+                        return response;
+                    }
+                }
+
+                // Validate any TeamsChannel source part: it is permitted only when it references the
+                // same channel as this job's TeamsChannel destination, the job has at least one other
+                // source part of a recognized type, and the part is inclusionary. (US3: source == destination.)
+                // Shared with the update path (PatchJobHandler) via TeamsChannelSourcePartValidator.
+                var teamsChannelSourceError = TeamsChannelSourcePartValidator.Validate(newSyncJobEntity);
+                if (teamsChannelSourceError != null)
+                {
+                    response.StatusCode = HttpStatusCode.BadRequest;
+                    response.ErrorCode = teamsChannelSourceError.ErrorCode;
+                    response.Message = teamsChannelSourceError.Message;
+                    return response;
+                }
+
+                var isPendingConfigurationEnabled = _pendingConfigurationConfig.PendingConfigurationIsEnabled;
+
+                // Check if pending configuration feature is enabled, only works for groups
+                if (isPendingConfigurationEnabled && newSyncJobEntity.MembershipType == MembershipTypes.GroupMembership.ToString())
+                {
+                    newSyncJobEntity.Status = SyncStatus.PendingConfiguration.ToString();
+                }
+                else if (_autoApproverQueueRepository != null)
+                {
+                    // Route through the AutoApprover: the job waits in PendingAutoApproval until the
+                    // AutoApprover evaluates it (approves -> Idle, declines -> PendingReview). The queue
+                    // repository is only registered when AutoApprover:IsEnabled is true, so when the feature
+                    // is disabled (or not configured) it resolves to null and the job keeps the default
+                    // PendingReview status and is never enqueued.
+                    newSyncJobEntity.Status = SyncStatus.PendingAutoApproval.ToString();
+                }
+
+                var isAITitleEnabled = await IsAITitleEnabledAsync();
+
+                var destinationId = newSyncJobEntity.MembershipType == MembershipTypes.GroupMembership.ToString() ? newSyncJobEntity.Group.GroupId : newSyncJobEntity.Channel.GroupId;
+                var userIdentifier = (request.IsOnBehalfAllowed && !string.IsNullOrEmpty(request.NewSyncJob.LastModifiedOnBehalfOfObjectId)) ? request.NewSyncJob.LastModifiedOnBehalfOfObjectId : request.UserIdentity;
+                var userResponse = await _graphGroupRepository.GetUserByUpnOrIdAsync(userIdentifier, false);
+                newSyncJobEntity.Requestor = userResponse.UserPrincipalName;
+                var isGroupOwner = await _graphGroupRepository.IsEmailRecipientOwnerOfGroupAsync(request.UserIdentity, destinationId);
+                if (!(isGroupOwner || request.IsJobTenantWriter))
+                {
+                    response.StatusCode = HttpStatusCode.Forbidden;
+                    return response;
+                }
+
+                var newSyncJobId = await _syncJobRepository.CreateSyncJobAsync(newSyncJobEntity);
+
+                if (newSyncJobId != Guid.Empty)
+                {
+                    response.StatusCode = HttpStatusCode.Created;
+                    response.NewSyncJobId = newSyncJobId;
+
+                    _logger.JobCreated(newSyncJobId);
+
+                    _telemetryClient.TrackEvent("JobOnboarded", new Dictionary<string, string>
+                    {
+                        { "SyncJobId", newSyncJobId.ToString() },
+                        { "TargetOfficeGroupId", newSyncJobEntity.TargetOfficeGroupId.ToString() },
+                        { "MembershipType", newSyncJobEntity.MembershipType },
+                        { "OnboardedUsingAIQB", request.NewSyncJob.OnboardedUsingAIQB.ToString() }
+                    });
+
+                    var destinationName = await _graphGroupRepository.GetGroupNameAsync(destinationId);
+                    var destinationEmail = await _graphGroupRepository.GetGroupEmailAsync(destinationId);
+                    var ownersDictionary = await _graphGroupRepository.GetDestinationOwnersAsync(new List<Guid> { destinationId });
+                    var destinationAttributes = new DestinationAttributes
+                    {
+                        Id = newSyncJobId,
+                        Name = destinationName,
+                        Email = destinationEmail,
+                        Owners = ownersDictionary.GetValueOrDefault(destinationId)
+                    };
+                    await _destinationAttributesRepository.UpdateAttributes(destinationAttributes);
+                    // Only honor the on-behalf owner when the caller is allowed (Job Tenant Writer or Submission Reviewer); otherwise the audit records the real submitter.
+                    string? changedOnBehalfOfDisplayName = request.IsOnBehalfAllowed ? request.NewSyncJob.LastModifiedOnBehalfOfDisplayName : null;
+                    string? changedOnBehalfOfObjectId = request.IsOnBehalfAllowed ? request.NewSyncJob.LastModifiedOnBehalfOfObjectId : null;
+                    var changeReason = SyncJobChangeReason.Onboarding;
+
+                    await _syncJobChangeRepository.Save(new SyncJobChange
+                    {
+                        SyncJobId = newSyncJobId,
+                        ChangeTime = DateTime.UtcNow,
+                        ChangedByObjectId = Guid.Parse(request.UserIdentity),
+                        ChangedByDisplayName = request.UserDisplayName,
+                        ChangeSource = SyncJobChangeSource.WebApp,
+                        ChangeReason = changeReason.ToString(),
+                        ChangeDetails = SyncJobSerializationHelper.SerializeSyncJob(newSyncJobEntity),
+                        BusinessJustification = request.BusinessJustification,
+                        ChangedOnBehalfOfDisplayName = changedOnBehalfOfDisplayName != null && changedOnBehalfOfDisplayName != request.UserDisplayName ? changedOnBehalfOfDisplayName : null,
+                        ChangedOnBehalfOfObjectId = !string.IsNullOrEmpty(changedOnBehalfOfObjectId) && changedOnBehalfOfObjectId != request.UserIdentity ? new Guid(changedOnBehalfOfObjectId) : (Guid?)null
+                    });
+
+                    if (request.NewSyncJob.GroupSettings != null)
+                    {
+                        await _syncJobChangeRepository.Save(new SyncJobChange
+                        {
+                            SyncJobId = newSyncJobId,
+                            ChangeTime = DateTime.UtcNow,
+                            ChangedByObjectId = Guid.Parse(request.UserIdentity),
+                            ChangedByDisplayName = request.UserDisplayName,
+                            ChangeSource = SyncJobChangeSource.WebApp,
+                            ChangeReason = SyncJobChangeReason.GroupSettings.ToString(),
+                            ChangeDetails = JsonSerializer.Serialize(request.NewSyncJob.GroupSettings),
+                            BusinessJustification = request.BusinessJustification,
+                            ChangedOnBehalfOfDisplayName = changedOnBehalfOfDisplayName != null && changedOnBehalfOfDisplayName != request.UserDisplayName ? changedOnBehalfOfDisplayName : null,
+                            ChangedOnBehalfOfObjectId = !string.IsNullOrEmpty(changedOnBehalfOfObjectId) && changedOnBehalfOfObjectId != request.UserIdentity ? new Guid(changedOnBehalfOfObjectId) : (Guid?)null
+                        });
+                    }
+
+                    if (isPendingConfigurationEnabled && newSyncJobEntity.MembershipType == MembershipTypes.GroupMembership.ToString())
+                    {
+                        var jobConfigurationQueueMessage = new JobConfigurationQueueMessage {
+                            JobId = newSyncJobId,
+                            GroupId = destinationId,
+                            RequestorObjectId = request.UserIdentity,
+                            RequestorDisplayName = request.UserDisplayName,
+                            ChangedOnBehalfOfDisplayName = changedOnBehalfOfDisplayName,
+                            ChangedOnBehalfOfObjectId = changedOnBehalfOfObjectId,
+                            BusinessJustification = request.BusinessJustification
+                        };
+                        var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(jobConfigurationQueueMessage));
+
+                        var message = new ServiceBusMessage
+                        {
+                            MessageId = destinationId.ToString(),
+                            Body = body
+                        };
+
+                        await _serviceBusQueueRepository.SendMessageAsync(message);
+
+                        _logger.JobConfigurationMessageSent(message.MessageId);
+                    }
+
+                    if (!isPendingConfigurationEnabled || newSyncJobEntity.MembershipType != MembershipTypes.GroupMembership.ToString())
+                    {
+                        if (_autoApproverQueueRepository != null && newSyncJobEntity.Status == SyncStatus.PendingAutoApproval.ToString())
+                        {
+                            var autoApprovalMessage = new AutoApprovalQueueMessage
+                            {
+                                SyncJobId = newSyncJobId,
+                                RequestorObjectId = request.UserIdentity,
+                                RequestorDisplayName = request.UserDisplayName,
+                                ChangedOnBehalfOfDisplayName = changedOnBehalfOfDisplayName,
+                                ChangedOnBehalfOfObjectId = changedOnBehalfOfObjectId,
+                                BusinessJustification = request.BusinessJustification
+                            };
+
+                            var autoApprovalBody = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(autoApprovalMessage));
+                            var autoApprovalServiceBusMessage = new ServiceBusMessage
+                            {
+                                MessageId = newSyncJobId.ToString(),
+                                Body = autoApprovalBody
+                            };
+
+                            try
+                            {
+                                await _autoApproverQueueRepository.SendMessageAsync(autoApprovalServiceBusMessage);
+                                _logger.AutoApproverMessageSent(autoApprovalServiceBusMessage.MessageId);
+                            }
+                            catch (Exception ex)
+                            {
+                                // The job was already persisted with PendingAutoApproval status. The AutoApprover
+                                // only acts on queue messages (it never scans the database for orphaned jobs), so
+                                // if enqueueing fails nothing would ever move the job out of PendingAutoApproval and
+                                // it would be invisible to reviewers. Revert it to PendingReview for human review.
+                                _logger.AutoApproverMessageSendFailed(newSyncJobId, ex);
+
+                                try
+                                {
+                                    newSyncJobEntity.Id = newSyncJobId;
+                                    newSyncJobEntity.Status = SyncStatus.PendingReview.ToString();
+                                    await _syncJobRepository.UpdateSyncJobsAsync(new[] { newSyncJobEntity });
+                                }
+                                catch (Exception revertEx)
+                                {
+                                    _logger.AutoApproverRevertToPendingReviewFailed(newSyncJobId, revertEx);
+                                }
+                            }
+                        }
+                    }
+
+                    if (isAITitleEnabled && request.NewSyncJob.Titles != null)
+                    {
+                        var titlesDictionary = request.NewSyncJob.Titles.ToDictionary(t => t.PartId, t => t.Name);
+                        await _titlesRepository.SaveTitlesAsync(titlesDictionary, newSyncJobId);
+                    }
+                }
+                else
+                {
+                    response.StatusCode = HttpStatusCode.BadRequest;
+                    response.ErrorCode = "JobCreationFailed";
+                    _logger.JobCreationReturnedEmptyId();
+                }
+            }
+            catch (Exception ex)
+            {
+                response.StatusCode = HttpStatusCode.InternalServerError;
+                _logger.JobCreationFailed(ex);
+            }
+
+            return response;
+        }
+
+
+        private async Task<bool> IsAITitleEnabledAsync()
+        {
+            try
+            {
+                var setting = await _databaseSettingsRepository.GetSettingByKeyAsync(SettingKey.IsAITitleEnabled);
+                return setting != null && bool.TryParse(setting.SettingValue, out bool result) && result;
+            }
+            catch (Exception ex)
+            {
+                _logger.AITitleSettingRetrievalFailed(ex);
+                return false;
+            }
+        }
+
+        private static SyncJob MapSyncJobDTOtoEntity(NewSyncJobDTO syncJob)
+        {
+            var queryObject = JsonDocument.Parse(syncJob.Query);
+            var convertedQuery = JsonSerializer.Serialize(
+                JsonDocument.Parse(syncJob.Query),
+                new JsonSerializerOptions
+                {
+                    Encoder = JavaScriptEncoder.UnsafeRelaxedJsonEscaping,
+                    WriteIndented = false
+                });
+
+
+            var destinationArray = JsonSerializer.Deserialize<List<JsonElement>>(syncJob.Destination);
+            string? targetOfficeGroupId = null;
+            string? channelId = null;
+            string? type = null;
+
+            var destination = destinationArray?.FirstOrDefault();
+            if (destination != null && destination.Value.TryGetProperty("value", out JsonElement value))
+            {
+                if (value.TryGetProperty("objectId", out JsonElement objectId))
+                {
+                    targetOfficeGroupId = objectId.GetString();
+                }
+
+                if (value.TryGetProperty("channelId", out JsonElement channelIdElement))
+                {
+                    channelId = channelIdElement.GetString();
+                }
+            }
+
+            type = destination != null ? destination.Value.GetProperty("type").GetString() : null;
+
+            var targetGroupId = !string.IsNullOrEmpty(targetOfficeGroupId) ? new Guid(targetOfficeGroupId) : Guid.Empty;
+            string membershipType = !string.IsNullOrEmpty(type) ? type : MembershipTypes.GroupMembership.ToString();
+
+            return new SyncJob
+            {
+                Id = new Guid(),
+                TargetOfficeGroupId = targetGroupId,
+                Destination = syncJob.Destination,
+                Requestor = syncJob.Requestor,
+                StartDate = DateTime.Parse(syncJob.StartDate),
+                Period = syncJob.Period == DEFAULT_PERIOD ? syncJob.Period : DEFAULT_PERIOD,
+                Query = convertedQuery,
+                ThresholdPercentageForAdditions = syncJob.ThresholdPercentageForAdditions,
+                ThresholdPercentageForRemovals = syncJob.ThresholdPercentageForRemovals,
+                Status = SyncStatus.PendingReview.ToString(),
+                MembershipType = membershipType,
+                Channel = membershipType == MembershipTypes.TeamsChannelMembership.ToString() ? new Channel { GroupId = targetGroupId, ChannelId = channelId } : null,
+                Group = membershipType == MembershipTypes.GroupMembership.ToString() ? new Group { GroupId = targetGroupId } : null
+            };
+        }
+    }
+}

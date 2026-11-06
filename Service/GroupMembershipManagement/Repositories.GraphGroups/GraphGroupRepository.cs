@@ -1,763 +1,366 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
 using Microsoft.ApplicationInsights;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.Graph;
-using Newtonsoft.Json.Linq;
+using Models;
+using Models.Entities;
 using Repositories.Contracts;
+using Repositories.Contracts.Helpers;
 using System;
-using System.Collections.Concurrent;
 using System.Collections.Generic;
 using System.Linq;
-using System.Net;
-using System.Net.Http;
-using System.Net.Http.Headers;
-using System.Text.RegularExpressions;
 using System.Threading.Tasks;
-using Group = Microsoft.Graph.Group;
-using Metric = Services.Entities.Metric;
 
 namespace Repositories.GraphGroups
 {
     public class GraphGroupRepository : IGraphGroupRepository
     {
-        private readonly IGraphServiceClient _graphServiceClient;
-        private readonly TelemetryClient _telemetryClient;
-        private readonly ILoggingRepository _log;
+        private readonly ILogger<GraphGroupRepository> _graphGroupRepositoryLogger;
+        private readonly GraphGroupInformationRepository _graphGroupInformationReader;
+        private readonly GraphGroupOwnerReader _graphGroupOwnerReader;
+        private readonly GraphUserReader _graphUserReader;
+        private readonly GraphGroupMembershipReader _graphGroupMembershipReader;
+        private readonly GraphGroupMembershipUpdater _graphGroupMembershipUpdater;
+        private readonly GraphGroupDeltaReader _graphGroupDeltaReader;
+        private readonly GraphGroupPlacesReader _graphGroupPlacesReader;
 
         public Guid RunId { get; set; }
 
-        public GraphGroupRepository(IGraphServiceClient graphServiceClient, TelemetryClient telemetryClient, ILoggingRepository logger)
+        public GraphGroupRepository(GraphServiceClient graphServiceClient,
+                                    TelemetryClient telemetryClient,
+                                    ILoggerFactory loggerFactory = null)
+            : this(graphServiceClient, telemetryClient, null, loggerFactory)
         {
-            _graphServiceClient = graphServiceClient;
-            _telemetryClient = telemetryClient;
-            _log = logger;
         }
 
-        private const int MaxRetries = 10;
-        private const int MaxResultCount = 999;
+        public GraphGroupRepository(GraphServiceClient graphServiceClient,
+                                    TelemetryClient telemetryClient,
+                                    IGraphRepositorySettings graphRepositorySettings,
+                                    ILoggerFactory loggerFactory = null)
+        {
+            if (graphServiceClient == null) throw new ArgumentNullException(nameof(graphServiceClient));
+            _ = telemetryClient ?? throw new ArgumentNullException(nameof(telemetryClient));
+            _graphGroupRepositoryLogger = loggerFactory?.CreateLogger<GraphGroupRepository>() ?? NullLogger<GraphGroupRepository>.Instance;
 
-        private const string ResourceUnitHeader = "x-ms-resource-unit";
-        private const string ThrottlePercentageHeader = "x-ms-throttle-limit-percentage";
+            var graphGroupMetricTracker = new GraphGroupMetricTracker(
+                graphServiceClient,
+                telemetryClient,
+                loggerFactory?.CreateLogger<GraphGroupMetricTracker>() ?? NullLogger<GraphGroupMetricTracker>.Instance);
+            _graphGroupInformationReader = new GraphGroupInformationRepository(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphGroupInformationRepository>() ?? NullLogger<GraphGroupInformationRepository>.Instance);
+            _graphGroupOwnerReader = new GraphGroupOwnerReader(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphGroupOwnerReader>() ?? NullLogger<GraphGroupOwnerReader>.Instance);
+            _graphUserReader = new GraphUserReader(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphUserReader>() ?? NullLogger<GraphUserReader>.Instance);
+            _graphGroupMembershipReader = new GraphGroupMembershipReader(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphGroupMembershipReader>() ?? NullLogger<GraphGroupMembershipReader>.Instance);
+            _graphGroupMembershipUpdater = new GraphGroupMembershipUpdater(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                graphRepositorySettings,
+                loggerFactory?.CreateLogger<GraphGroupMembershipUpdater>() ?? NullLogger<GraphGroupMembershipUpdater>.Instance);
+            _graphGroupDeltaReader = new GraphGroupDeltaReader(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphGroupDeltaReader>() ?? NullLogger<GraphGroupDeltaReader>.Instance);
+            _graphGroupPlacesReader = new GraphGroupPlacesReader(
+                graphServiceClient,
+                graphGroupMetricTracker,
+                loggerFactory?.CreateLogger<GraphGroupPlacesReader>() ?? NullLogger<GraphGroupPlacesReader>.Instance,
+                loggerFactory?.CreateLogger<GraphUserReader>() ?? NullLogger<GraphUserReader>.Instance);
+        }
 
         public async Task<bool> GroupExists(Guid objectId)
         {
-            try
-            {
-                var group = await _graphServiceClient.Groups[objectId.ToString()].Request().WithMaxRetry(MaxRetries).GetAsync();
-                TrackMetrics(group.AdditionalData);
-                return group != null;
-            }
-            catch (ServiceException ex)
-            {
-                if (ex.StatusCode == HttpStatusCode.NotFound)
-                    return false;
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
+            return await _graphGroupInformationReader.GroupExistsAsync(objectId, ResolveRunId());
         }
 
-        public async Task<bool> IsAppIDOwnerOfGroup(string appId, Guid groupObjectId)
+        public async Task<bool> GroupExists(string groupName)
         {
-            if (await GroupExists(groupObjectId) == false) { return false; }
-
-            // get the service principal ID by its app ID
-            var servicePrincipal = (await _graphServiceClient.ServicePrincipals.Request().WithMaxRetry(MaxRetries).Filter($"appId eq '{appId}'").GetAsync()).Single();
-            TrackMetrics(servicePrincipal.AdditionalData);
-
-            await _log.LogMessageAsync(new LogMessage
-            {
-                RunId = RunId,
-                Message = $"Checking if app ID {appId} (service principal with object ID {servicePrincipal.Id}) owns the group {groupObjectId}."
-            });
-
-            return await IsGroupOwnerAsync($"id eq '{servicePrincipal.Id}'", groupObjectId);
+            return await _graphGroupInformationReader.GroupExistsAsync(groupName, ResolveRunId());
         }
 
-        public async Task<bool> IsEmailRecipientOwnerOfGroupAsync(string email, Guid groupObjectId)
+        public async Task<bool> IsGroupSyncedOnPremisesAsync(Guid groupId)
         {
-            if (await GroupExists(groupObjectId) == false) { return false; }
-
-            User user = null;
-
-            try
-            {
-                user = await _graphServiceClient.Users[email].Request().GetAsync();
-            }
-            catch (ServiceException ex)
-            {
-                if (ex.StatusCode == HttpStatusCode.NotFound)
-                    return false;
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
-
-            await _log.LogMessageAsync(new LogMessage
-            {
-                RunId = RunId,
-                Message = $"Checking if email owns the group {groupObjectId}."
-            });
-
-            return await IsGroupOwnerAsync($"id eq '{user.Id}'", groupObjectId);
+            return await _graphGroupInformationReader.IsGroupSyncedOnPremisesAsync(groupId, ResolveRunId());
         }
 
-        public async Task<List<User>> GetGroupOwnersAsync(Guid groupObjectId, int top = 0)
+        public async Task<AzureADGroup> GetGroup(string groupName)
         {
-            await _log.LogMessageAsync(new LogMessage
-            {
-                RunId = RunId,
-                Message = $"Getting owners of group {groupObjectId}."
-            });
-
-            var owners = new List<User>();
-
-            try
-            {
-                var request = _graphServiceClient.Groups[groupObjectId.ToString()].Owners
-                                        .Request().WithMaxRetry(MaxRetries);
-
-                if (top > 0) request = request.Top(top);
-
-                var groupOwners = await request.GetAsync();
-                owners.AddRange(groupOwners.CurrentPage.OfType<User>());
-                TrackMetrics(groupOwners.AdditionalData);
-
-                while (groupOwners.NextPageRequest != null)
-                {
-                    groupOwners = await groupOwners.NextPageRequest.WithMaxRetry(MaxRetries).GetAsync();
-                    TrackMetrics(groupOwners.AdditionalData);
-                    owners.AddRange(groupOwners.CurrentPage.OfType<User>());
-                }
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    RunId = RunId,
-                    Message = $"Retrieved{(top > 0 ? " top " : " ")}{owners.Count} owners of group {groupObjectId}."
-                });
-
-                return owners;
-            }
-            catch (ServiceException ex)
-            {
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
+            return await _graphGroupInformationReader.GetGroupAsync(groupName, ResolveRunId());
         }
 
         public async Task<string> GetGroupNameAsync(Guid objectId)
         {
-            try
+            return await _graphGroupInformationReader.GetGroupNameAsync(objectId, ResolveRunId());
+        }
+
+        public Task<Dictionary<Guid, string>> GetGroupNamesAsync(List<Guid> objectIds)
+        {
+            return _graphGroupInformationReader.GetGroupNamesAsync(objectIds);
+        }
+
+        public Task<string> GetGroupEmailAsync(Guid objectId)
+        {
+            return _graphGroupInformationReader.GetGroupEmailAsync(objectId, ResolveRunId());
+        }
+
+        public Task<(string Email, DateTimeOffset? CreatedDateTime)> GetGroupEmailAndCreatedDateAsync(Guid objectId)
+        {
+            return _graphGroupInformationReader.GetGroupEmailAndCreatedDateAsync(objectId, ResolveRunId());
+        }
+
+        public Task<Dictionary<Guid, string>> GetGroupEmailsAsync(List<Guid> objectIds)
+        {
+            return _graphGroupInformationReader.GetGroupEmailsAsync(objectIds);
+        }
+
+        public Task<Dictionary<Guid, List<Guid>>> GetDestinationOwnersAsync(List<Guid> objectIds)
+        {
+            return _graphGroupInformationReader.GetGroupOwnersAsync(objectIds);
+        }
+
+        public Task<List<string>> GetGroupEndpointsAsync(Guid groupId)
+        {
+            return _graphGroupInformationReader.GetGroupEndpointsAsync(groupId, ResolveRunId());
+        }
+
+        public Task<string?> GetGroupVivaEngageUrlAsync(Guid groupId)
+        {
+            return _graphGroupInformationReader.GetGroupVivaEngageUrlAsync(groupId, RunId);
+        }
+
+
+        public async Task<IEnumerable<IAzureADObject>> GetChildrenOfGroup(Guid groupId)
+        {
+            return await _graphGroupMembershipReader.GetChildrenOfGroup(groupId, ResolveRunId());
+        }
+
+        public async Task<bool> IsAppIDOwnerOfGroup(string appId, Guid groupObjectId, bool validateGroupExists = true)
+        {
+            if (validateGroupExists)
             {
-                var group = await _graphServiceClient.Groups[objectId.ToString()].Request().WithMaxRetry(MaxRetries).GetAsync();
-                TrackMetrics(group.AdditionalData);
-                return group != null ? group.DisplayName : string.Empty;
-            }
-            catch (ServiceException ex)
-            {
-                if (ex.StatusCode == HttpStatusCode.NotFound)
-                    return string.Empty;
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
-        }
-
-        public async Task<List<AzureADUser>> GetUsersInGroupTransitively(Guid objectId)
-        {
-            var nonUserGraphObjects = new Dictionary<string, int>();
-            IGroupTransitiveMembersCollectionWithReferencesPage members;
-
-            try
-            {
-                members = await _graphServiceClient.Groups[objectId.ToString()].TransitiveMembers.Request()
-                            .WithMaxRetry(MaxRetries)
-                            .Select("id")
-                            .GetAsync();
-                TrackMetrics(members.AdditionalData);
-
-                var toReturn = new List<AzureADUser>(ToUsers(members.CurrentPage, nonUserGraphObjects));
-                while (members.NextPageRequest != null)
-                {
-                    members = await members.NextPageRequest.WithMaxRetry(MaxRetries).GetAsync();
-                    TrackMetrics(members.AdditionalData);
-                    toReturn.AddRange(ToUsers(members.CurrentPage, nonUserGraphObjects));
-                }
-
-                var nonUserGraphObjectsSummary = string.Join(Environment.NewLine, nonUserGraphObjects.Select(x => $"{x.Value}: {x.Key}"));
-                await _log.LogMessageAsync(new LogMessage { RunId = RunId, Message = $"From group {objectId}, read {toReturn.Count} users, and the following other directory objects:\n{nonUserGraphObjectsSummary}\n" });
-                return toReturn;
-            }
-            catch (ServiceException ex)
-            {
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
-        }
-
-        /// <summary>
-        /// get group members page by id.
-        /// </summary>
-        /// <param name="groupId">group id.</param>
-        /// <returns>group members page.</returns>
-        public async Task<IGroupTransitiveMembersCollectionWithReferencesPage> GetGroupMembersPageByIdAsync(string groupId)
-        {
-            return await _graphServiceClient
-                                    .Groups[groupId]
-                                    .TransitiveMembers
-                                    .Request()
-                                    .Top(MaxResultCount)
-                                    .WithMaxRetry(MaxRetries)
-                                    .GetAsync();
-        }
-
-        /// <summary>
-        /// get group members page by next page url.
-        /// </summary>
-        /// <param name="groupMembersRef">group members page reference.</param>
-        /// <param name="nextPageUrl">group members next page data link url.</param>
-        /// <returns>group members page.</returns>
-        public async Task<IGroupTransitiveMembersCollectionWithReferencesPage> GetGroupMembersNextPageAsnyc(
-            IGroupTransitiveMembersCollectionWithReferencesPage groupMembersRef,
-            string nextPageUrl)
-        {
-            groupMembersRef.InitializeNextPageRequest(_graphServiceClient, nextPageUrl);
-            return await groupMembersRef
-                .NextPageRequest
-                .GetAsync();
-        }
-
-        public async Task<(List<AzureADUser> users,
-                           Dictionary<string, int> nonUserGraphObjects,
-                           string nextPageUrl,
-                           IGroupTransitiveMembersCollectionWithReferencesPage usersFromGroup)> GetFirstUsersPageAsync(Guid objectId)
-        {
-            var users = new List<AzureADUser>();
-            var nonUserGraphObjects = new Dictionary<string, int>();
-
-            var usersFromGroup = await GetGroupMembersPageByIdAsync(objectId.ToString());
-            TrackMetrics(usersFromGroup.AdditionalData);
-            usersFromGroup.AdditionalData.TryGetValue("@odata.nextLink", out object nextLink1);
-            var nextPageUrl = (nextLink1 == null) ? string.Empty : nextLink1.ToString();
-            users.AddRange(ToUsers(usersFromGroup, nonUserGraphObjects));
-            return (users, nonUserGraphObjects, nextPageUrl, usersFromGroup);
-        }
-
-        public async Task<(List<AzureADUser> users,
-                           Dictionary<string, int> nonUserGraphObjects,
-                           string nextPageUrl,
-                           IGroupTransitiveMembersCollectionWithReferencesPage usersFromGroup)> GetNextUsersPageAsync(string nextPageUrl, IGroupTransitiveMembersCollectionWithReferencesPage usersFromGroup)
-        {
-            var users = new List<AzureADUser>();
-            var nonUserGraphObjects = new Dictionary<string, int>();
-
-            usersFromGroup = await GetGroupMembersNextPageAsnyc(usersFromGroup, nextPageUrl);
-            TrackMetrics(usersFromGroup.AdditionalData);
-            usersFromGroup.AdditionalData.TryGetValue("@odata.nextLink", out object nextLink2);
-            nextPageUrl = (nextLink2 == null) ? string.Empty : nextLink2.ToString();
-            users.AddRange(ToUsers(usersFromGroup, nonUserGraphObjects));
-            return (users, nonUserGraphObjects, nextPageUrl, usersFromGroup);
-        }
-
-        public async Task<IEnumerable<IAzureADObject>> GetChildrenOfGroup(Guid objectId)
-        {
-            IGroupMembersCollectionWithReferencesPage members;
-
-            try
-            {
-                members = await _graphServiceClient.Groups[objectId.ToString()].Members.Request()
-                .WithMaxRetry(MaxRetries)
-                .Select("id")
-                .GetAsync();
-
-                TrackMetrics(members.AdditionalData);
-
-                var toReturn = new List<IAzureADObject>(ToEntities(members.CurrentPage));
-                while (members.NextPageRequest != null)
-                {
-                    members = await members.NextPageRequest.WithMaxRetry(MaxRetries).GetAsync();
-                    toReturn.AddRange(ToEntities(members.CurrentPage));
-                }
-                return toReturn;
-            }
-            catch (ServiceException ex)
-            {
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = "Unable to retrieve group members.\n" + ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
-        }
-
-        void TrackMetrics(IDictionary<string, object> additionalData)
-        {
-            // some replies just don't have the response headers
-            // i suspect those either aren't throttled the same way or it's a different kind of call
-            if (!additionalData.TryGetValue("responseHeaders", out var headers))
-                return;
-
-            // see https://github.com/microsoftgraph/msgraph-sdk-dotnet/blob/dev/docs/headers.md#reading-response-headers
-            var responseHeaders = _graphServiceClient.HttpProvider.Serializer.DeserializeObject<Dictionary<string, List<string>>>(headers.ToString());
-
-            if (responseHeaders.TryGetValue(ResourceUnitHeader, out var resourceValues))
-                _telemetryClient.GetMetric(nameof(Metric.ResourceUnitsUsed)).TrackValue(ParseFirst<int>(resourceValues, int.TryParse));
-
-            if (responseHeaders.TryGetValue(ThrottlePercentageHeader, out var throttleValues))
-                _telemetryClient.GetMetric(nameof(Metric.ThrottleLimitPercentage)).TrackValue(ParseFirst<double>(throttleValues, double.TryParse));
-        }
-
-        const int GraphBatchLimit = 20;
-        const int ConcurrentRequests = 10;
-        public Task<(ResponseCode ResponseCode, int SuccessCount)> AddUsersToGroup(IEnumerable<AzureADUser> users, AzureADGroup targetGroup)
-        {
-            //You can, in theory, send batches of 20 requests of 20 group adds each
-            // but Graph starts saying "Service Unavailable" for a bunch of them if you do that, so only send so many at once
-            // 5 seems to be the most without it starting to throw errors that have to be retried
-            return BatchAndSend(users, b => MakeBulkAddRequest(b, targetGroup.ObjectId), GraphBatchLimit, 5);
-        }
-
-        public Task<(ResponseCode ResponseCode, int SuccessCount)> RemoveUsersFromGroup(IEnumerable<AzureADUser> users, AzureADGroup targetGroup)
-        {
-            // This, however, is the most we can send per delete batch, and it works pretty well.
-            return BatchAndSend(users, b => MakeBulkRemoveRequest(b, targetGroup.ObjectId), 1, GraphBatchLimit);
-        }
-
-        delegate HttpRequestMessage MakeBulkRequest(List<AzureADUser> batch);
-        private class ChunkOfUsers
-        {
-            public List<AzureADUser> ToSend { get; set; }
-            public string Id { get; set; }
-
-            private const int MaxBatchRetries = 5;
-
-            // basically, whenever a batch is retried, we append the thread number after a dash
-            public bool ShouldRetry => Id.Split('-')[1].Length < MaxBatchRetries;
-            public ChunkOfUsers UpdateIdForRetry(int threadNumber)
-            {
-                Id += threadNumber;
-                return this;
-            }
-        }
-
-        private string GetNewChunkId() => $"{Guid.NewGuid().ToString().Replace("-", string.Empty)}-";
-
-        private async Task<(ResponseCode ResponseCode, int SuccessCount)> BatchAndSend(IEnumerable<AzureADUser> users, MakeBulkRequest makeRequest, int requestMax, int batchSize)
-        {
-            if (!users.Any()) { return (ResponseCode.Ok, 0); }
-
-            var queuedBatches = new ConcurrentQueue<ChunkOfUsers>(
-                    ChunksOfSize(users, requestMax) // Chop up the users into chunks of how many per graph request (20 for add, 1 for remove)
-                    .Select(x => new ChunkOfUsers { ToSend = x, Id = GetNewChunkId() }));
-
-            var responses = await Task.WhenAll(Enumerable.Range(0, ConcurrentRequests).Select(x => ProcessQueue(queuedBatches, makeRequest, x, batchSize)));
-
-            var status = responses.Any(x => x.ResponseCode == ResponseCode.Error) ? ResponseCode.Error : ResponseCode.Ok;
-            return (status, responses.Sum(x => x.SuccessCount));
-        }
-
-        private async Task<(ResponseCode ResponseCode, int SuccessCount)> ProcessQueue(ConcurrentQueue<ChunkOfUsers> queue, MakeBulkRequest makeRequest, int threadNumber, int batchSize)
-        {
-            var successCount = 0;
-
-            do
-            {
-                var toSend = new List<ChunkOfUsers>();
-                while (queue.TryDequeue(out var step))
-                {
-                    toSend.Add(step);
-                    if (toSend.Count == batchSize)
-                    {
-                        var response = await ProcessBatch(queue, toSend, makeRequest, threadNumber);
-                        toSend.Clear();
-
-                        successCount += response.SuccessCount;
-
-                        if (response.ResponseCode == ResponseCode.Error)
-                            return response;
-                    }
-                }
-
-                if (toSend.Any())
-                {
-                    var response = await ProcessBatch(queue, toSend, makeRequest, threadNumber);
-
-                    successCount += response.SuccessCount;
-
-                    if (response.ResponseCode == ResponseCode.Error)
-                        return response;
-                }
-
-            } while (!queue.IsEmpty); // basically, that last ProcessBatch may have put more stuff in the queue
-
-            return (ResponseCode.Ok, successCount);
-        }
-
-        private async Task<(ResponseCode ResponseCode, int SuccessCount)> ProcessBatch(ConcurrentQueue<ChunkOfUsers> queue, List<ChunkOfUsers> toSend, MakeBulkRequest makeRequest, int threadNumber)
-        {
-            await _log.LogMessageAsync(new LogMessage { Message = $"Thread number {threadNumber}: Sending a batch of {toSend.Count} requests.", RunId = RunId });
-            int requeued = 0;
-            bool hasUnrecoverableErrors = false;
-            var successfulRequests = toSend.SelectMany(x => x.ToSend).ToList().Count;
-
-            try
-            {
-                await foreach (var idToRetry in await SendBatch(new BatchRequestContent(toSend.Select(x => new BatchRequestStep(x.Id, makeRequest(x.ToSend))).ToArray())))
-                {
-                    var chunkToRetry = toSend.First(x => x.Id == idToRetry.RequestId);
-
-                    successfulRequests -= chunkToRetry.ToSend.Count;
-
-                    if (idToRetry.ResponseCode == ResponseCode.Error)
-                    {
-                        hasUnrecoverableErrors = true;
-                        break;
-                    }
-
-                    if (chunkToRetry.ShouldRetry)
-                    {
-                        if (chunkToRetry.ToSend.Count > 1
-                            && !string.IsNullOrWhiteSpace(idToRetry.AzureObjectId))
-                        {
-                            var notFoundUser = chunkToRetry.ToSend.FirstOrDefault(x => x.ObjectId.ToString().Equals(idToRetry.AzureObjectId, StringComparison.InvariantCultureIgnoreCase));
-                            if (notFoundUser != null)
-                            {
-                                chunkToRetry.ToSend.Remove(notFoundUser);
-
-                                var notFoundChunk = new ChunkOfUsers
-                                {
-                                    Id = GetNewChunkId(),
-                                    ToSend = new List<AzureADUser> { notFoundUser }
-                                };
-
-                                requeued++;
-                                queue.Enqueue(notFoundChunk.UpdateIdForRetry(threadNumber));
-                                await _log.LogMessageAsync(new LogMessage { Message = $"Queued {notFoundChunk.Id} from {chunkToRetry.Id}", RunId = RunId });
-                            }
-                        }
-
-                        requeued++;
-                        var originalId = chunkToRetry.Id;
-                        queue.Enqueue(chunkToRetry.UpdateIdForRetry(threadNumber));
-                        await _log.LogMessageAsync(new LogMessage { Message = $"Requeued {originalId} as {chunkToRetry.Id}", RunId = RunId });
-                    }
-                }
-                await _log.LogMessageAsync(new LogMessage { Message = $"Thread number {threadNumber}: {toSend.Count - requeued} out of {toSend.Count} requests succeeded. {queue.Count} left.", RunId = RunId });
-            }
-            catch (ServiceException ex)
-            {
-                // winding up in here is a pretty rare event
-                // Usually, it's because either a timeout happened or something else weird went on
-                // the best thing to do is just requeue the chunks
-                // but if a chunk has already been queued five times or so, drop it on the floor so we don't go forever
-                // in the future, log the exception and which ones get dropped.
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                foreach (var chunk in toSend)
-                {
-                    if (chunk.ShouldRetry)
-                    {
-                        var originalId = chunk.Id;
-                        queue.Enqueue(chunk.UpdateIdForRetry(threadNumber));
-
-                        await _log.LogMessageAsync(new LogMessage { Message = $"Requeued {originalId} as {chunk.Id}", RunId = RunId });
-                    }
-                }
+                var groupExists = await _graphGroupInformationReader.GroupExistsAsync(groupObjectId, ResolveRunId());
+                if (!groupExists) return false;
             }
 
-            var status = hasUnrecoverableErrors ? ResponseCode.Error : ResponseCode.Ok;
-            return (status, successfulRequests);
+            return await _graphGroupOwnerReader.IsAppIDOwnerOfGroupAsync(appId, groupObjectId, ResolveRunId());
         }
 
-        private async Task<IAsyncEnumerable<RetryResponse>> SendBatch(BatchRequestContent tosend)
+        public async Task<bool> IsServiceAccountOwnerOfGroupAsync(Guid serviceAccountObjectId, Guid groupObjectId)
         {
-            try
-            {
-                await _log.LogMessageAsync(new LogMessage { Message = $"Sending requests {string.Join(",", tosend.BatchRequestSteps.Keys)}.", RunId = RunId });
-
-                var response = await _graphServiceClient.Batch.Request().PostAsync(tosend);
-                return GetStepIdsToRetry(await response.GetResponsesAsync());
-            }
-            catch (ServiceException ex)
-            {
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
+            return await _graphGroupOwnerReader.IsServiceAccountOwnerOfGroupAsync(serviceAccountObjectId, groupObjectId, ResolveRunId());
         }
 
-        private static readonly HttpStatusCode[] _shouldRetry = new[] { HttpStatusCode.ServiceUnavailable, HttpStatusCode.GatewayTimeout, HttpStatusCode.BadGateway, HttpStatusCode.InternalServerError };
-        private static readonly HttpStatusCode[] _isOkay = new[] { HttpStatusCode.NoContent, HttpStatusCode.NotFound, HttpStatusCode.OK };
-
-        // These indicate that we're trying to remove a user that's already been removed.
-        // Probably because an ID from earlier finally went through between the first try and the retry.
-        private static readonly string[] _okayErrorMessages =
-            {
-                "One or more removed object references do not exist for the following modified properties: 'members'.",
-                "One or more added object references already exist for the following modified properties: 'members'."
-            };
-
-        private static readonly Regex _userNotFound = new Regex(@"Resource '(?<id>[({]?[a-fA-F0-9]{8}[-]?([a-fA-F0-9]{4}[-]?){3}[a-fA-F0-9]{12}[})]?)' does not exist", RegexOptions.IgnoreCase);
-
-        private async IAsyncEnumerable<RetryResponse> GetStepIdsToRetry(Dictionary<string, HttpResponseMessage> responses)
+        public async Task<bool> IsEmailRecipientOwnerOfGroupAsync(string userIdentifier, Guid groupObjectId, bool validateGroupExists = true)
         {
-            bool beenThrottled = false;
-
-            var resourceUnitsUsed = _telemetryClient.GetMetric(nameof(Metric.ResourceUnitsUsed));
-            var throttleLimitPercentage = _telemetryClient.GetMetric(nameof(Metric.ThrottleLimitPercentage));
-
-            foreach (var kvp in responses)
+            if (validateGroupExists)
             {
-                //Ensure that the response messages get disposed of.
-                using var response = kvp.Value;
-                var status = response.StatusCode;
-                var content = await response.Content.ReadAsStringAsync();
-
-                if (response.Headers.TryGetValues(ResourceUnitHeader, out var resourceValues))
-                    resourceUnitsUsed.TrackValue(ParseFirst<int>(resourceValues, int.TryParse));
-
-                if (response.Headers.TryGetValues(ThrottlePercentageHeader, out var throttleValues))
-                    throttleLimitPercentage.TrackValue(ParseFirst<double>(throttleValues, double.TryParse));
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = $"Response - RequestId:{kvp.Key} - StatusCode:{status} - Content:{content}",
-                    RunId = RunId
-                });
-
-
-                // Note that the ones with empty bodies mean "this response is okay and we don't have to do anything about it."
-                if (status == HttpStatusCode.BadRequest && IsOkayError(content)) { }
-                else if (status == HttpStatusCode.NotFound && (content).Contains("does not exist or one of its queried reference-property objects are not present."))
-                {
-                    var match = _userNotFound.Match(content);
-                    var userId = default(string);
-
-                    if (match.Success)
-                    {
-                        userId = match.Groups["id"].Value;
-                    }
-
-                    yield return new RetryResponse
-                    {
-                        RequestId = kvp.Key,
-                        ResponseCode = ResponseCode.Ok,
-                        AzureObjectId = userId
-                    };
-
-                }
-                else if (_isOkay.Contains(status)) { }
-                else if (status == HttpStatusCode.TooManyRequests)
-                {
-                    // basically, each request in the batch will probably say it's been throttled
-                    // but we only need to wait the first time.
-                    if (!beenThrottled)
-                    {
-                        await HandleThrottling(response.Headers.RetryAfter);
-                        beenThrottled = true;
-                    }
-
-                    yield return new RetryResponse
-                    {
-                        RequestId = kvp.Key,
-                        ResponseCode = ResponseCode.Ok
-                    };
-                }
-                else if (_shouldRetry.Contains(status))
-                {
-                    yield return new RetryResponse
-                    {
-                        RequestId = kvp.Key,
-                        ResponseCode = ResponseCode.Ok
-                    };
-                }
-                else
-                {
-                    await _log.LogMessageAsync(new LogMessage { Message = $"Got an unexpected error from Graph, stopping all processing for current job: {status} {response.ReasonPhrase} {content}.", RunId = RunId });
-                    yield return new RetryResponse
-                    {
-                        RequestId = kvp.Key,
-                        ResponseCode = ResponseCode.Error
-                    };
-                }
-            }
-        }
-
-        delegate bool TryParseFunction<T>(string str, out T parsed);
-        private static T ParseFirst<T>(IEnumerable<string> toParse, TryParseFunction<T> tryParse)
-        {
-            foreach (var str in toParse)
-            {
-                if (tryParse(str, out var parsed))
-                {
-                    return parsed;
-                }
+                var groupExists = await _graphGroupInformationReader.GroupExistsAsync(groupObjectId, ResolveRunId());
+                if (!groupExists) return false;
             }
 
-            return default;
+            return await _graphGroupOwnerReader.IsEmailRecipientOwnerOfGroupAsync(userIdentifier, groupObjectId, ResolveRunId());
         }
 
-        private static bool IsOkayError(string error)
+        public async Task<bool> IsEmailRecipientMemberOfGroupAsync(string userIdentifier, Guid groupObjectId)
         {
-            error = JObject.Parse(error)["error"]["message"].Value<string>();
-            return _okayErrorMessages.Any(x => error.Contains(x));
+            var groupExists = await _graphGroupInformationReader.GroupExistsAsync(groupObjectId, ResolveRunId());
+            if (!groupExists) return false;
+
+            return await _graphGroupMembershipReader.IsEmailRecipientMemberOfGroupAsync(userIdentifier, groupObjectId, ResolveRunId());
         }
-        private static Task HandleThrottling(RetryConditionHeaderValue wait)
+
+        public async Task<bool?> GetUserAccountEnabledAsync(string userIdentifier)
         {
-            TimeSpan waitFor = TimeSpan.FromSeconds(120);
-            if (wait.Delta.HasValue) { waitFor = wait.Delta.Value; }
-            if (wait.Date.HasValue) { waitFor = wait.Date.Value - DateTimeOffset.UtcNow; }
-            return Task.Delay(waitFor);
+            return await _graphUserReader.GetUserAccountEnabledAsync(userIdentifier, ResolveRunId());
         }
 
-        private HttpRequestMessage MakeBulkAddRequest(List<AzureADUser> batch, Guid targetGroup)
+        public async Task<List<AzureADUser>> GetGroupOwnersAsync(Guid groupObjectId, int top = 0)
         {
-            return new HttpRequestMessage(HttpMethod.Patch, $"https://graph.microsoft.com/v1.0/groups/{targetGroup}")
-            {
-                Content = new StringContent(MakeAddRequestBody(batch), System.Text.Encoding.UTF8, "application/json"),
-            };
+            return await _graphGroupOwnerReader.GetGroupOwnersAsync(groupObjectId, ResolveRunId(), top);
         }
 
-        private HttpRequestMessage MakeBulkRemoveRequest(List<AzureADUser> batch, Guid targetGroup)
+        public async Task<AzureADGroup> CreateGroup(string newGroupName, TestGroupType testGroupType)
         {
-            // You have to remove users with their object ID. UPN won't work because you can only use it when the thing you're removing is
-            // unambiguously a user.
-
-            if (batch.Count != 1) { throw new ArgumentException("Batches of deletes must have exactly one item. This one has " + batch.Count); }
-
-            var toRemove = batch.Single().ObjectId;
-            return new HttpRequestMessage(HttpMethod.Delete, $"https://graph.microsoft.com/v1.0/groups/{targetGroup}/members/{toRemove}/$ref");
+            return await _graphGroupInformationReader.CreateGroupAsync(newGroupName, testGroupType, ResolveRunId());
         }
 
-        private static string MakeAddRequestBody(List<AzureADUser> users)
+        public async Task AddGroupOwners(string groupId, List<Guid> ownerIds)
         {
-            JObject body = new JObject
-            {
-                ["members@odata.bind"] = JArray.FromObject(users.Select(x => $"https://graph.microsoft.com/v1.0/users/{x.ObjectId}"))
-            };
-            return body.ToString(Newtonsoft.Json.Formatting.None);
+            await _graphGroupInformationReader.AddGroupOwnersAsync(groupId, ownerIds, ResolveRunId());
         }
 
-        private static IEnumerable<List<T>> ChunksOfSize<T>(IEnumerable<T> enumerable, int chunkSize)
+        public async Task<List<Guid>> GetGroupIdsOwnedByServicePrincipalAsync(Guid servicePrincipalObjectId)
         {
-            var toReturn = new List<T>();
-            foreach (var item in enumerable)
-            {
-                if (toReturn.Count == chunkSize)
-                {
-                    yield return toReturn;
-                    toReturn = new List<T>();
-                }
-                toReturn.Add(item);
-            }
-            yield return toReturn;
+            return await _graphGroupOwnerReader.GetGroupIdsOwnedByServicePrincipalAsync(servicePrincipalObjectId, ResolveRunId());
         }
 
-        private IEnumerable<IAzureADObject> ToEntities(IEnumerable<DirectoryObject> fromGraph)
+        public async Task<AzureADGroup> CreateGroupFromUI(string groupName, Guid groupOwnerId, string groupAlias)
         {
-            foreach (var directoryObj in fromGraph)
-            {
-                switch (directoryObj)
-                {
-                    case User user:
-                        yield return new AzureADUser { ObjectId = Guid.Parse(user.Id) };
-                        break;
-                    case Group group:
-                        yield return new AzureADGroup { ObjectId = Guid.Parse(group.Id) };
-                        break;
-                    default:
-                        break;
-                }
-            }
+            return await _graphGroupInformationReader.CreateGroupFromUIAsync(groupName, groupOwnerId, groupAlias, ResolveRunId());
         }
 
-        private IEnumerable<AzureADUser> ToUsers(IEnumerable<DirectoryObject> fromGraph, Dictionary<string, int> nonUserGraphObjects)
+        public async Task<List<AzureADUser>> GetTenantUsers(int userCount)
         {
-            foreach (var directoryObj in fromGraph)
-            {
-                switch (directoryObj)
-                {
-                    case User user:
-                        yield return new AzureADUser { ObjectId = Guid.Parse(user.Id) };
-                        break;
-                    // We only care about users
-                    // I'd prefer to be able to filter these out from the results on Graph's side, but the library doesn't support that yet.
-                    // we do want to log the count of non-user graph objects, though
-                    default:
-                        if (nonUserGraphObjects.TryGetValue(directoryObj.ODataType, out int count))
-                            nonUserGraphObjects[directoryObj.ODataType] = count + 1;
-                        else
-                            nonUserGraphObjects[directoryObj.ODataType] = 1;
-                        break;
-                }
-            }
+            return await _graphUserReader.GetTenantUsersAsync(userCount, ResolveRunId());
         }
 
-        private async Task<bool> IsGroupOwnerAsync(string query, Guid groupObjectId)
+        public async Task<List<AzureADUser>> GetUsersInGroupTransitively(Guid groupId)
         {
-            try
-            {
-                var groupOwners = await _graphServiceClient.Groups[groupObjectId.ToString()].Owners.Request().WithMaxRetry(MaxRetries).Filter(query).GetAsync();
-                TrackMetrics(groupOwners.AdditionalData);
-                return groupOwners.Any();
-            }
-            catch (ServiceException ex)
-            {
-                if (ex.StatusCode == HttpStatusCode.NotFound)
-                    return false;
-
-                await _log.LogMessageAsync(new LogMessage
-                {
-                    Message = ex.GetBaseException().ToString(),
-                    RunId = RunId
-                });
-
-                throw;
-            }
+            return await _graphGroupMembershipReader.GetUsersInGroupTransitivelyAsync(groupId, ResolveRunId());
         }
-    }
 
-    internal class RetryResponse
-    {
-        public string RequestId { get; set; }
-        public ResponseCode ResponseCode { get; set; }
-        public string AzureObjectId { get; set; }
+        public async Task<(ResponseCode ResponseCode, int SuccessCount, List<AzureADUser> UsersNotFound, List<AzureADUser> UsersAlreadyExist)>
+            AddUsersToGroup(IEnumerable<AzureADUser> users, AzureADGroup targetGroup)
+        {
+            _graphGroupMembershipUpdater.RunId = ResolveRunId() ?? Guid.Empty;
+            return await _graphGroupMembershipUpdater.AddUsersToGroup(users, targetGroup);
+        }
+
+        public async Task<(ResponseCode ResponseCode, int SuccessCount, List<AzureADUser> UsersNotFound, List<AzureADUser> UsersAlreadyExist)>
+            RemoveUsersFromGroup(IEnumerable<AzureADUser> users, AzureADGroup targetGroup)
+        {
+            _graphGroupMembershipUpdater.RunId = ResolveRunId() ?? Guid.Empty;
+            return await _graphGroupMembershipUpdater.RemoveUsersFromGroup(users, targetGroup);
+        }
+
+        public async Task<(List<AzureADUser> users, Dictionary<string, int> nonUserGraphObjects, string nextPageUrl)>
+            GetFirstTransitiveMembersPageAsync(Guid groupId)
+        {
+            return await _graphGroupMembershipReader.GetFirstTransitiveMembersPageAsync(groupId, ResolveRunId());
+        }
+
+        public async Task<(List<AzureADUser> users, Dictionary<string, int> nonUserGraphObjects, string nextPageUrl)>
+            GetNextTransitiveMembersPageAsync(Guid groupId, string nextPageUrl)
+        {
+            return await _graphGroupMembershipReader.GetNextTransitiveMembersPageAsync(groupId, nextPageUrl, ResolveRunId());
+        }
+
+        public async Task<AzureADUser> GetUserByUpnOrIdAsync(string userIdentifier, bool includeMailProperty = false)
+        {
+            return await _graphUserReader.GetUserByUpnOrIdAsync(userIdentifier, ResolveRunId(), includeMailProperty);
+        }
+
+        public async Task<AzureADUser> GetUserWithOnPremisesImmutableIdAsync(string userIdentifier, Guid? runId)
+        {
+            return await _graphUserReader.GetUserWithOnPremisesImmutableIdAsync(userIdentifier, ResolveRunId(runId));
+        }
+
+        public async Task<(List<AzureADUser> users, Dictionary<string, int> nonUserGraphObjects, string nextPageUrl)>
+            GetFirstMembersPageAsync(string url)
+        {
+            return await _graphUserReader.GetFirstMembersPageAsync(url, ResolveRunId());
+        }
+
+        public async Task<(List<AzureADUser> users, Dictionary<string, int> nonUserGraphObjects, string nextPageUrl)>
+            GetNextMembersPageAsync(string nextPageUrl)
+        {
+            return await _graphUserReader.GetNextMembersPageAsync(nextPageUrl, ResolveRunId());
+        }
+
+        public async Task<(List<AzureADUser> users, string nextPageUrl)> GetRoomsPageAsync(string url, int top, int skip)
+        {
+            return await _graphGroupPlacesReader.GetRoomsPageAsync(url, top, skip, ResolveRunId());
+        }
+
+        public async Task<(List<AzureADUser> users, string nextPageUrl)> GetWorkSpacesPageAsync(string url, int top, int skip)
+        {
+            return await _graphGroupPlacesReader.GetWorkSpacesPageAsync(url, top, skip, ResolveRunId());
+        }
+
+        public async Task<(List<AzureADUser> usersToAdd, List<AzureADUser> usersToRemove, string nextPageUrl, string deltaUrl)>
+            GetFirstDeltaLinkUsersPageAsync(Guid groupId, string deltaLink, int numberOfPages)
+        {
+            var (usersToAdd, usersToRemove, nextPageUrl, deltaUrl) = await _graphGroupDeltaReader.GetFirstDeltaLinkUsersPageAsync(groupId, deltaLink, ResolveRunId(), numberOfPages);
+
+            _graphGroupRepositoryLogger.LogInformationWithRunId(ResolveRunId(), $"Number of users from first page using delta link - {usersToAdd.Count + usersToRemove.Count}");
+
+            return (usersToAdd, usersToRemove, nextPageUrl, deltaUrl);
+        }
+
+        public async Task<(List<AzureADUser> usersToAdd, List<AzureADUser> usersToRemove, string nextPageUrl, string deltaUrl)>
+            GetNextDeltaLinkUsersPagesAsync(Guid groupId, string nextPageUrl, int numberOfPages)
+        {
+            var (usersToAdd, usersToRemove, newNextPageUrl, deltaUrl) = await _graphGroupDeltaReader.GetNextDeltaLinkUsersPagesAsync(groupId, nextPageUrl, ResolveRunId(), numberOfPages);
+
+            _graphGroupRepositoryLogger.LogInformationWithRunId(ResolveRunId(), $"Number of users from next page using delta link - {usersToAdd.Count + usersToRemove.Count}");
+
+            return (usersToAdd, usersToRemove, newNextPageUrl, deltaUrl);
+        }
+
+        public async Task<(List<AzureADUser> users, string nextPageUrl, string deltaUrl)> GetFirstDeltaUsersPageAsync(Guid groupId, int numberOfPages)
+        {
+            return await _graphGroupDeltaReader.GetFirstDeltaUsersPageAsync(groupId, ResolveRunId(), numberOfPages);
+        }
+
+        public async Task<(List<AzureADUser> users, string nextPageUrl, string deltaUrl)> GetNextDeltaUsersPagesAsync(Guid groupId, string nextPageUrl, int numberOfPages)
+        {
+            return await _graphGroupDeltaReader.GetNextDeltaUsersPagesAsync(groupId, nextPageUrl, ResolveRunId(), numberOfPages);
+        }
+
+        public async Task<int> GetGroupsCountAsync(Guid objectId)
+        {
+            return await _graphGroupMembershipReader.GetGroupsCountAsync(objectId, ResolveRunId());
+        }
+
+        public async Task<int> GetUsersCountAsync(Guid objectId)
+        {
+            return await _graphGroupMembershipReader.GetUsersCountAsync(objectId, ResolveRunId());
+        }
+
+        public async Task<int> GetAgentUserCountAsync(Guid objectId)
+        {
+            return await _graphGroupMembershipReader.GetAgentUserCountAsync(objectId, ResolveRunId());
+        }
+
+        public async Task<List<AzureADGroup>> GetGroupsAsync(List<Guid> groupIds)
+        {
+            return await _graphGroupInformationReader.GetGroupsAsync(groupIds, ResolveRunId());
+        }
+
+        public async Task<List<AzureADGroup>> SearchDestinationsAsync(string query)
+        {
+            return await _graphGroupInformationReader.SearchGroupsAsync(query);
+        }
+        public async Task<List<AzureADGroup>> SearchDestinationsBySearchAsync(string search)
+        {
+            return await _graphGroupInformationReader.SearchGroupsBySearchAsync(search);
+        }
+        public async Task<Dictionary<Guid, string>> GetAllGroupNamesAsync()
+        {
+            return await _graphGroupInformationReader.GetAllGroupNamesAsync();
+        }
+
+        public async Task<List<AzureADGroup>> GetGroupsByFilterAsync(string filter)
+        {
+            return await _graphGroupInformationReader.GetGroupsByFilterAsync(filter);
+        }
+
+        public async Task<Guid> GetObjectIdFromAppIdAsync(Guid appId, Guid? runId)
+        {
+            return await _graphUserReader.GetObjectIdFromServicePrincipalAsync(appId, runId);
+        }
+
+        public async Task<List<AzureADGroup>> GetDirectGroupTypeMembersAsync(Guid groupObjectId)
+        {
+            var children = await _graphGroupMembershipReader.GetDirectGroupMembersAsync(groupObjectId, ResolveRunId());
+            return children.OfType<AzureADGroup>().ToList();
+        }
+
+        private Guid? ResolveRunId(Guid? runId = null)
+        {
+            return CorrelationActivity.ResolveRunId(runId, RunId == Guid.Empty ? null : RunId);
+        }
     }
 }

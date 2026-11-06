@@ -1,0 +1,339 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Microsoft.AspNetCore.Authorization;
+using Microsoft.AspNetCore.Mvc;
+using Models;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using Services.WebApi;
+using System.Text.Json;
+using WebApi.Models.DTOs;
+
+namespace WebApi.Controllers.v1.Settings
+{
+    [ApiController]
+    [ApiVersion("1.0")]
+    [Route("api/v{version:apiVersion}/settings")]
+    public class SettingsController : ControllerBase
+    {
+        /// <summary>
+        /// AI settings that AI Onboarding users need to render the Copilot chat experience
+        /// (feature flags and end-user-facing configuration). Readable by anyone holding either
+        /// the AI Settings Administrator or AI Onboarding Chat role. Authoring stays admin-only.
+        /// </summary>
+        private static readonly IReadOnlySet<SettingKey> AIOnboardingReadableSettingKeys = new HashSet<SettingKey>
+        {
+            SettingKey.IsAICopilotEnabled,
+            SettingKey.IsAIRunExplanationEnabled,
+            SettingKey.CopilotSuggestedPrompts
+        };
+
+        /// <summary>
+        /// Sensitive AI settings that only the AI Settings Administrator may read or write.
+        /// </summary>
+        private static readonly IReadOnlySet<SettingKey> AIAdminOnlySettingKeys = new HashSet<SettingKey>
+        {
+            SettingKey.CopilotTemperature,
+            SettingKey.CopilotTopP,
+            SettingKey.CopilotInstructions
+        };
+
+        /// <summary>
+        /// All AI settings. Reads/writes of any of these keys via the single-key and patch
+        /// endpoints remain restricted to the AI Settings Administrator.
+        /// </summary>
+        private static readonly IReadOnlySet<SettingKey> AISettingKeys = new HashSet<SettingKey>(
+            AIOnboardingReadableSettingKeys.Concat(AIAdminOnlySettingKeys));
+
+        /// <summary>
+        /// Complete set of AI setting keys owned by the AI settings administrator role for writes.
+        /// Broader than <see cref="AISettingKeys"/> because the AI feature flags are readable by
+        /// everyone but must only ever be authored by the AI Settings Administrator.
+        /// </summary>
+        private static readonly IReadOnlySet<SettingKey> AIWritableSettingKeys = new HashSet<SettingKey>
+        {
+            SettingKey.IsAITitleEnabled,
+            SettingKey.IsAICopilotEnabled,
+            SettingKey.IsAISearchForUserEnabled,
+            SettingKey.IsAIRunExplanationEnabled,
+            SettingKey.CopilotTemperature,
+            SettingKey.CopilotTopP,
+            SettingKey.CopilotInstructions,
+            SettingKey.CopilotSuggestedPrompts,
+            SettingKey.IsAIRejectionFeedbackRefinementEnabled
+        };
+
+        private static readonly IReadOnlySet<SettingKey> AutoApproverSettingKeys = new HashSet<SettingKey>
+        {
+            SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled,
+            SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled,
+            SettingKey.IsPerPartAutoApprovalEnabled
+        };
+
+        private static readonly IReadOnlySet<SettingKey> GeneralSettingKeys = new HashSet<SettingKey>
+        {
+            SettingKey.CanReviewOwnSubmissions,
+            SettingKey.CreateGroupFeatureEnabled,
+            SettingKey.IsBusinessJustificationRequired,
+            SettingKey.IsDisclaimerEnabled,
+            SettingKey.DashboardUrl,
+            SettingKey.OutlookWarningUrl,
+            SettingKey.PrivacyPolicyUrl
+        };
+
+        private readonly IRequestHandler<GetSettingRequest, GetSettingResponse> _getSettingRequestHandler;
+        private readonly IRequestHandler<GetAllSettingsRequest, GetAllSettingsResponse> _getAllSettingsRequestHandler;
+        private readonly IRequestHandler<PatchSettingRequest, NullResponse> _patchSettingRequestHandler;
+        private readonly IRequestHandler<GetSupportEmailRequest, GetSupportEmailResponse> _getSupportEmailRequestHandler;
+
+        public SettingsController(
+            IRequestHandler<GetSettingRequest, GetSettingResponse> getSettingRequestHandler,
+            IRequestHandler<GetAllSettingsRequest, GetAllSettingsResponse> getAllSettingsRequestHandler,
+            IRequestHandler<PatchSettingRequest, NullResponse> patchSettingRequestHandler,
+            IRequestHandler<GetSupportEmailRequest, GetSupportEmailResponse> getSupportEmailRequestHandler)
+        {
+            _getSettingRequestHandler = getSettingRequestHandler ?? throw new ArgumentNullException(nameof(getSettingRequestHandler));
+            _getAllSettingsRequestHandler = getAllSettingsRequestHandler ?? throw new ArgumentNullException(nameof(getAllSettingsRequestHandler));
+            _patchSettingRequestHandler = patchSettingRequestHandler ?? throw new ArgumentNullException(nameof(patchSettingRequestHandler));
+            _getSupportEmailRequestHandler = getSupportEmailRequestHandler ?? throw new ArgumentNullException(nameof(getSupportEmailRequestHandler));
+        }
+
+        [Authorize()]
+        [HttpGet("{settingKey}")]
+        public async Task<IActionResult> GetSettingByKeyAsync(SettingKey settingKey)
+        {
+            if (AISettingKeys.Contains(settingKey) && !CanReadAISettings())
+            {
+                return Forbid();
+            }
+
+            try
+            {
+                var response = await _getSettingRequestHandler.ExecuteAsync(new GetSettingRequest(settingKey));
+                if (response.Model != null)
+                {
+                    return Ok(response.Model);
+                }
+                return NotFound();
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500);
+            }
+        }
+
+        [Authorize()]
+        [HttpGet]
+        public async Task<IActionResult> GetAllSettingsAsync()
+        {
+            try
+            {
+                var response = await _getAllSettingsRequestHandler.ExecuteAsync(new GetAllSettingsRequest());
+                var settings = response.Settings;
+                if (!CanReadAISettings())
+                {
+                    var canReadOnboardingAISettings = User.IsInRole(Models.Roles.AI_ONBOARDING_CHAT);
+                    settings = settings
+                        .Where(setting =>
+                            !AISettingKeys.Contains(setting.SettingKey) ||
+                            (canReadOnboardingAISettings && AIOnboardingReadableSettingKeys.Contains(setting.SettingKey)))
+                        .ToList();
+                }
+
+                return Ok(settings);
+            }
+            catch (Exception ex)
+            {
+                return StatusCode(500);
+            }
+        }
+
+        [Authorize(Roles = $"{Models.Roles.GENERAL_SETTINGS_ADMINISTRATOR}, {Models.Roles.AUTO_APPROVER_ADMINISTRATOR}, {Models.Roles.AI_SETTINGS_ADMINISTRATOR}")]
+        [HttpPatch("{settingKey}")]
+        public async Task<IActionResult> PatchSettingAsync(SettingKey settingKey, [FromBody] string settingValue)
+        {
+            if (!IsAuthorizedToWrite(settingKey))
+            {
+                return Forbid();
+            }
+
+            try
+            {
+                await _patchSettingRequestHandler.ExecuteAsync(new PatchSettingRequest(settingKey, settingValue));
+                return NoContent();
+            }
+            catch (KeyNotFoundException)
+            {
+                return NotFound();
+            }
+            catch (Exception)
+            {
+                return StatusCode(500);
+            }
+        }
+
+        /// <summary>
+        /// Determines whether the caller holds the administrator role that owns the requested
+        /// setting key. Each mutable setting key is owned by exactly one administrator role, so a
+        /// caller holding an unrelated Admin Configuration role cannot write it. Keys outside every
+        /// ownership group are not writable through this endpoint.
+        /// </summary>
+        private bool IsAuthorizedToWrite(SettingKey settingKey)
+        {
+            if (GeneralSettingKeys.Contains(settingKey))
+            {
+                return User.IsInRole(Models.Roles.GENERAL_SETTINGS_ADMINISTRATOR);
+            }
+
+            if (AutoApproverSettingKeys.Contains(settingKey))
+            {
+                return User.IsInRole(Models.Roles.AUTO_APPROVER_ADMINISTRATOR);
+            }
+
+            if (AIWritableSettingKeys.Contains(settingKey))
+            {
+                return User.IsInRole(Models.Roles.AI_SETTINGS_ADMINISTRATOR);
+            }
+
+            return false;
+        }
+
+        /// <summary>
+        /// Whether the caller may read AI settings. Read-write implies read, so an administrator
+        /// qualifies without holding the reader role. This gates reads only; every AI settings
+        /// write remains administrator-only via <see cref="IsAuthorizedToWrite"/>.
+        /// </summary>
+        private bool CanReadAISettings()
+        {
+            return User.IsInRole(Models.Roles.AI_SETTINGS_ADMINISTRATOR)
+                || User.IsInRole(Models.Roles.AI_SETTINGS_READER);
+        }
+
+        [Authorize()]
+        [HttpGet("supportEmail")]
+        public async Task<IActionResult> GetSupportEmailAddressAsync()
+        {
+            var request = new GetSupportEmailRequest();
+            var response = await _getSupportEmailRequestHandler.ExecuteAsync(request);
+            return Ok(response.SupportEmailAddress);
+        }
+
+        [Authorize(Roles = $"{Models.Roles.AI_SETTINGS_ADMINISTRATOR}, {Models.Roles.AI_SETTINGS_READER}")]
+        [HttpGet("aiPrompt/defaults")]
+        public IActionResult GetDefaultAIPrompt()
+        {
+            return Ok(CopilotPrompts.DefaultInstructions);
+        }
+
+        private static readonly JsonSerializerOptions AlertBannerJsonOptions = new JsonSerializerOptions
+        {
+            PropertyNameCaseInsensitive = true,
+            PropertyNamingPolicy = JsonNamingPolicy.CamelCase
+        };
+
+        /// <summary>
+        /// Maximum allowed length for an alert banner message.
+        /// </summary>
+        private const int AlertBannerMaxMessageLength = 250;
+
+        [Authorize()]
+        [HttpGet("alertBanner")]
+        public async Task<IActionResult> GetAlertBannerAsync()
+        {
+            try
+            {
+                var response = await _getSettingRequestHandler.ExecuteAsync(new GetSettingRequest(SettingKey.AlertBannerConfig));
+
+                AlertBannerConfigDto config;
+                if (response.Model == null || string.IsNullOrWhiteSpace(response.Model.SettingValue))
+                {
+                    config = AlertBannerConfigDto.Default;
+                }
+                else
+                {
+                    config = JsonSerializer.Deserialize<AlertBannerConfigDto>(response.Model.SettingValue, AlertBannerJsonOptions)
+                             ?? AlertBannerConfigDto.Default;
+                    config.NormalizeDatesToUtc();
+                }
+
+                return Ok(config);
+            }
+            catch (Exception)
+            {
+                return StatusCode(500);
+            }
+        }
+
+        [Authorize(Roles = Models.Roles.GENERAL_SETTINGS_ADMINISTRATOR)]
+        [HttpPatch("alertBanner")]
+        public async Task<IActionResult> PatchAlertBannerAsync([FromBody] AlertBannerConfigDto config)
+        {
+            if (!User.IsInRole(Models.Roles.GENERAL_SETTINGS_ADMINISTRATOR))
+            {
+                return Forbid();
+            }
+
+            if (config == null)
+            {
+                return BadRequest("Alert banner configuration is required.");
+            }
+
+            config.NormalizeDatesToUtc();
+
+            var validationError = ValidateAlertBannerConfig(config);
+            if (validationError != null)
+            {
+                return BadRequest(validationError);
+            }
+
+            try
+            {
+                var json = JsonSerializer.Serialize(config, AlertBannerJsonOptions);
+                await _patchSettingRequestHandler.ExecuteAsync(new PatchSettingRequest(SettingKey.AlertBannerConfig, json));
+                return Ok(config);
+            }
+            catch (Exception)
+            {
+                return StatusCode(500);
+            }
+        }
+
+        /// <summary>
+        /// Validates an alert banner configuration. Returns an error message when invalid,
+        /// or <c>null</c> when the configuration passes all rules.
+        /// </summary>
+        private static string? ValidateAlertBannerConfig(AlertBannerConfigDto config)
+        {
+            if (config.IsEnabled && string.IsNullOrWhiteSpace(config.Message))
+            {
+                return "Message is required when the alert banner is enabled.";
+            }
+
+            if (!string.IsNullOrEmpty(config.Message) && config.Message.Length > AlertBannerMaxMessageLength)
+            {
+                return $"Message must be {AlertBannerMaxMessageLength} characters or fewer.";
+            }
+
+            if (config.StartDate >= config.EndDate)
+            {
+                return "Start date must be earlier than end date.";
+            }
+
+            if (!string.IsNullOrWhiteSpace(config.LinkUrl))
+            {
+                if (!config.LinkUrl.StartsWith("https://", StringComparison.OrdinalIgnoreCase))
+                {
+                    return "Link URL must start with https://.";
+                }
+
+                if (!Uri.TryCreate(config.LinkUrl, UriKind.Absolute, out var uri) || uri.Scheme != Uri.UriSchemeHttps)
+                {
+                    return "Link URL must be a valid absolute https URI.";
+                }
+            }
+
+            return null;
+        }
+    }
+}

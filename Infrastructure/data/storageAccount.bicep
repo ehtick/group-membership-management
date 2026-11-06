@@ -3,6 +3,9 @@
 @maxLength(24)
 param name string
 
+@description('Key vault name.')
+param keyVaultName string
+
 @allowed([
   'Standard_LRS'
   'Standard_GRS'
@@ -11,19 +14,107 @@ param name string
 ])
 param sku string = 'Standard_LRS'
 
+@description('When true, adds lifecycle management policies for the jobs storage account.')
+param addJobsStorageAccountPolicies bool = false
+
+@description('Name of the membership blob container created for the jobs storage account.')
+@minLength(1)
+param membershipContainerName string
+
+@description('Specifies the Azure location where the storage account will be created.')
+param location string
+
 resource storageAccount 'Microsoft.Storage/storageAccounts@2019-04-01' = {
   name: name
-  location: resourceGroup().location
+  location: location
   kind: 'StorageV2'
   sku: {
     name: sku
   }
   properties: {
     supportsHttpsTrafficOnly: true
+    allowBlobPublicAccess: false
+    minimumTlsVersion: 'TLS1_2'
+    allowSharedKeyAccess: false
+    publicNetworkAccess: 'Enabled'
   }
   identity: {
     type: 'SystemAssigned'
   }
 }
 
-output connectionString string = 'DefaultEndpointsProtocol=https;AccountName=${name};AccountKey=${listkeys(resourceId(resourceGroup().name, 'Microsoft.Storage/storageAccounts', name), providers('Microsoft.Storage', 'storageAccounts').apiVersions[0]).keys[0].value}'
+resource membershipContainer 'Microsoft.Storage/storageAccounts/blobServices/containers@2022-05-01' = {
+  name: '${storageAccount.name}/default/${membershipContainerName}'
+  properties: {
+    publicAccess: 'None'
+  }
+}
+
+resource allBlobPolicy 'Microsoft.Storage/storageAccounts/managementPolicies@2022-05-01' = if (addJobsStorageAccountPolicies) {
+  name: 'default'
+  parent: storageAccount
+  properties: {
+    policy: {
+      rules: [
+        {
+          definition: {
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: 30
+                }
+              }
+            }
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+            }
+          }
+          enabled: true
+          name: '30-Day Blob Deletion Policy'
+          type: 'Lifecycle'
+        }
+        {
+          definition: {
+            actions: {
+              baseBlob: {
+                delete: {
+                  daysAfterModificationGreaterThan: 7
+                }
+              }
+            }
+            filters: {
+              blobTypes: [
+                'blockBlob'
+              ]
+              prefixMatch: [
+                'membership/cache/'
+              ]
+            }
+          }
+          enabled: true
+          name: '7-Day Cache Blob Deletion Policy'
+          type: 'Lifecycle'
+        }
+      ]
+    }
+  }
+}
+
+module secureSecretsTemplate 'keyVaultSecretsSecure.bicep' = {
+  name: 'secureSecretsTemplate${name}'
+  params: {
+    keyVaultName: keyVaultName
+    keyVaultSecrets: {
+      secrets: [
+        {
+          name: startsWith(name, 'jobs') ? 'jobsStorageAccountConnectionString' : 'storageAccountConnectionString'
+          value: 'DefaultEndpointsProtocol=https;AccountName=${storageAccount.name};AccountKey=${storageAccount.listKeys().keys[0].value}'
+        }
+      ]
+    }
+  }
+}
+
+output storageAccountId string = storageAccount.id

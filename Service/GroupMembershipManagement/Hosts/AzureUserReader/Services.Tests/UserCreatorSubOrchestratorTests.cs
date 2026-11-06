@@ -1,11 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-using Entities;
 using Hosts.AzureUserReader;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Graph;
+using Microsoft.DurableTask;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Models;
 using Moq;
 using Repositories.Contracts;
 using System;
@@ -21,9 +22,8 @@ namespace Services.Tests
         [TestMethod]
         public async Task CreateUsersAsync()
         {
-            var loggingRepository = new Mock<ILoggingRepository>();
             var graphUserRepository = new Mock<IGraphUserRepository>();
-            var context = new Mock<IDurableOrchestrationContext>();
+            var context = new Mock<TaskOrchestrationContext>();
 
             var personnelNumbers = new List<string>();
             for (int i = 1; i <= 10000; i++)
@@ -42,25 +42,24 @@ namespace Services.Tests
                 }
             };
 
-            loggingRepository.Setup(x => x.LogMessageAsync(It.IsAny<LogMessage>(), It.IsAny<string>(), It.IsAny<string>()));
+            context.Setup(x => x.CreateReplaySafeLogger(It.IsAny<string>())).Returns(NullLogger.Instance);
             context.Setup(x => x.GetInput<AzureUserCreatorRequest>()).Returns(request);
 
             var currentProfilePage = default(List<GraphProfileInformation>);
-            context.Setup(x => x.CallActivityAsync<List<GraphProfileInformation>>(It.IsAny<string>(), It.IsAny<AzureUserCreatorRequest>()))
-                 .Callback<string, object>(async (name, request) =>
+            context.Setup(x => x.CallActivityAsync<List<GraphProfileInformation>>(It.IsAny<TaskName>(), It.IsAny<AzureUserCreatorRequest>(), It.IsAny<TaskOptions>()))
+                 .Callback<TaskName, object, TaskOptions>(async (name, request, options) =>
                  {
                      currentProfilePage = await RunAzureUserCreatorFunctionAsync
                                                 (
                                                     graphUserRepository.Object,
-                                                    loggingRepository.Object,
                                                     request as AzureUserCreatorRequest
                                                 );
                  })
                  .ReturnsAsync(() => currentProfilePage);
 
             var addedUsers = default(List<GraphProfileInformation>);
-            graphUserRepository.Setup(x => x.AddUsersAsync(It.IsAny<List<User>>(), It.IsAny<Guid?>()))
-                .Callback<List<User>, Guid?>((users, runId) =>
+            graphUserRepository.Setup(x => x.AddUsersAsync(It.IsAny<List<GraphUser>>(), It.IsAny<Guid?>()))
+                .Callback<List<GraphUser>, Guid?>((users, runId) =>
                {
                    addedUsers = new List<GraphProfileInformation>();
                    foreach (var user in users)
@@ -75,7 +74,7 @@ namespace Services.Tests
                })
                 .ReturnsAsync(() => addedUsers);
 
-            var function = new UserCreatorSubOrchestratorFunction(loggingRepository.Object);
+            var function = new UserCreatorSubOrchestratorFunction();
             var newUsers = await function.CreateUsersAsync(context.Object);
 
             Assert.AreEqual(personnelNumbers.Count, newUsers.Count);
@@ -84,9 +83,9 @@ namespace Services.Tests
             Assert.IsTrue(newUsers.All(x => !string.IsNullOrWhiteSpace(x.UserPrincipalName)));
         }
 
-        private async Task<List<GraphProfileInformation>> RunAzureUserCreatorFunctionAsync(IGraphUserRepository graphUserRepository, ILoggingRepository loggingRepository, AzureUserCreatorRequest request)
+        private async Task<List<GraphProfileInformation>> RunAzureUserCreatorFunctionAsync(IGraphUserRepository graphUserRepository, AzureUserCreatorRequest request)
         {
-            var function = new AzureUserCreatorFunction(graphUserRepository, loggingRepository);
+            var function = new AzureUserCreatorFunction(graphUserRepository, NullLogger<AzureUserCreatorFunction>.Instance);
             return await function.AddUsersAsync(request);
         }
     }

@@ -1,0 +1,240 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Microsoft.Data.SqlClient;
+using Microsoft.EntityFrameworkCore;
+using Models;
+using Models.SyncJobChange;
+using Repositories.Contracts;
+using Repositories.EntityFramework.Contexts;
+
+namespace Repositories.EntityFramework
+{
+    // TODO: Implement RepositoryBase once it is added to the project.
+    public class SyncJobChangeRepository : ISyncJobChangeRepository
+    {
+        // TODO: Remove these private members once the RepositoryBase is added.
+        private readonly GMMContext _writeContext;
+        private readonly GMMReadContext _readContext;
+
+        // TODO: Remove this constructor once the RepositoryBase is added.
+        public SyncJobChangeRepository(GMMContext writeContext, GMMReadContext readContext)
+        {
+            _writeContext = writeContext ?? throw new ArgumentNullException(nameof(writeContext));
+            _readContext = readContext ?? throw new ArgumentNullException(nameof(readContext));
+        }
+
+        public async Task<RepositoryPage<SyncJobChange>> GetPageBySyncJobId(
+            Guid syncJobId,
+            int startPage = 1,
+            int pageSize = 10,
+            SyncJobChangeSortingField sortBy = SyncJobChangeSortingField.ChangeTime,
+            bool sortAscending = false)
+        {
+            // filtering
+            var query = _readContext.SyncJobChanges
+                .Where(s => s.SyncJobId == syncJobId);
+
+            // counting
+            var pagingQueryable = query.AsQueryable();
+            var totalCount = await pagingQueryable.CountAsync();
+
+            // sorting
+            _ = sortBy switch
+            {
+                SyncJobChangeSortingField.ChangeTime => query = sortAscending
+                    ? query.OrderBy(s => s.ChangeTime)
+                    : query.OrderByDescending(s => s.ChangeTime),
+                SyncJobChangeSortingField.ChangedByObjectId => query = sortAscending
+                    ? query.OrderBy(s => s.ChangedByObjectId)
+                    : query.OrderByDescending(s => s.ChangedByObjectId),
+                SyncJobChangeSortingField.ChangeSource => query = sortAscending
+                    ? query.OrderBy(s => s.ChangeSource)
+                    : query.OrderByDescending(s => s.ChangeSource),
+                SyncJobChangeSortingField.ChangeReason => query = sortAscending
+                    ? query.OrderBy(s => s.ChangeReason)
+                    : query.OrderByDescending(s => s.ChangeReason),
+                SyncJobChangeSortingField.ChangeDetails => query = sortAscending
+                    ? query.OrderBy(s => s.ChangeDetails)
+                    : query.OrderByDescending(s => s.ChangeDetails),
+                _ => query = query.OrderByDescending(s => s.ChangeTime)
+            };
+
+            // paging
+            var skip = (startPage - 1) * pageSize;
+            var take = Math.Min(pageSize, totalCount - skip); // take a page size or the remaining items, whichever is smaller
+            query = query.Skip(skip).Take(take);
+            var totalPages = totalCount % pageSize == 0 ? totalCount / pageSize : (totalCount / pageSize) + 1;
+
+            // transformation and execution
+            var items = await query.Select(s => MapEntityToModel(s)).ToListAsync();
+            return new RepositoryPage<SyncJobChange>
+            {
+                Items = items,
+                PageNumber = startPage,
+                PageSize = pageSize,
+                TotalCount = totalCount,
+                TotalPages = totalPages
+            };
+        }
+
+        public async Task Save(SyncJobChange syncJobChange)
+        {
+            _writeContext.Set<Entities.SyncJobChange>().Add(MapModelToEntity(syncJobChange));
+            await _writeContext.SaveChangesAsync();
+        }
+
+        public async Task BulkSaveAsync(IEnumerable<SyncJobChange> syncJobChanges)
+        {
+            var entities = syncJobChanges.Select(MapModelToEntity).ToList();
+            _writeContext.Set<Entities.SyncJobChange>().AddRange(entities);
+            await _writeContext.SaveChangesAsync();
+        }
+
+        public async Task UpdateSyncJobChangeAsync(SyncJobChange syncJobChange)
+        {
+            var entry = _writeContext.Set<Entities.SyncJobChange>().Add(MapModelToEntity(syncJobChange));
+            entry.State = EntityState.Modified;
+            await _writeContext.SaveChangesAsync();
+        }
+
+        public async Task<SyncJobChange?> GetLastSyncJobChangeBySyncJobIdAsync(Guid syncJobId)
+        {
+            var entity = await _readContext.SyncJobChanges
+                                                .Where(s => s.SyncJobId == syncJobId &&
+                                                            (s.ChangeReason == SyncJobChangeReason.Onboarding.ToString() ||
+                                                             s.ChangeReason == SyncJobChangeReason.OnboardingAutoApproved.ToString() ||
+                                                             s.ChangeReason == SyncJobChangeReason.Update.ToString() ||
+                                                             s.ChangeReason == SyncJobChangeReason.SubmissionRejected.ToString()))
+                                                .OrderByDescending(s => s.ChangeTime)
+                                                .FirstOrDefaultAsync();
+
+            return entity == null ? null : MapEntityToModel(entity);
+        }
+
+        public async Task<SyncJobChange?> GetLatestSubmissionRejectedChangeBySyncJobIdAsync(Guid syncJobId)
+        {
+            var entity = await _readContext.SyncJobChanges
+                                                .Where(s => s.SyncJobId == syncJobId &&
+                                                            s.ChangeReason == SyncJobChangeReason.SubmissionRejected.ToString())
+                                                .OrderByDescending(s => s.ChangeTime)
+                                                .FirstOrDefaultAsync();
+
+            return entity == null ? null : MapEntityToModel(entity);
+        }
+
+        public async Task<SyncJobChange?> GetLastSyncJobRecordBySyncJobIdAsync(Guid syncJobId)
+        {
+            // Return the absolute most recent record for this job regardless of change reason
+            var entity = await _readContext.SyncJobChanges
+                                           .Where(s => s.SyncJobId == syncJobId)
+                                           .OrderByDescending(s => s.ChangeTime)
+                                           .FirstOrDefaultAsync();
+
+            return entity == null ? null : MapEntityToModel(entity);
+        }
+
+        public async Task<SyncJobChange?> GetLastSyncJobChangeWithOnboardingOrUpdateBySyncJobIdAsync(Guid syncJobId)
+        {
+            var entity = await _readContext.SyncJobChanges
+                                                .Where(s => s.SyncJobId == syncJobId &&
+                                                            (s.ChangeReason == SyncJobChangeReason.Onboarding.ToString() ||
+                                                             s.ChangeReason == SyncJobChangeReason.OnboardingAutoApproved.ToString() ||
+                                                             s.ChangeReason == SyncJobChangeReason.Update.ToString()))
+                                                .OrderByDescending(s => s.ChangeTime)
+                                                .FirstOrDefaultAsync();
+
+            return entity == null ? null : MapEntityToModel(entity);
+        }
+
+        public async Task<SyncJobChange?> GetRecentGroupSettingsBySyncJobIdAsync(Guid syncJobId)
+        {
+            var entity = await _readContext.SyncJobChanges
+                                                .Where(s => s.SyncJobId == syncJobId && s.ChangeReason == SyncJobChangeReason.GroupSettings.ToString())
+                                                .OrderByDescending(s => s.ChangeTime)
+                                                .FirstOrDefaultAsync();
+
+            return entity == null ? null : MapEntityToModel(entity);
+        }
+
+        public async Task<int> GetScheduleNowCountByUserAsync(Guid userObjectId, DateTime since)
+        {
+            var scheduledNowReason = SyncJobChangeReason.ScheduledNow.ToString();
+            return await _readContext.SyncJobChanges
+                .CountAsync(s => s.ChangedByObjectId == userObjectId
+                    && s.ChangeReason == scheduledNowReason
+                    && s.ChangeTime >= since);
+        }
+
+        public async Task<List<SyncJobChange>> GetRecentConfigChangesBySyncJobIdAsync(Guid syncJobId, DateTime asOf, int count = 2)
+        {
+            var onboarding = SyncJobChangeReason.Onboarding.ToString();
+            var onboardingAutoApproved = SyncJobChangeReason.OnboardingAutoApproved.ToString();
+            var update = SyncJobChangeReason.Update.ToString();
+
+            var entities = await _readContext.SyncJobChanges
+                .Where(s => s.SyncJobId == syncJobId
+                    && s.ChangeTime <= asOf
+                    && (s.ChangeReason == onboarding
+                        || s.ChangeReason == onboardingAutoApproved
+                        || s.ChangeReason == update))
+                .OrderByDescending(s => s.ChangeTime)
+                .Take(count)
+                .ToListAsync();
+
+            return entities.Select(MapEntityToModel).ToList();
+        }
+
+        public async Task<List<SyncJobChange>> GetRecentIgnoreThresholdOnceEventsAsync(Guid syncJobId, DateTime asOf, int count = 2)
+        {
+            var ignoreThresholdOnce = SyncJobChangeReason.IgnoreThresholdOnce.ToString();
+
+            var entities = await _readContext.SyncJobChanges
+                .Where(s => s.SyncJobId == syncJobId
+                    && s.ChangeTime <= asOf
+                    && s.ChangeReason == ignoreThresholdOnce)
+                .OrderByDescending(s => s.ChangeTime)
+                .Take(count)
+                .ToListAsync();
+
+            return entities.Select(MapEntityToModel).ToList();
+        }
+
+        // TODO: Add 'override' keyword to the following methods once the RepositoryBase is added.
+        private static SyncJobChange MapEntityToModel(Entities.SyncJobChange entity)
+        {
+            var syncJobChange = new SyncJobChange();
+            syncJobChange.Id = entity.Id;
+            syncJobChange.SyncJobId = entity.SyncJobId;
+            syncJobChange.ChangeTime = entity.ChangeTime;
+            syncJobChange.ChangedByDisplayName = entity.ChangedByDisplayName;
+            syncJobChange.ChangedByObjectId = entity.ChangedByObjectId;
+            syncJobChange.ChangedOnBehalfOfDisplayName = entity.ChangedOnBehalfOfDisplayName;
+            syncJobChange.ChangedOnBehalfOfObjectId = entity.ChangedOnBehalfOfObjectId;
+            syncJobChange.ChangeSource = (SyncJobChangeSource?)entity.ChangeSource;
+            syncJobChange.ChangeReason = entity.ChangeReason;
+            syncJobChange.ChangeDetails = entity.ChangeDetails;
+            syncJobChange.BusinessJustification = entity.BusinessJustification;
+
+            return syncJobChange;
+        }
+
+        private static Entities.SyncJobChange MapModelToEntity(SyncJobChange model)
+        {
+            var syncJobChange = new Entities.SyncJobChange();
+            syncJobChange.Id = model.Id;
+            syncJobChange.SyncJobId = model.SyncJobId;
+            syncJobChange.ChangeTime = model.ChangeTime;
+            syncJobChange.ChangedByDisplayName = model.ChangedByDisplayName;
+            syncJobChange.ChangedByObjectId = model.ChangedByObjectId;
+            syncJobChange.ChangedOnBehalfOfDisplayName = model.ChangedOnBehalfOfDisplayName;
+            syncJobChange.ChangedOnBehalfOfObjectId = model.ChangedOnBehalfOfObjectId;
+            syncJobChange.ChangeSource = (Entities.SyncJobChangeSource?)model.ChangeSource;
+            syncJobChange.ChangeReason = model.ChangeReason;
+            syncJobChange.ChangeDetails = model.ChangeDetails;
+            syncJobChange.BusinessJustification = model.BusinessJustification;
+
+            return syncJobChange;
+        }
+    }
+}

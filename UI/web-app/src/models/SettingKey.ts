@@ -1,0 +1,48 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+export const enum SettingKey {
+    DashboardUrl = 0,
+    OutlookWarningUrl = 1,
+    PrivacyPolicyUrl = 2,
+    UIUrl = 3,
+    CanReviewOwnSubmissions = 4,
+    CreateGroupFeatureEnabled = 5,
+    IsBusinessJustificationRequired = 6,
+    IsDisclaimerEnabled = 7,
+    IsAutoApprovalForGroupBasedSyncsEnabled = 8,
+    IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled = 9,
+    IsAITitleEnabled = 10,
+    IsAICopilotEnabled = 11,
+    CopilotTemperature = 12,
+    CopilotTopP = 13,
+    CopilotInstructions = 14,
+    CopilotSuggestedPrompts = 15,
+    IsAISearchForUserEnabled = 16,
+    IsAIRunExplanationEnabled = 17,
+    IsPerPartAutoApprovalEnabled = 20,
+    IsAIRejectionFeedbackRefinementEnabled = 21
+}
+
+export const SettingKeyMap: Record<SettingKey, string> = {
+    [SettingKey.DashboardUrl]: 'DashboardUrl',
+    [SettingKey.OutlookWarningUrl]: 'OutlookWarningUrl',
+    [SettingKey.PrivacyPolicyUrl]: 'PrivacyPolicyUrl',
+    [SettingKey.UIUrl]: 'UIUrl',
+    [SettingKey.CanReviewOwnSubmissions]: 'CanReviewOwnSubmissions',
+    [SettingKey.CreateGroupFeatureEnabled]: 'CreateGroupFeatureEnabled',
+    [SettingKey.IsBusinessJustificationRequired]: 'IsBusinessJustificationRequired',
+    [SettingKey.IsDisclaimerEnabled]: 'IsDisclaimerEnabled',
+    [SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled]: 'IsAutoApprovalForGroupBasedSyncsEnabled',
+    [SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled]: 'IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled',
+    [SettingKey.IsAITitleEnabled]: 'IsAITitleEnabled',
+    [SettingKey.IsAICopilotEnabled]: 'IsAICopilotEnabled',
+    [SettingKey.CopilotTemperature]: 'CopilotTemperature',
+    [SettingKey.CopilotTopP]: 'CopilotTopP',
+    [SettingKey.CopilotInstructions]: 'CopilotInstructions',
+    [SettingKey.CopilotSuggestedPrompts]: 'CopilotSuggestedPrompts',
+    [SettingKey.IsAISearchForUserEnabled]: 'IsAISearchForUserEnabled',
+    [SettingKey.IsAIRunExplanationEnabled]: 'IsAIRunExplanationEnabled',
+    [SettingKey.IsPerPartAutoApprovalEnabled]: 'IsPerPartAutoApprovalEnabled',
+    [SettingKey.IsAIRejectionFeedbackRefinementEnabled]: 'IsAIRejectionFeedbackRefinementEnabled'
+};

@@ -1,14 +1,12 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Entities.ServiceBus;
+using Models.ServiceBus;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
-using Newtonsoft.Json;
-using System;
-using System.Collections.Generic;
-using System.Linq;
-using System.Text;
+using Models;
 using Services.Tests.Mocks;
+using System;
+using System.Linq;
+using System.Text.Json;
 
 namespace Services.Tests
 {
@@ -29,9 +27,8 @@ namespace Services.Tests
 			foreach (var chunk in split)
 			{
 				Assert.AreEqual(initial.Destination, chunk.Destination);
-				Assert.AreEqual(initial.SyncJobRowKey, chunk.SyncJobRowKey);
-				Assert.AreEqual(initial.SyncJobPartitionKey, chunk.SyncJobPartitionKey);
-			}
+                Assert.AreEqual(initial.SyncJobId, chunk.SyncJobId);
+            }
 
 			foreach (var nonlastChunk in split.Take(split.Length - 1))
 			{
@@ -45,9 +42,8 @@ namespace Services.Tests
 			var rejoined = GroupMembership.Merge(split);
 
 			Assert.AreEqual(initial.Destination, rejoined.Destination);
-			Assert.AreEqual(initial.SyncJobRowKey, rejoined.SyncJobRowKey);
-			Assert.AreEqual(initial.SyncJobPartitionKey, rejoined.SyncJobPartitionKey);
-			CollectionAssert.AreEqual(initial.SourceMembers, rejoined.SourceMembers);
+            Assert.AreEqual(initial.SyncJobId, rejoined.SyncJobId);
+            CollectionAssert.AreEqual(initial.SourceMembers, rejoined.SourceMembers);
 		}
 
 		[TestMethod]
@@ -55,16 +51,15 @@ namespace Services.Tests
 		{
 			var initial = MockGroupMembershipHelper.MockGroupMembership();
 
-			var split = JsonConvert.DeserializeObject<GroupMembership[]>(JsonConvert.SerializeObject(initial.Split()));
+			var split = JsonSerializer.Deserialize<GroupMembership[]>(JsonSerializer.Serialize(initial.Split()));
 
 			Assert.AreEqual((UserCount / ChunkSize) + 1, split.Length);
 
 			foreach (var chunk in split)
 			{
 				Assert.AreEqual(initial.Destination, chunk.Destination);
-				Assert.AreEqual(initial.SyncJobRowKey, chunk.SyncJobRowKey);
-				Assert.AreEqual(initial.SyncJobPartitionKey, chunk.SyncJobPartitionKey);
-			}
+                Assert.AreEqual(initial.SyncJobId, chunk.SyncJobId);
+            }
 
 			foreach (var nonlastChunk in split.Take(split.Length - 1))
 			{
@@ -78,9 +73,8 @@ namespace Services.Tests
 			var rejoined = GroupMembership.Merge(split);
 
 			Assert.AreEqual(initial.Destination, rejoined.Destination);
-			Assert.AreEqual(initial.SyncJobRowKey, rejoined.SyncJobRowKey);
-			Assert.AreEqual(initial.SyncJobPartitionKey, rejoined.SyncJobPartitionKey);
-			CollectionAssert.AreEqual(initial.SourceMembers, rejoined.SourceMembers);
+            Assert.AreEqual(initial.SyncJobId, rejoined.SyncJobId);
+            CollectionAssert.AreEqual(initial.SourceMembers, rejoined.SourceMembers);
 		}
 
 		[TestMethod]
@@ -89,8 +83,7 @@ namespace Services.Tests
 			var initial = new GroupMembership()
 			{
 				Destination = new AzureADGroup { ObjectId = Guid.NewGuid() },
-				SyncJobPartitionKey = Guid.NewGuid().ToString(),
-				SyncJobRowKey = Guid.NewGuid().ToString(),
+				SyncJobId = Guid.NewGuid()
 			};
 
 			var split = initial.Split();
@@ -98,63 +91,15 @@ namespace Services.Tests
 			Assert.AreEqual(1, split.Length);
 			Assert.AreEqual(0, split.Single().SourceMembers.Count);
 			Assert.AreEqual(initial.Destination, split.Single().Destination);
-			Assert.AreEqual(initial.SyncJobRowKey, split.Single().SyncJobRowKey);
-			Assert.AreEqual(initial.SyncJobPartitionKey, split.Single().SyncJobPartitionKey);
+			Assert.AreEqual(initial.SyncJobId, split.Single().SyncJobId);
 			Assert.IsTrue(split.Single().IsLastMessage);
 
 			var rejoined = GroupMembership.Merge(split);
 
 			Assert.AreEqual(0, rejoined.SourceMembers.Count);
 			Assert.AreEqual(initial.Destination, rejoined.Destination);
-			Assert.AreEqual(initial.SyncJobRowKey, rejoined.SyncJobRowKey);
-			Assert.AreEqual(initial.SyncJobPartitionKey, rejoined.SyncJobPartitionKey);
+			Assert.AreEqual(initial.SyncJobId, rejoined.SyncJobId);
 			CollectionAssert.AreEqual(initial.SourceMembers, rejoined.SourceMembers);
-		}
-
-		// DynamicData example from https://www.meziantou.net/mstest-v2-data-tests.htm
-		[DataTestMethod]
-		[DynamicData(nameof(SizesToTest), DynamicDataSourceType.Method)]
-		public void SerializationSize(int chunkSize)
-		{
-			// https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-quotas
-			const int maxMessageSize = 256 * 1024; // 256 kilobytes
-			const int largestSafePayload = maxMessageSize - (64 * 1024); // minus the maximum header size
-
-			var initial = MockGroupMembershipHelper.MockGroupMembership();
-			foreach (var chunk in initial.Split(chunkSize))
-			{
-				var serialized = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(chunk));
-				Assert.IsTrue(serialized.Length <= largestSafePayload);
-			}
-		}
-
-		public static IEnumerable<object[]> SizesToTest()
-		{
-			for (int i = 100; i < 3700; i += 100)
-			{
-				yield return new object[] { i };
-			}
-
-			for (int i = 3700; i <= ChunkSize; i += 1)
-			{
-				yield return new object[] { i };
-			}
-		}
-
-		[TestMethod]
-		public void DefaultSerializationSizeWorks()
-		{
-			// https://docs.microsoft.com/en-us/azure/service-bus-messaging/service-bus-quotas
-			const int maxMessageSize = 256 * 1024; // 256 kilobytes
-			const int largestSafePayload = maxMessageSize - (64 * 1024); // minus the maximum header size
-
-			var initial = MockGroupMembershipHelper.MockGroupMembership();
-
-			foreach (var chunk in initial.Split())
-			{
-				var serialized = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(chunk));
-				Assert.IsTrue(serialized.Length <= largestSafePayload);
-			}
 		}
 	}
 }

@@ -1,0 +1,145 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Hosts.WebApi;
+using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
+using Models;
+using Repositories.Contracts;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using System.Net;
+using WebApi.Models;
+using Microsoft.Extensions.Logging;
+using SyncJobDetailsDTO = WebApi.Models.DTOs.SyncJobDetails;
+
+namespace Services
+{
+    public class GetGroupHandler : RequestHandlerBase<GetGroupRequest, GetGroupResponse>
+    {
+        private readonly ILogger<GetGroupHandler> _logger;
+        private readonly IDatabaseSyncJobsRepository _databaseSyncJobsRepository;
+        private readonly IDatabaseGroupsRepository _databaseGroupsRepository;
+        private readonly IDatabaseTitlesRepository _titlesRepository;
+        private readonly IGraphGroupRepository _graphGroupRepository;
+        private readonly IHttpContextAccessor _httpContextAccessor;
+
+        public GetGroupHandler(ILogger<GetGroupHandler> logger,
+                              IDatabaseSyncJobsRepository databaseSyncJobsRepository,
+                              IDatabaseGroupsRepository databaseGroupsRepository,
+                              IDatabaseTitlesRepository titlesRepository,
+                              IGraphGroupRepository graphGroupRepository,
+                              IHttpContextAccessor httpContextAccessor) : base(logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _databaseSyncJobsRepository = databaseSyncJobsRepository ?? throw new ArgumentNullException(nameof(databaseSyncJobsRepository));
+            _databaseGroupsRepository = databaseGroupsRepository ?? throw new ArgumentNullException(nameof(databaseGroupsRepository));
+            _titlesRepository = titlesRepository ?? throw new ArgumentNullException(nameof(titlesRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+            _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+        }
+
+        protected override async Task<GetGroupResponse> ExecuteCoreAsync(GetGroupRequest request)
+        {
+            var endpoints = new List<string>();
+            var response = new GetGroupResponse
+            {
+                StatusCode = HttpStatusCode.OK
+            };
+
+            var (job, statusCode) = await GetSyncJobByGroupIdAsync(request.GroupId);
+
+            if (statusCode != HttpStatusCode.OK)
+            {
+                response.StatusCode = statusCode;
+                return response;
+            }
+
+            try
+            {
+                endpoints = await _graphGroupRepository.GetGroupEndpointsAsync(request.GroupId);
+            }
+            catch (Exception ex)
+            {
+                _logger.GroupDetailsEndpointsRetrievalFailed(ex.GetBaseException());
+            }
+
+            var type = job.MembershipType;
+            var targetGroupName = await _graphGroupRepository.GetGroupNameAsync(request.GroupId);
+            var titles = await _titlesRepository.GetTitlesAsync(job.Id);
+            var currentTime = DateTime.UtcNow;
+            var jobStartsInFuture = currentTime < job.StartDate;
+            var jobScheduledForFuture = currentTime < job.ScheduledDate;
+
+            DateTime estimatedNextRunTime;
+            if (!jobStartsInFuture && !jobScheduledForFuture)
+            {
+                // Round current time up to next 5-minute boundary for estimated run time
+                var now = DateTime.UtcNow;
+                var minutesToAdd = 5 - (now.Minute % 5);
+                estimatedNextRunTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0)
+                    .AddMinutes(minutesToAdd);
+            }
+            else if (jobStartsInFuture)
+            {
+                estimatedNextRunTime = job.StartDate;
+            }
+            else
+            {
+                estimatedNextRunTime = job.ScheduledDate;
+            }
+
+            var dto = new SyncJobDetailsDTO
+            (
+                startDate: job.StartDate,
+                lastSuccessfulStartTime: job.LastSuccessfulStartTime,
+                query: job.Query,
+                requestor: job.Requestor,
+                thresholdPercentageForAdditions: job.ThresholdPercentageForAdditions,
+                thresholdPercentageForRemovals: job.ThresholdPercentageForRemovals,
+                endpoints: endpoints,
+                period: job.Period
+            )
+            {
+                SyncJobId = job.Id,
+                TargetGroupId = request.GroupId,
+                TargetGroupName = targetGroupName,
+                TargetDestinationType = type,
+                LastSuccessfulRunTime = job.LastSuccessfulRunTime,
+                EstimatedNextRunTime = estimatedNextRunTime,
+                Status = job.Status,
+                Titles = titles
+            };
+
+            response.Model = dto;
+
+            return response;
+        }
+
+        private async Task<(SyncJob? syncJob, HttpStatusCode statusCode)> GetSyncJobByGroupIdAsync(Guid groupId)
+        {
+            var userId = _httpContextAccessor.HttpContext.User.Claims.FirstOrDefault(x => x.Type == "http://schemas.microsoft.com/identity/claims/objectidentifier")?.Value;
+            if (string.IsNullOrWhiteSpace(userId)) return (null, HttpStatusCode.Forbidden);
+
+            var group = await _databaseGroupsRepository.GetGroupAsync(groupId);
+
+            if (_httpContextAccessor.HttpContext.User.IsInRole(Roles.JOB_TENANT_READER) ||
+                _httpContextAccessor.HttpContext.User.IsInRole(Roles.JOB_TENANT_WRITER))
+            {
+                return (await _databaseSyncJobsRepository.GetSyncJobAsync(group.SyncJobId), HttpStatusCode.OK);
+            }
+
+            if (!await _databaseSyncJobsRepository.GetSyncJobs(true).AnyAsync(x => x.Id == group.SyncJobId))
+            {
+                return (null, HttpStatusCode.NotFound);
+            }
+
+            var job = await _databaseSyncJobsRepository
+                            .GetSyncJobs(true)
+                            .FirstOrDefaultAsync(x => x.Id == group.SyncJobId && x.DestinationOwners.Any(o => o.ObjectId == Guid.Parse(userId)));
+
+            return job != null ? (job, HttpStatusCode.OK) : (null, HttpStatusCode.Forbidden);
+        }
+    }
+}

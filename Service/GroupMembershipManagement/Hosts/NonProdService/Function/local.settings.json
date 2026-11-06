@@ -1,0 +1,22 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AZURE_TOKEN_CREDENTIALS": "VisualStudioCredential",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "graphCredentials:ClientId": "",
+    "graphCredentials:ClientSecret": "",
+    "graphCredentials:KeyVaultName": "gmm-prereqs-<env>",
+    "graphCredentials:KeyVaultTenantId": "<demo-tenant-id>",
+    "graphCredentials:TenantId": "<demo-tenant-id>",
+    "ConnectionStrings:JobsContext": "",
+    "ConnectionStrings:JobsContextReadOnly": "",
+    "LoadTesting:RequestorEmail": "admin@<demo-tenant-M365domain>",
+    "LoadTesting:JobCount": 100,
+    "LoadTesting:SyncJobChangePercent": 10,
+    "LoadTesting:SyncJobProbabilityOfChangePercent": 50,
+    "appConfigurationEndpoint": "https://gmm-appconfig-<env>.azconfig.io",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": ""
+  }
+}

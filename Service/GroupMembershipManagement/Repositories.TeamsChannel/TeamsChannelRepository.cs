@@ -1,0 +1,878 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Microsoft.ApplicationInsights;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Graph;
+using Microsoft.Graph.Models;
+using Microsoft.Graph.Models.ODataErrors;
+using Microsoft.Kiota.Abstractions;
+using Microsoft.Kiota.Abstractions.Serialization;
+using Microsoft.Kiota.Http.HttpClientLibrary.Middleware.Options;
+using Models;
+using Models.Entities;
+using Repositories.Contracts;
+using Repositories.Contracts.Helpers;
+using Repositories.GraphGroups;
+using System;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Net;
+using System.Net.Http;
+using System.Linq;
+using Channel = Microsoft.Graph.Models.Channel;
+using Group = Microsoft.Graph.Models.Group;
+
+namespace Repositories.TeamsChannel
+{
+    public class TeamsChannelRepository : ITeamsChannelRepository
+    {
+        private readonly GraphServiceClient _graphServiceClient;
+        private readonly ILogger<TeamsChannelRepository> _teamsChannelRepositoryLogger;
+        private readonly TeamsChannelMetricTracker _teamsChannelMetricTracker;
+
+        public Guid RunId { get; set; }
+
+        public TeamsChannelRepository(GraphServiceClient graphServiceClient,
+                                      TelemetryClient telemetryClient,
+                                      ILogger<TeamsChannelRepository> teamsChannelRepositoryLogger,
+                                      ILoggerFactory loggerFactory = null)
+        {
+            _graphServiceClient = graphServiceClient ?? throw new ArgumentNullException(nameof(graphServiceClient));
+            _ = telemetryClient ?? throw new ArgumentNullException(nameof(telemetryClient));
+            _teamsChannelRepositoryLogger = teamsChannelRepositoryLogger ?? throw new ArgumentNullException(nameof(teamsChannelRepositoryLogger));
+            _teamsChannelMetricTracker = new TeamsChannelMetricTracker(
+                graphServiceClient,
+                telemetryClient,
+                loggerFactory?.CreateLogger<TeamsChannelMetricTracker>() ?? NullLogger<TeamsChannelMetricTracker>.Instance);
+        }
+
+        public async Task<List<AzureADTeamsUser>> ReadUsersFromChannelAsync(AzureADTeamsChannel teamsChannel, Guid? runId, string? query = null, bool excludeOwners = true)
+        {
+            var groupId = teamsChannel.ObjectId;
+            var channelId = teamsChannel.ChannelId;
+
+            _teamsChannelRepositoryLogger.LogInformation($"Reading Teams users from group {groupId}, channel {channelId}.");
+
+            var toReturn = new List<AzureADTeamsUser>();
+
+            try
+            {
+                await IterateChannelMembersAsync(teamsChannel, runId, query, throwOnFailure: true, membersPage =>
+                {
+                    if (membersPage?.Value != null)
+                    {
+                        _teamsChannelRepositoryLogger.LogInformation($"Read {membersPage.Value.Count} Teams users from group {groupId}, channel {channelId}.");
+                        // x! uses the "null forgiving operator" to fix the nullable/non-nullable type mismatch https://stackoverflow.com/a/54724546
+                        // it's fine here because the where clause guarantees there's no nulls.
+                        toReturn.AddRange(membersPage.Value.Select((member) => ToTeamsUser(member, excludeOwners)).Where(x => x != null).Select(x => x!));
+                    }
+                });
+
+                _teamsChannelRepositoryLogger.LogInformation($"Read a total of {toReturn.Count} Teams users from group {groupId}, channel {channelId}.");
+
+                return toReturn;
+
+            }
+            catch (ODataError e)
+            {
+                _teamsChannelRepositoryLogger.LogError($"Exception code:  {e.Error.Code}");
+                _teamsChannelRepositoryLogger.LogError($"Exception Message:  {e.Error.Message}");
+                throw;
+            }
+            
+        }
+
+        /// <summary>
+        /// Fetches the members of a Teams channel, following pagination, and invokes <paramref name="processPage"/>
+        /// for each page of results. Shared by <see cref="ReadUsersFromChannelAsync"/> and <see cref="GetChannelOwnersAsync"/>.
+        /// When <paramref name="throwOnFailure"/> is true a non-success response throws; otherwise it stops iterating.
+        /// </summary>
+        private async Task IterateChannelMembersAsync(
+            AzureADTeamsChannel teamsChannel,
+            Guid? runId,
+            string query,
+            bool throwOnFailure,
+            Action<ConversationMemberCollectionResponse> processPage)
+        {
+            var groupId = teamsChannel.ObjectId;
+            var channelId = teamsChannel.ChannelId;
+
+            var nativeResponseHandler = new NativeResponseHandler();
+
+            await _graphServiceClient.Teams[groupId.ToString()].Channels[channelId].Members.GetAsync(requestConfiguration =>
+            {
+                if (!string.IsNullOrEmpty(query))
+                {
+                    requestConfiguration.QueryParameters.Filter = query;
+                }
+                requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+            });
+
+            var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+            if (nativeResponse == null)
+            {
+                return;
+            }
+
+            var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+            await _teamsChannelMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+            if (!nativeResponse.IsSuccessStatusCode)
+            {
+                if (throwOnFailure)
+                {
+                    throw new HttpRequestException($"Failed to read Teams channel members. Status code: {nativeResponse.StatusCode}");
+                }
+
+                _teamsChannelRepositoryLogger.LogInformation($"Failed to read members of group {groupId}, channel {channelId}. Status code: {nativeResponse.StatusCode}");
+                return;
+            }
+
+            var membersPage = await DeserializeResponseAsync(nativeResponse, ConversationMemberCollectionResponse.CreateFromDiscriminatorValue);
+
+            processPage(membersPage);
+
+            var nextLink = membersPage?.OdataNextLink;
+
+            while (!string.IsNullOrEmpty(nextLink))
+            {
+                var request = new RequestInformation
+                {
+                    HttpMethod = Method.GET,
+                    UrlTemplate = nextLink
+                };
+
+                var pageResponseHandler = new NativeResponseHandler();
+                request.AddRequestOptions(new List<IRequestOption> { new ResponseHandlerOption { ResponseHandler = pageResponseHandler } });
+
+                await _graphServiceClient.RequestAdapter.SendAsync<ConversationMemberCollectionResponse>(request, ConversationMemberCollectionResponse.CreateFromDiscriminatorValue);
+
+                var pageResponse = pageResponseHandler.Value as HttpResponseMessage;
+
+                if (pageResponse == null)
+                {
+                    break;
+                }
+
+                var pageHeaders = pageResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+                await _teamsChannelMetricTracker.TrackMetricsAsync(pageHeaders, QueryType.Other, runId);
+
+                if (!pageResponse.IsSuccessStatusCode)
+                {
+                    if (throwOnFailure)
+                    {
+                        throw new HttpRequestException($"Failed to read Teams channel members page. Status code: {pageResponse.StatusCode}");
+                    }
+
+                    break;
+                }
+
+                membersPage = await DeserializeResponseAsync(pageResponse, ConversationMemberCollectionResponse.CreateFromDiscriminatorValue);
+
+                processPage(membersPage);
+
+                nextLink = membersPage?.OdataNextLink;
+            }
+        }
+
+        public async Task<List<AzureADUser>> GetChannelOwnersAsync(AzureADTeamsChannel teamsChannel, Guid? runId)
+        {
+            var groupId = teamsChannel.ObjectId;
+            var channelId = teamsChannel.ChannelId;
+
+            _teamsChannelRepositoryLogger.LogInformation($"Getting owners of group {groupId}, channel {channelId}.");
+
+            var owners = new List<AzureADUser>();
+
+            try
+            {
+                await IterateChannelMembersAsync(teamsChannel, runId, query: null, throwOnFailure: false, membersPage =>
+                {
+                    AddChannelOwners(membersPage, owners);
+                });
+
+                _teamsChannelRepositoryLogger.LogInformation($"Retrieved {owners.Count} owners of group {groupId}, channel {channelId}.");
+
+                return owners;
+            }
+            catch (ODataError e)
+            {
+                _teamsChannelRepositoryLogger.LogError($"Exception reading channel owners. Code: {e.Error?.Code}, Message: {e.Error?.Message}");
+                return owners;
+            }
+        }
+
+        private static void AddChannelOwners(ConversationMemberCollectionResponse membersPage, List<AzureADUser> owners)
+        {
+            if (membersPage?.Value == null) return;
+
+            foreach (var member in membersPage.Value)
+            {
+                if (member is not AadUserConversationMember aadMember) continue;
+                var isOwner = aadMember.Roles?.Contains("Owner", StringComparer.InvariantCultureIgnoreCase) ?? false;
+                if (!isOwner) continue;
+                if (string.IsNullOrEmpty(aadMember.UserId) || !Guid.TryParse(aadMember.UserId, out var objectId)) continue;
+                if (owners.Any(o => o.ObjectId == objectId)) continue;
+                owners.Add(new AzureADUser { ObjectId = objectId, Mail = aadMember.Email });
+            }
+        }
+
+        public async Task<string> GetChannelTypeAsync(AzureADTeamsChannel teamsChannel, Guid runId)
+        {
+            try
+            {
+                _teamsChannelRepositoryLogger.LogInformation($"Reading metadata about group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}.");
+
+                var nativeResponseHandler = new NativeResponseHandler();
+
+                await _graphServiceClient.Teams[teamsChannel.ObjectId.ToString()].Channels[teamsChannel.ChannelId].GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse == null)
+                {
+                    return string.Empty;
+                }
+
+                try
+                {
+                    await TrackResponseMetricsAsync(nativeResponse, ResolveRunId(runId));
+
+                    if (!nativeResponse.IsSuccessStatusCode)
+                    {
+                        throw new HttpRequestException($"Failed to read metadata about group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}. Status code: {nativeResponse.StatusCode}");
+                    }
+
+                    var channelData = await DeserializeResponseAsync(nativeResponse, Channel.CreateFromDiscriminatorValue);
+
+                    _teamsChannelRepositoryLogger.LogInformation($"Read metadata about group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}. MembershipType is {channelData?.MembershipType}.");
+
+                    return channelData?.MembershipType?.ToString() ?? string.Empty;
+                }
+                finally
+                {
+                    nativeResponse.Dispose();
+                }
+            }
+            catch (ODataError e)
+            {
+                _teamsChannelRepositoryLogger.LogError($"Exception code:  {e.Error.Code}");
+                _teamsChannelRepositoryLogger.LogError($"Exception Message:  {e.Error.Message}");
+                throw;
+            }
+
+        }
+
+        private AzureADTeamsUser? ToTeamsUser(ConversationMember member, bool excludeOwners)
+        {
+            var aadMember = member as AadUserConversationMember;
+            if (excludeOwners && (aadMember?.Roles?.Contains("Owner", StringComparer.InvariantCultureIgnoreCase) ?? false)) { return null; }
+            return new AzureADTeamsUser { ObjectId = Guid.Parse(aadMember.UserId), ConversationMemberId = aadMember.Id };
+        }
+
+        public async Task<(int SuccessCount, List<AzureADTeamsUser> UsersToRetry, List<AzureADTeamsUser> UsersNotFound)> AddUsersToChannelAsync(AzureADTeamsChannel teamsChannel, ICollection<AzureADTeamsUser> members)
+        {
+            int successCount = 0;
+            var usersToRetry = new List<AzureADTeamsUser>();
+            var usersNotFound = new List<AzureADTeamsUser>();
+            foreach (var member in members)
+            {
+                var requestBody = CreateRequestBody(member.ObjectId.ToString());
+                try
+                {
+                    var nativeResponseHandler = new NativeResponseHandler();
+
+                    await _graphServiceClient.Teams[teamsChannel.ObjectId.ToString()].Channels[teamsChannel.ChannelId.ToString()].Members.PostAsync(requestBody, requestConfiguration =>
+                    {
+                        requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                    });
+
+                    var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                    if (nativeResponse == null)
+                    {
+                        _teamsChannelRepositoryLogger.LogInformationWithRunId(ResolveRunId(), $"No response captured for Add of user {member.ObjectId} to group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}; not counted as added, continuing sync.");
+                        continue;
+                    }
+
+                    try
+                    {
+                        await TrackResponseMetricsAsync(nativeResponse, ResolveRunId(), QueryType.Other, GraphOperationType.Write);
+                        await LogWriteAttemptAsync(nativeResponse, member, teamsChannel, "Add", ResolveRunId());
+
+                        if (nativeResponse.StatusCode == HttpStatusCode.Created)
+                        {
+                            successCount++;
+                        }
+                        else
+                        {
+                            var (errorCode, errorMessage) = await TryReadODataErrorAsync(nativeResponse);
+                            _teamsChannelRepositoryLogger.LogInformation($"Add for user {member.ObjectId} returned {(int)nativeResponse.StatusCode} {nativeResponse.StatusCode} (not 201 Created); not counted as added, continuing sync. Error: {errorCode} {errorMessage}");
+                        }
+                    }
+                    finally
+                    {
+                        nativeResponse.Dispose();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _teamsChannelRepositoryLogger.LogError($"Exception adding user {member.ObjectId} to group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}; not counted as added, continuing sync. Exception: {ex.GetBaseException()}");
+                    continue;
+                }
+            }
+            return (successCount, usersToRetry, usersNotFound);
+        }
+        public async Task<(int SuccessCount, List<AzureADTeamsUser> UserRemovesFailed)> RemoveUsersFromChannelAsync(AzureADTeamsChannel teamsChannel, ICollection<AzureADTeamsUser> members)
+        {
+            int successCount = 0;
+            var usersNotFound = new List<AzureADTeamsUser>();
+            foreach (var member in members)
+            {
+                try
+                {
+                    var conversationMember = member as AzureADTeamsUser;
+                    var nativeResponseHandler = new NativeResponseHandler();
+
+                    await _graphServiceClient.Teams[teamsChannel.ObjectId.ToString()]
+                        .Channels[teamsChannel.ChannelId.ToString()]
+                        .Members[conversationMember.ConversationMemberId]
+                        .DeleteAsync(requestConfiguration =>
+                        {
+                            requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                        });
+
+                    var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                    if (nativeResponse == null)
+                    {
+                        _teamsChannelRepositoryLogger.LogInformationWithRunId(ResolveRunId(), $"No response captured for Remove of user {member.ObjectId} from group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}; not counted as removed, continuing sync.");
+                        continue;
+                    }
+
+                    try
+                    {
+                        await TrackResponseMetricsAsync(nativeResponse, ResolveRunId(), QueryType.Other, GraphOperationType.Write);
+                        await LogWriteAttemptAsync(nativeResponse, member, teamsChannel, "Remove", ResolveRunId());
+
+                        if (nativeResponse.StatusCode == HttpStatusCode.NoContent)
+                        {
+                            successCount++;
+                        }
+                        else
+                        {
+                            var (errorCode, errorMessage) = await TryReadODataErrorAsync(nativeResponse);
+                            _teamsChannelRepositoryLogger.LogInformation($"Remove for user with object id '{member.ObjectId}' and conversation id '{member.ConversationMemberId}' returned {(int)nativeResponse.StatusCode} {nativeResponse.StatusCode} (not 204 No Content); not counted as removed, continuing sync. Error: {errorCode} {errorMessage}");
+                        }
+                    }
+                    finally
+                    {
+                        nativeResponse.Dispose();
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _teamsChannelRepositoryLogger.LogError($"Exception removing user {member.ObjectId} (conversation id '{member.ConversationMemberId}') from group {teamsChannel.ObjectId}, channel {teamsChannel.ChannelId}; not counted as removed, continuing sync. Exception: {ex.GetBaseException()}");
+                    continue;
+                }
+            }
+            return (successCount, usersNotFound); 
+        }
+        private ConversationMember CreateRequestBody(string userObjectId)
+        {
+            var requestBody = new ConversationMember
+            {
+                OdataType = "#microsoft.graph.aadUserConversationMember",
+                AdditionalData = new Dictionary<string, object>
+                {
+                    {
+                        "user@odata.bind" , $"https://graph.microsoft.com/v1.0/users('{userObjectId}')"
+                    },
+                }
+            };
+            return requestBody;
+        }
+        public async Task<string> GetGroupNameAsync(Guid groupId, Guid runId)
+        {
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var responseHandlerOption = new ResponseHandlerOption { ResponseHandler = nativeResponseHandler };
+                Group group = null;
+
+                await _graphServiceClient.Groups[groupId.ToString()].GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.Options.Add(responseHandlerOption);
+                });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+                if (nativeResponse.IsSuccessStatusCode)
+                {
+                    group = await DeserializeResponseAsync(nativeResponse, Group.CreateFromDiscriminatorValue);
+                }
+
+                var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+                await _teamsChannelMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                return group != null ? group.DisplayName : string.Empty;
+            }
+            catch (ODataError ex)
+            {
+                if (ex.ResponseStatusCode == (int)HttpStatusCode.NotFound)
+                    return string.Empty;
+
+                _teamsChannelRepositoryLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+        }
+        public async Task<List<AzureADUser>> GetGroupOwnersAsync(Guid groupObjectId, Guid runId, int top = 0)
+        {
+            _teamsChannelRepositoryLogger.LogInformationWithRunId(runId, $"Getting owners of group {groupObjectId}.");
+
+            var owners = new List<User>();
+
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var groupOwnersResponse = new DirectoryObjectCollectionResponse();
+
+                await _graphServiceClient.Groups[groupObjectId.ToString()].Owners.GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.QueryParameters.Top = top > 0 ? top : null;
+                    requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse.IsSuccessStatusCode)
+                {
+                    groupOwnersResponse = await DeserializeResponseAsync(nativeResponse,
+                                                                         DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+
+                    var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+
+                    owners.AddRange(groupOwnersResponse.Value.OfType<User>());
+                    await _teamsChannelMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                    _teamsChannelRepositoryLogger.LogInformationWithRunId(runId, $"Retrieved{(top > 0 ? " top " : " ")}{owners.Count} owners of group {groupObjectId}.");
+
+                    return owners.Select(x => new AzureADUser
+                    {
+                        ObjectId = Guid.Parse(x.Id),
+                        Mail = x.Mail
+                    })
+                    .ToList();
+                }
+
+                _teamsChannelRepositoryLogger.LogInformationWithRunId(runId, $"Failed to retrieve owners of group {groupObjectId}. StatusCode {nativeResponse.StatusCode}");
+
+                return new List<AzureADUser>();
+
+            }
+            catch (ODataError ex)
+            {
+                _teamsChannelRepositoryLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+        }
+        protected async Task<T> DeserializeResponseAsync<T>(HttpResponseMessage response, ParsableFactory<T> factory) where T : IParsable
+        {
+            var rootNode = await GetRootParseNodeAsync(response);
+            if (rootNode == null) return default;
+            var result = rootNode.GetObjectValue(factory);
+            return result;
+        }
+        private async Task<IParseNode> GetRootParseNodeAsync(HttpResponseMessage response)
+        {
+            var pNodeFactory = ParseNodeFactoryRegistry.DefaultInstance;
+            var responseContentType = response.Content?.Headers?.ContentType?.MediaType?.ToLowerInvariant();
+
+            if (string.IsNullOrEmpty(responseContentType))
+                return null;
+
+            using var contentStream = await (response.Content?.ReadAsStreamAsync() ?? Task.FromResult(Stream.Null));
+            var rootNode = pNodeFactory.GetRootParseNode(responseContentType!, contentStream);
+            return rootNode;
+        }
+        public async Task<Dictionary<string, string>> GetTeamsChannelNamesAsync(List<AzureADTeamsChannel> channels)
+        {
+            var channelNames = new Dictionary<string, string>();
+            var batchRequest = new BatchRequestContentCollection(_graphServiceClient);
+
+            // requestId, groupId
+            var requestIdTracker = new Dictionary<string, string>();
+
+            foreach (var channel in channels.Distinct())
+            {
+                var requestInformation = _graphServiceClient
+                                            .Teams[channel.ObjectId.ToString()]
+                                            .Channels[channel.ChannelId.ToString()]
+                                            .ToGetRequestInformation(requestConfiguration =>
+                                            {
+                                                requestConfiguration.QueryParameters.Select = new[] { "displayName" };
+                                            });
+
+
+
+                var requestId = await batchRequest.AddBatchRequestStepAsync(requestInformation);
+                requestIdTracker.Add(requestId, channel.ChannelId);
+            }
+
+            var batchResponse = await _graphServiceClient.Batch.PostAsync(batchRequest);
+
+            foreach (var statusCodeResponse in await batchResponse.GetResponsesStatusCodesAsync())
+            {
+                using var response = await batchResponse.GetResponseByIdAsync(statusCodeResponse.Key);
+
+                await TrackResponseMetricsAsync(response, ResolveRunId());
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseHandler = new ResponseHandler<Channel>();
+                    var channel = await responseHandler.HandleResponseAsync<HttpResponseMessage, Channel>(response, null);
+                    if (channel != null)
+                        channelNames.Add(requestIdTracker[statusCodeResponse.Key], channel.DisplayName);
+                }
+                else
+                {
+                    channelNames.Add(requestIdTracker[statusCodeResponse.Key], null);
+                }
+            }
+
+            return channelNames;
+        }
+        public async Task<List<Channel>> SearchTeamsChannelsAsync(Guid teamObjectId, string filter)
+        {
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+
+                await _graphServiceClient.Teams[teamObjectId.ToString()]
+                    .Channels
+                    .GetAsync(requestConfig =>
+                    {
+                        requestConfig.QueryParameters.Select = ["id", "displayName", "membershipType"];
+                        requestConfig.QueryParameters.Filter = filter;
+                        requestConfig.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                    });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse == null)
+                {
+                    return new List<Channel>();
+                }
+
+                try
+                {
+                    await TrackResponseMetricsAsync(nativeResponse, ResolveRunId());
+
+                    if (!nativeResponse.IsSuccessStatusCode)
+                    {
+                        throw new HttpRequestException($"Failed to search Teams channels for team {teamObjectId}. Status code: {nativeResponse.StatusCode}");
+                    }
+
+                    var channelResponse = await DeserializeResponseAsync(nativeResponse, ChannelCollectionResponse.CreateFromDiscriminatorValue);
+
+                    return channelResponse?.Value?.ToList() ?? new List<Channel>();
+                }
+                finally
+                {
+                    nativeResponse.Dispose();
+                }
+            }
+            catch (ODataError ex)
+            {
+                _teamsChannelRepositoryLogger.LogError(ex.GetBaseException().ToString());
+
+                throw;
+            }
+        }
+        public async Task<Channel> GetMainChannelAsync(Guid teamObjectId)
+        {
+            var teamResponseHandler = new NativeResponseHandler();
+
+            await _graphServiceClient.Teams[teamObjectId.ToString()]
+                .GetAsync(requestConfig =>
+                {
+                    requestConfig.QueryParameters.Select = new[] { "internalId" };
+                    requestConfig.Options.Add(new ResponseHandlerOption { ResponseHandler = teamResponseHandler });
+                });
+
+            var teamResponse = teamResponseHandler.Value as HttpResponseMessage;
+
+            if (teamResponse == null)
+            {
+                return null;
+            }
+
+            Team team = null;
+
+            try
+            {
+                await TrackResponseMetricsAsync(teamResponse, ResolveRunId());
+
+                if (!teamResponse.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException($"Failed to read team {teamObjectId}. Status code: {teamResponse.StatusCode}");
+                }
+
+                team = await DeserializeResponseAsync(teamResponse, Team.CreateFromDiscriminatorValue);
+            }
+            finally
+            {
+                teamResponse.Dispose();
+            }
+
+            if (team == null || string.IsNullOrEmpty(team.InternalId))
+            {
+                return null;
+            }
+
+            var channelResponseHandler = new NativeResponseHandler();
+
+            await _graphServiceClient.Teams[teamObjectId.ToString()]
+                .Channels[team.InternalId]
+                .GetAsync(requestConfig =>
+                {
+                    requestConfig.QueryParameters.Select = new[] { "id", "displayName", "email" };
+                    requestConfig.Options.Add(new ResponseHandlerOption { ResponseHandler = channelResponseHandler });
+                });
+
+            var channelResponse = channelResponseHandler.Value as HttpResponseMessage;
+
+            if (channelResponse == null)
+            {
+                return null;
+            }
+
+            try
+            {
+                await TrackResponseMetricsAsync(channelResponse, ResolveRunId());
+
+                if (!channelResponse.IsSuccessStatusCode)
+                {
+                    throw new HttpRequestException($"Failed to read channel {team.InternalId} for team {teamObjectId}. Status code: {channelResponse.StatusCode}");
+                }
+
+                return await DeserializeResponseAsync(channelResponse, Channel.CreateFromDiscriminatorValue);
+            }
+            finally
+            {
+                channelResponse.Dispose();
+            }
+        }
+        public async Task<Dictionary<string,string>> GetTeamsChannelEmailsAsync(List<AzureADTeamsChannel> channels)
+        {
+            var channelEmails = new Dictionary<string, string>();
+            var batchRequest = new BatchRequestContentCollection(_graphServiceClient);
+            var requestIdTracker = new Dictionary<string, string>();
+
+            foreach (var channel in channels.Distinct())
+            {
+                var requestInformation = _graphServiceClient
+                    .Teams[channel.ObjectId.ToString()]
+                    .Channels[channel.ChannelId]
+                    .ToGetRequestInformation(requestConfig =>
+                    {
+                        requestConfig.QueryParameters.Select = new[] { "email" };
+                    });
+
+                var requestId = await batchRequest.AddBatchRequestStepAsync(requestInformation);
+                requestIdTracker.Add(requestId, channel.ChannelId);
+            }
+
+            var batchResponse = await _graphServiceClient.Batch.PostAsync(batchRequest);
+
+            foreach (var statusCodeResponse in await batchResponse.GetResponsesStatusCodesAsync())
+            {
+                using var response = await batchResponse.GetResponseByIdAsync(statusCodeResponse.Key);
+
+                await TrackResponseMetricsAsync(response, ResolveRunId());
+
+                if (response.IsSuccessStatusCode)
+                {
+                    var responseHandler = new ResponseHandler<Channel>();
+                    var channelObj = await responseHandler.HandleResponseAsync<HttpResponseMessage, Channel>(response, null);
+
+                    channelEmails[requestIdTracker[statusCodeResponse.Key]] = channelObj?.Email; 
+                }
+                else
+                {
+                    channelEmails[requestIdTracker[statusCodeResponse.Key]] = null;
+                }
+            }
+
+            return channelEmails;
+        }
+
+        public async Task<string> GetTeamsChannelNameAsync(AzureADTeamsChannel channel)
+        {
+            var name = (await GetTeamsChannelNamesAsync(new List<AzureADTeamsChannel>() { channel }))[channel.ChannelId];
+            return name;
+        }
+        public async Task<bool> IsServiceAccountOwnerOfChannelAsync(Guid serviceAccountObjectId, AzureADTeamsChannel channel, Guid? runId)
+        {
+            var userList = await ReadUsersFromChannelAsync(channel, runId, $"roles/any(r: tolower(r) eq 'owner')", false);
+            return userList.Any(user => user.ObjectId == serviceAccountObjectId);
+        }
+
+        public async Task<bool> TeamsChannelExistsAsync(AzureADTeamsChannel channel, Guid? runId)
+        {
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var responseHandlerOption = new ResponseHandlerOption { ResponseHandler = nativeResponseHandler };
+                var retryHandlerOption = new RetryHandlerOption { MaxRetry = 4, Delay = 20 };
+
+                bool? channelExists = null;
+
+                await _graphServiceClient.Teams[channel.ObjectId.ToString()].Channels[channel.ChannelId].GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.Options.Add(retryHandlerOption);
+                    requestConfiguration.Options.Add(responseHandlerOption);
+                });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+                var statusCode = nativeResponse?.StatusCode;
+                if (nativeResponse != null)
+                {
+                    try
+                    {
+                        await TrackResponseMetricsAsync(nativeResponse, ResolveRunId(runId));
+
+                        if (nativeResponse.IsSuccessStatusCode)
+                        {
+                            var response = await DeserializeResponseAsync(nativeResponse, Channel.CreateFromDiscriminatorValue);
+                            channelExists = response?.Id != null;
+                        }
+                        else if (nativeResponse.StatusCode == HttpStatusCode.NotFound)
+                        {
+                            channelExists = false;
+                        }
+                    }
+                    finally
+                    {
+                        nativeResponse.Dispose();
+                    }
+                }
+                else
+                {
+                    channelExists = null;
+                }
+
+                if (!channelExists.HasValue)
+                {
+                    throw new Exception($"Unable to determine if channel {{ objectId: {channel.ObjectId} channelId: {channel.ChannelId} }} exists. Status code: {statusCode?.ToString() ?? "(none)"}");
+                }
+
+                return channelExists.Value;
+            }
+            catch (ODataError ex)
+            {
+                if (ex.ResponseStatusCode == (int)HttpStatusCode.NotFound)
+                    return false;
+
+                _teamsChannelRepositoryLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+            catch (Exception ex)
+            {
+                _teamsChannelRepositoryLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+        }
+
+        private Guid? ResolveRunId(Guid? runId = null)
+        {
+            return CorrelationActivity.ResolveRunId(runId, RunId == Guid.Empty ? null : RunId);
+        }
+
+        private async Task LogWriteAttemptAsync(HttpResponseMessage response, AzureADTeamsUser member, AzureADTeamsChannel teamsChannel, string operation, Guid? runId)
+        {
+            var headers = GetResponseHeaders(response);
+            var graphRequestId = TryGetHeaderValue(headers, "request-id");
+            var clientRequestId = TryGetHeaderValue(headers, "client-request-id");
+
+            _teamsChannelRepositoryLogger.LogInformationWithRunId(runId,
+                $"TeamsChannel write attempt. Operation: {operation}, TargetUserObjectId: {member.ObjectId}, HttpStatusCode: {(int)response.StatusCode} {response.StatusCode}, GraphRequestId: {graphRequestId}, ClientRequestId: {clientRequestId}, GroupId: {teamsChannel.ObjectId}, ChannelId: {teamsChannel.ChannelId}");
+
+            if (headers != null)
+            {
+                await _teamsChannelMetricTracker.TrackRequestAsync(headers, runId);
+            }
+        }
+
+        private async Task<(string Code, string Message)> TryReadODataErrorAsync(HttpResponseMessage response)
+        {
+            try
+            {
+                var error = await DeserializeResponseAsync(response, ODataError.CreateFromDiscriminatorValue);
+                return (error?.Error?.Code ?? string.Empty, error?.Error?.Message ?? string.Empty);
+            }
+            catch (Exception ex)
+            {
+                _teamsChannelRepositoryLogger.LogInformation($"Unable to parse OData error body: {ex.Message}");
+                return (string.Empty, string.Empty);
+            }
+        }
+
+        private static string TryGetHeaderValue(IDictionary<string, IEnumerable<string>> headers, string key)
+        {
+            if (headers != null && headers.TryGetValue(key, out var values))
+            {
+                return values?.FirstOrDefault() ?? string.Empty;
+            }
+            return string.Empty;
+        }
+
+        private async Task TrackResponseMetricsAsync(HttpResponseMessage response, Guid? runId, QueryType queryType = QueryType.Other, GraphOperationType operationType = GraphOperationType.Read)
+        {
+            if (response == null)
+            {
+                return;
+            }
+
+            var headers = GetResponseHeaders(response);
+
+            if (headers != null)
+            {
+                await _teamsChannelMetricTracker.TrackMetricsAsync(headers, queryType, runId, operationType);
+            }
+        }
+
+        private static IDictionary<string, IEnumerable<string>> GetResponseHeaders(HttpResponseMessage response)
+        {
+            if (response == null)
+            {
+                return null;
+            }
+
+            var headers = new Dictionary<string, IEnumerable<string>>(StringComparer.OrdinalIgnoreCase);
+
+            foreach (var header in response.Headers)
+            {
+                headers[header.Key] = header.Value;
+            }
+
+            if (response.Content != null)
+            {
+                foreach (var header in response.Content.Headers)
+                {
+                    headers[header.Key] = header.Value;
+                }
+            }
+
+            return headers;
+        }
+    }
+}

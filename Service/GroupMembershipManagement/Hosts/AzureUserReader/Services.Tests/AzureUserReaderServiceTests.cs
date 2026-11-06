@@ -5,10 +5,11 @@ using Azure;
 using Azure.Storage.Blobs;
 using Azure.Storage.Blobs.Models;
 using DIConcreteTypes;
-using Entities;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
 using Moq;
-using Repositories.Contracts;
+using Models;
 using Services.Contracts;
 using Services.Entities.CustomExceptions;
 using System;
@@ -33,7 +34,6 @@ namespace Services.Tests
         public async Task GetPersonnelNumbersTest()
         {
             var storageAccountSecret = new StorageAccountSecret("myconnectionstring");
-            var loggerMock = new Mock<ILoggingRepository>();
             var blobClientFactoryMock = new Mock<IBlobClientFactory>();
             var blobClientMock = new Mock<BlobClient>();
 
@@ -86,9 +86,9 @@ namespace Services.Tests
             blobClientMock.Setup(x => x.Exists(It.IsAny<CancellationToken>())).Returns(Response.FromValue<bool>(true, new Mock<Response>().Object));
             blobClientMock.Setup(x => x.DownloadAsync()).ReturnsAsync(downloadResponse.Object);
 
-            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>())).Returns(blobClientMock.Object);
+            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<Uri>())).Returns(blobClientMock.Object);
 
-            var service = new AzureUserReaderService(storageAccountSecret, loggerMock.Object, blobClientFactoryMock.Object);
+            var service = new AzureUserReaderService(storageAccountSecret, NullLogger<AzureUserReaderService>.Instance, blobClientFactoryMock.Object);
             var personnelNumbers = await service.GetPersonnelNumbersAsync("validcontainer", "valid/blob/path/file.csv");
 
             Assert.AreEqual(1, personnelNumbers.Count);
@@ -100,15 +100,14 @@ namespace Services.Tests
         public async Task GetPersonnelNumbersFileNotFoundTest()
         {
             var storageAccountSecret = new StorageAccountSecret("myconnectionstring");
-            var loggerMock = new Mock<ILoggingRepository>();
             var blobClientFactoryMock = new Mock<IBlobClientFactory>();
             var blobClientMock = new Mock<BlobClient>();
             var response = new Mock<Response>();
 
             blobClientMock.Setup(x => x.Exists(It.IsAny<CancellationToken>())).Returns(Response.FromValue<bool>(false, new Mock<Response>().Object));
-            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>())).Returns(blobClientMock.Object);
+            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<Uri>())).Returns(blobClientMock.Object);
 
-            var service = new AzureUserReaderService(storageAccountSecret, loggerMock.Object, blobClientFactoryMock.Object);
+            var service = new AzureUserReaderService(storageAccountSecret, NullLogger<AzureUserReaderService>.Instance, blobClientFactoryMock.Object);
             var personnelNumbers = await service.GetPersonnelNumbersAsync("validcontainer", "notvalid/blob/path/file.csv");
         }
 
@@ -117,7 +116,6 @@ namespace Services.Tests
         public async Task GetPersonnelNumbersExceptionTest()
         {
             var storageAccountSecret = new StorageAccountSecret("myconnectionstring");
-            var loggerMock = new Mock<ILoggingRepository>();
             var blobClientFactoryMock = new Mock<IBlobClientFactory>();
             var blobClientMock = new Mock<BlobClient>();
 
@@ -129,17 +127,16 @@ namespace Services.Tests
 
             blobClientMock.Setup(x => x.Exists(It.IsAny<CancellationToken>())).Returns(Response.FromValue<bool>(true, new Mock<Response>().Object));
             blobClientMock.Setup(x => x.DownloadAsync()).ReturnsAsync(downloadResponse.Object);
-            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>())).Returns(blobClientMock.Object);
+            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<Uri>())).Returns(blobClientMock.Object);
 
-            var service = new AzureUserReaderService(storageAccountSecret, loggerMock.Object, blobClientFactoryMock.Object);
+            var service = new AzureUserReaderService(storageAccountSecret, NullLogger<AzureUserReaderService>.Instance, blobClientFactoryMock.Object);
             var personnelNumbers = await service.GetPersonnelNumbersAsync("validcontainer", "valid/blob/path/file.csv");
         }
 
         [TestMethod]
-        public async Task UploadUsersMemberIdTest()
+        public async Task UploadUsersMemberIdOverwriteTest()
         {
             var storageAccountSecret = new StorageAccountSecret("myconnectionstring");
-            var loggerMock = new Mock<ILoggingRepository>();
             var blobClientFactoryMock = new Mock<IBlobClientFactory>();
             var blobClientMock = new Mock<BlobClient>();
 
@@ -208,7 +205,7 @@ namespace Services.Tests
                                     }
                                 }
                             });
-            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>())).Returns(blobClientMock.Object);
+            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<Uri>())).Returns(blobClientMock.Object);
 
             var users = new List<GraphProfileInformation>
             {
@@ -216,13 +213,13 @@ namespace Services.Tests
                 new GraphProfileInformation{ PersonnelNumber =personnelNumbers[3], Id = Guid.NewGuid().ToString()}
             };
 
-            var service = new AzureUserReaderService(storageAccountSecret, loggerMock.Object, blobClientFactoryMock.Object);
+            var service = new AzureUserReaderService(storageAccountSecret, NullLogger<AzureUserReaderService>.Instance, blobClientFactoryMock.Object);
             await service.UploadUsersMemberIdAsync(new Entities.UploadRequest { ContainerName = "mycontainer", BlobTargetDirectory = "/target/folder", Users = users });
 
-            Assert.AreEqual(4, usersToUpload.Count);
-            foreach (var personnelNumber in personnelNumbers)
+            Assert.AreEqual(2, usersToUpload.Count);
+            foreach (var personnelNumber in new string[] { personnelNumbers[2], personnelNumbers[3] })
             {
-                Assert.IsTrue(usersToUpload.Any(x => x.PersonnelNumber == personnelNumber));
+                Assert.IsTrue(users.Any(x => x.PersonnelNumber == personnelNumber));
             }
         }
 
@@ -230,7 +227,6 @@ namespace Services.Tests
         public async Task UploadUsersMemberIdNoFileTest()
         {
             var storageAccountSecret = new StorageAccountSecret("myconnectionstring");
-            var loggerMock = new Mock<ILoggingRepository>();
             var blobClientFactoryMock = new Mock<IBlobClientFactory>();
             var blobClientMock = new Mock<BlobClient>();
             var response = new Mock<Response>();
@@ -259,7 +255,7 @@ namespace Services.Tests
                                     }
                                 }
                             });
-            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<string>())).Returns(blobClientMock.Object);
+            blobClientFactoryMock.Setup(x => x.GetBlobClient(It.IsAny<Uri>())).Returns(blobClientMock.Object);
 
             var users = new List<GraphProfileInformation>
             {
@@ -267,7 +263,7 @@ namespace Services.Tests
                 new GraphProfileInformation{ PersonnelNumber =personnelNumbers[1], Id = Guid.NewGuid().ToString()}
             };
 
-            var service = new AzureUserReaderService(storageAccountSecret, loggerMock.Object, blobClientFactoryMock.Object);
+            var service = new AzureUserReaderService(storageAccountSecret, NullLogger<AzureUserReaderService>.Instance, blobClientFactoryMock.Object);
             await service.UploadUsersMemberIdAsync(new Entities.UploadRequest { ContainerName = "mycontainer", BlobTargetDirectory = "/target/folder", Users = users });
 
             Assert.AreEqual(2, usersToUpload.Count);

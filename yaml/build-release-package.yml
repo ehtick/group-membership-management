@@ -1,0 +1,76 @@
+parameters:
+- name: repoToCheckout
+  type: string
+- name: checkoutPath
+  type: string
+- name: buildRelease
+  type: boolean
+
+stages:
+
+- stage: Build_ReleasePackage
+  dependsOn:
+  - Build_WebAPP
+  - Build_WebAPI
+  - Build_Functions
+  jobs:
+  - job: Build_ReleasePackage
+    ${{ if parameters.buildRelease }}:
+      strategy:
+        maxParallel: 2
+        matrix:
+          debug:
+            BuildConfiguration: debug
+          release:
+            BuildConfiguration: release
+    ${{ else }}:
+      variables:
+        BuildConfiguration: 'debug'
+
+    steps:
+
+    - ${{ if ne(parameters.repoToCheckout, '') }}:
+      - checkout: ${{ parameters.repoToCheckout }}
+        path: ${{ parameters.checkoutPath }}
+
+    - task: UseDotNet@2
+      displayName: "Install .NET SDK"
+      inputs:
+        packageType: sdk
+        useGlobalJson: true
+
+    - task: PowerShell@2
+      displayName: 'Build json templates'
+      inputs:
+        targetType: inline
+        workingDirectory: 'Deployment'
+        script: |
+          try {
+            $templateFiles = Get-ChildItem -Path . -Filter "*.bicep"
+            foreach ($templateFile in $templateFiles) {
+              az bicep build --file $templateFile.FullName
+              if ($LASTEXITCODE -ne 0) {
+                Write-Error "az bicep build failed with exit code $LASTEXITCODE"
+                exit $LASTEXITCODE
+              }
+            }
+          } catch {
+            Write-Error "An error occurred: $_"
+            exit 1
+          }
+        pwsh: true
+
+    - task: CopyFiles@2
+      displayName: 'Copy deployment artifacts'
+      inputs:
+        SourceFolder: Deployment
+        Contents: |
+          **/*.json
+          **/*.ps1
+        TargetFolder: '$(build.artifactstagingdirectory)/Deployment'
+
+    - task: PublishBuildArtifacts@1
+      displayName: 'Publish web app artifacts'
+      inputs:
+        PathtoPublish: '$(build.artifactstagingdirectory)'
+        ArtifactName: '$(Build.BuildNumber)_$(BuildConfiguration)'

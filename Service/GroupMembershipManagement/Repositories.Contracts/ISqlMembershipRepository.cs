@@ -1,0 +1,36 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using SqlMembershipObtainer.Entities;
+using System.Collections.Generic;
+using System.Threading.Tasks;
+
+namespace Repositories.Contracts
+{
+    public enum AttributeSearchMode
+    {
+        Prefix = 0,
+        Substring = 1
+    }
+
+    public interface ISqlMembershipRepository
+    {
+        Task<List<PersonEntity>> GetChildEntitiesAsync(string filter, int personnelNumber, string tableName, int depth);
+        Task<(int maxDepth, int id)> GetOrgLeaderDetailsAsync(string azureObjectId, string tableName);
+        Task<List<PersonEntity>> FilterChildEntitiesAsync(string query, string tableName);
+        Task<bool> IsUserInFilterAsync(string filter, string tableName, string azureObjectId);
+        Task<bool> CheckIfTableExistsAsync(string tableName);
+        Task<List<string>> GetColumnNamesAsync(string tableName);
+        Task<(int maxDepth, string azureObjectId)> GetOrgLeaderAsync(int employeeId, string tableName);
+        Task<List<(string Name, string Type)>> GetColumnDetailsAsync(string tableName);
+        Task<bool> CheckIfMappingsTableExistsAsync(string tableName);
+        Task<List<(string Code, string Description)>> GetAttributeMappingsAsync(string attribute, string tableName);
+        Task<(List<(string Code, string Description)> Mappings, bool HasMore)> GetAttributeMappingsPageAsync(string attribute, string tableName, string? search = null, int top = 500, AttributeSearchMode matchMode = AttributeSearchMode.Prefix);
+        Task<List<(string Code, string Description)>> GetAttributeMappingsByCodesAsync(string attribute, string tableName, IEnumerable<string> codes);
+        Task<List<string>> GetAttributeValuesAsync(string attribute, bool hasMapping, string tableName);
+        Task<Dictionary<int, string>> ValidateFiltersAsync(Dictionary<int, string> sqlFilters, string tableName);
+        Task<Dictionary<string, string>?> GetUserAttributesAsync(string azureObjectId, string tableName);
+        Task<int?> GetUserEmployeeIdAsync(string azureObjectId, string tableName);
+        Task<Dictionary<string, Dictionary<string, string>>> GetUserAttributesBatchAsync(IEnumerable<string> userIds, string tableName);
+    }
+}

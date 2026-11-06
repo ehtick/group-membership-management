@@ -1,0 +1,136 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import { createAsyncThunk } from '@reduxjs/toolkit';
+import { ThunkConfig } from './store';
+import { SqlMembershipAttribute, SqlMembershipSource } from '../models';
+import { GetAttributeMappingsResponse } from '../models/GetAttributeMappingsResponse';
+import { GetAttributeMappingsRequest } from '../models/GetAttributeMappingsRequest';
+import { ResolveAttributeMappingsRequest } from '../models/ResolveAttributeMappingsRequest';
+import { ResolveAttributeMappingsResponse } from '../models/ResolveAttributeMappingsResponse';
+import { GetAttributeValuesResponse } from '../models/GetAttributeValuesResponse';
+import { ValidateSqlFiltersResponse } from '../models/ValidateSqlFiltersResponse';
+
+export const fetchDefaultSqlMembershipSource = createAsyncThunk<SqlMembershipSource, void, ThunkConfig>(
+    'sqlMembershipSources/fetchDefaultSqlMembershipSource',
+    async (_, { extra }) => {
+      const { gmmApi } = extra.apis;
+
+      try {
+        return await gmmApi.sqlMembershipSources.fetchDefaultSqlMembershipSource();
+      } catch (error) {
+        throw new Error('Failed to fetch default SQL membership source!');
+      }
+    }
+);
+
+export const fetchDefaultSqlMembershipSourceAttributes = createAsyncThunk<SqlMembershipAttribute[], void, ThunkConfig>(
+    'settings/fetchSqlFilterAttributes',
+    async (_, { extra }) => {
+      const { gmmApi } = extra.apis;
+
+      try {
+        return await gmmApi.sqlMembershipSources.fetchDefaultSqlMembershipSourceAttributes();
+      } catch (error) {
+        throw new Error('Failed to fetch default SQL filter attributes!');
+      }
+    }
+  );
+
+export const fetchAttributeMappings = createAsyncThunk<GetAttributeMappingsResponse, GetAttributeMappingsRequest, ThunkConfig>(
+  'fetchSqlFilterAttributeMappings',
+  async (request, { extra }) => {
+    const { gmmApi } = extra.apis;
+    let payload: GetAttributeMappingsResponse;
+    try {
+      if (request.hasMapping && request.attribute.endsWith("_Code")) {
+        const response = await gmmApi.sqlMembershipSources.fetchDefaultSqlMembershipSourceAttributeMappings(request.attribute.slice(0, -5), request.search, request.top);
+        payload = { mappings: response.mappings, attribute: request.attribute, type: request.type, hasMore: response.hasMore, search: request.search };
+      }
+      else if (request.type === "bit") {
+        payload = { mappings: [{ description: "Yes", code: "1" }, { description: "No", code: "0" }], attribute: request.attribute, type: request.type, hasMore: false, search: request.search };
+      }
+      else {
+        payload = { mappings: [], attribute: request.attribute, type: request.type, hasMore: false, search: request.search };
+      }
+      return payload;
+    } catch (error) {
+      payload = { mappings: [], attribute: request.attribute, type: request.type, hasMore: false, search: request.search };
+      return payload;
+    }
+  }
+);
+
+export const resolveAttributeMappings = createAsyncThunk<ResolveAttributeMappingsResponse, ResolveAttributeMappingsRequest, ThunkConfig>(
+  'resolveSqlFilterAttributeMappings',
+  async (request, { extra }) => {
+    const { gmmApi } = extra.apis;
+    const emptyPayload: ResolveAttributeMappingsResponse = { mappings: [], attribute: request.attribute, type: request.type };
+
+    if (!request.hasMapping || !request.attribute.endsWith("_Code") || request.codes.length === 0) {
+      return emptyPayload;
+    }
+
+    try {
+      const response = await gmmApi.sqlMembershipSources.resolveDefaultSqlMembershipSourceAttributeMappings(request.attribute.slice(0, -5), request.codes);
+      return { mappings: response, attribute: request.attribute, type: request.type };
+    } catch (error) {
+      return emptyPayload;
+    }
+  }
+);
+
+export const fetchAttributeValues = createAsyncThunk<GetAttributeValuesResponse, SqlMembershipAttribute, ThunkConfig>(
+  'fetchSqlFilterAttributeValues',
+  async (attribute, { extra }) => {
+    const { gmmApi } = extra.apis;
+    let payload: GetAttributeValuesResponse;
+    try {
+      const response = await gmmApi.sqlMembershipSources.fetchDefaultSqlMembershipSourceAttributeValues(attribute);
+      payload = { values: response, attribute: attribute.name };
+      return payload;
+    } catch (error) {
+      payload = { values: [], attribute: attribute.name };
+      return payload;
+    }
+  }
+);
+
+export const patchDefaultSqlMembershipSourceCustomLabel = createAsyncThunk<void, string, ThunkConfig>(
+    'sqlMembershipSources/patchDefaultSqlMembershipSourceCustomLabel',
+    async (customLabel, { extra }) => {
+      const { gmmApi } = extra.apis;
+
+      try {
+        return await gmmApi.sqlMembershipSources.patchDefaultSqlMembershipSourceCustomLabel(customLabel);
+      } catch (error) {
+        throw new Error('Failed to update default SQL membership source custom label!');
+      }
+    }
+);
+
+export const patchDefaultSqlMembershipSourceAttributes = createAsyncThunk<void, SqlMembershipAttribute[], ThunkConfig>(
+    'sqlMembershipSources/patchDefaultSqlMembershipSourceAttributes',
+    async (attributes, { extra }) => {
+      const { gmmApi } = extra.apis;
+
+      try {
+        return await gmmApi.sqlMembershipSources.patchDefaultSqlMembershipSourceAttributes(attributes);
+      } catch (error) {
+        throw new Error('Failed to update default SQL membership source attributes!');
+      }
+    }
+);
+
+export const validateSqlFilters = createAsyncThunk<ValidateSqlFiltersResponse, Map<number, string>, ThunkConfig>(
+  'sqlMembershipSources/validateSqlFilters',
+  async (filtersMap, { extra }) => {
+    const { gmmApi } = extra.apis;
+
+    try {
+      return await gmmApi.sqlMembershipSources.validateSqlFilters(filtersMap);
+    } catch (error) {
+      throw new Error('Failed to check Sql filter validation!');
+    }
+  }
+);

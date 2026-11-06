@@ -1,44 +1,64 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.ServiceBus;
+using Models;
+using Models.ServiceBus;
 using Repositories.Contracts;
 using System.Collections.Generic;
+using System.Linq;
 using System.Text;
 using System.Text.Json;
+using System.Text.Json.Nodes;
 using System.Threading.Tasks;
 
 namespace Tests.Repositories
 {
     public class MockServiceBusTopicsRepository : IServiceBusTopicsRepository
     {
-        public Dictionary<string, List<Message>> Subscriptions { get; private set; } = new Dictionary<string, List<Message>>();
+        public Dictionary<string, List<ServiceBusMessage>> Subscriptions { get; private set; } = new Dictionary<string, List<ServiceBusMessage>>();
 
         public async Task AddMessageAsync(SyncJob job)
         {
-            var message = CreateMessage(job);
-            var syncType = message.UserProperties["Type"].ToString();
-            if (Subscriptions.ContainsKey(syncType))
+            var allQueries = JsonNode.Parse(job.Query).AsArray();
+            var queryTypes = allQueries.Select(x => x["type"])
+                                       .OfType<JsonValue>()
+                                       .Select(x => x.GetValue<string>())
+                                       .Distinct()
+                                       .ToList();
+
+            foreach (var queryType in queryTypes)
             {
-                Subscriptions[syncType].Add(message);
-            }
-            else
-            {
-                Subscriptions.Add(syncType, new List<Message> { message });
+                var message = CreateMessage(job);
+                if (Subscriptions.ContainsKey(queryType))
+                {
+                    Subscriptions[queryType].Add(message);
+                }
+                else
+                {
+                    Subscriptions.Add(queryType, new List<ServiceBusMessage> { message });
+                }
             }
 
             await Task.CompletedTask;
         }
 
-        public Message CreateMessage(SyncJob job)
+        public Task AddMessageAsync(ServiceBusMessage message)
+        {
+            throw new System.NotImplementedException();
+        }
+
+        public Task AddMessagesAsync(IEnumerable<ServiceBusMessage> messages)
+        {
+            throw new System.NotImplementedException();
+        }
+
+        public ServiceBusMessage CreateMessage(SyncJob job)
         {
             var body = JsonSerializer.Serialize(job);
-            var message = new Message
+            var message = new ServiceBusMessage
             {
                 Body = Encoding.UTF8.GetBytes(body)
             };
 
-            message.UserProperties.Add("Type", job.Type);
             message.MessageId = $"{job.PartitionKey}_{job.RowKey}_{job.RunId}";
 
             return message;

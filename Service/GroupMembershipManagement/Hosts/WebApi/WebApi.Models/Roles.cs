@@ -1,0 +1,29 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+namespace WebApi.Models
+{
+    public class Roles
+    {
+        public const string JOB_OWNER_READER = "Job.Read.OwnedBy";
+        public const string JOB_OWNER_ENABLER = "Job.Enable.OwnedBy";
+        public const string JOB_OWNER_DELETER = "Job.Delete.OwnedBy";
+        public const string JOB_OWNER_CONFIGURATION_EDITOR = "Job.EditConfiguration.OwnedBy";
+        public const string JOB_OWNER_WRITER = "Job.ReadWrite.OwnedBy";
+        public const string JOB_TENANT_READER = "Job.Read.All";
+        public const string JOB_TENANT_WRITER = "Job.ReadWrite.All";
+        public const string SUBMISSION_REVIEWER = "Submission.ReadWrite.All";
+        public const string CUSTOM_MEMBERSHIP_PROVIDER_ADMINISTRATOR = "CustomSource.ReadWrite.All";
+        public const string RESET_ADMINISTRATOR = "Operations.Reset";
+        public const string GENERAL_SETTINGS_ADMINISTRATOR = "GeneralSettings.ReadWrite.All";
+        public const string AUTO_APPROVER_ADMINISTRATOR = "AutoApprover.ReadWrite.All";
+        public const string AI_ONBOARDING_CHAT = "AI.Onboarding.Chat";
+        public const string AI_SETTINGS_ADMINISTRATOR = "AISettings.ReadWrite.All";
+        public const string AI_SYNC_JOB = "AI.SyncJob.All";
+        public const string TEAMS_CHANNEL_ONBOARDER = "TeamsChannel.Onboard.OwnedBy";
+        public const string GENERAL_SETTINGS_READER = "GeneralSettings.Read.All";
+        public const string AUTO_APPROVER_READER = "AutoApprover.Read.All";
+        public const string AI_SETTINGS_READER = "AISettings.Read.All";
+        public const string CUSTOM_MEMBERSHIP_PROVIDER_READER = "CustomSource.Read.All";
+    }
+}

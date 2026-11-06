@@ -1,0 +1,356 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Hosts.AzureMaintenance;
+using Microsoft.Extensions.Logging;
+using Models;
+using Models.AzureMaintenance;
+using Models.Notifications;
+using Models.ServiceBus;
+using Repositories.Contracts;
+using Repositories.Contracts.DestinationResolution;
+using Repositories.Contracts.InjectConfig;
+using Services.Contracts;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Text;
+using System.Text.Json;
+using System.Threading.Tasks;
+
+
+namespace Services
+{
+    public class AzureMaintenanceService : IAzureMaintenanceService
+	{
+        // Any DateTime at or below this value is treated as an unset sentinel.
+        // Covers both the C# default SqlDateTime.MinValue (1753-01-01) and the
+        // SQL column default (1601-01-01) used for never-populated rows.
+        private static readonly DateTime _minRealDate = new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+
+        private readonly IDatabaseSyncJobsRepository _syncJobRepository = null;
+        private readonly IDestinationResolver _destinationResolver = null;
+        private readonly IDatabasePurgedSyncJobsRepository _purgedSyncJobRepository = null;
+        private readonly IGraphGroupRepository _graphGroupRepository = null;
+        private readonly IHandleInactiveJobsConfig _handleInactiveJobsConfig = null;
+        private readonly IServiceBusQueueRepository _notificationsQueueRepository;
+        private readonly ILogger<AzureMaintenanceService> _logger;
+        private readonly ISyncJobHistoryRepository _syncJobHistoryRepository;
+        private readonly ISyncJobChangeRepository _syncJobChangeRepository;
+        private readonly string _gmmOwnerAppName;
+
+        public AzureMaintenanceService(
+            IDatabaseSyncJobsRepository syncJobRepository,
+            IDestinationResolver destinationResolver,
+            IDatabasePurgedSyncJobsRepository purgedSyncJobRepository,
+            IGraphGroupRepository graphGroupRepository,
+			IHandleInactiveJobsConfig handleInactiveJobsConfig,
+            IServiceBusQueueRepository notificationQueueRepository,
+            ILogger<AzureMaintenanceService> logger,
+            ISyncJobHistoryRepository syncJobHistoryRepository,
+            ISyncJobChangeRepository syncJobChangeRepository,
+            string gmmOwnerAppName = null)
+        {
+            _syncJobRepository = syncJobRepository ?? throw new ArgumentNullException(nameof(syncJobRepository));
+            _destinationResolver = destinationResolver ?? throw new ArgumentNullException(nameof(destinationResolver));
+            _purgedSyncJobRepository = purgedSyncJobRepository ?? throw new ArgumentNullException(nameof(purgedSyncJobRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+            _handleInactiveJobsConfig = handleInactiveJobsConfig ?? throw new ArgumentNullException(nameof(handleInactiveJobsConfig));
+            _notificationsQueueRepository = notificationQueueRepository ?? throw new ArgumentNullException(nameof(notificationQueueRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _syncJobHistoryRepository = syncJobHistoryRepository ?? throw new ArgumentNullException(nameof(syncJobHistoryRepository));
+            _syncJobChangeRepository = syncJobChangeRepository ?? throw new ArgumentNullException(nameof(syncJobChangeRepository));
+            _gmmOwnerAppName = gmmOwnerAppName ?? string.Empty;
+        }
+
+        public async Task<List<SyncJob>> GetSyncJobsAsync()
+        {
+            var jobs = await _syncJobRepository.GetSyncJobsAsync(true, PurgeEligibleStatuses.All);
+
+            var jobsToBePurged = ApplyPurgingFilters(jobs).ToList();
+
+            _logger.JobsToBePurged(jobsToBePurged.Count);
+
+            return jobsToBePurged;
+        }
+
+        private IEnumerable<SyncJob> ApplyPurgingFilters(IEnumerable<SyncJob> jobs)
+        {
+            var purgeIfOlderThan = DateTime.UtcNow.AddDays(-_handleInactiveJobsConfig.NumberOfDaysBeforePurging);
+            return jobs.Where(x =>
+            {
+                // Never-run jobs have LastRunTime at a sentinel (1753/1601);
+                // fall back to InitialOnboardingDate so age is measured from
+                // row creation. Guard against any row missing both anchors.
+                var inactivitySince = x.LastRunTime > _minRealDate ? x.LastRunTime : x.InitialOnboardingDate;
+                return inactivitySince > _minRealDate && inactivitySince <= purgeIfOlderThan;
+            });
+        }
+
+        public async Task<string> GetGroupNameAsync(Guid groupId)
+        {
+            return await _graphGroupRepository.GetGroupNameAsync(groupId);
+        }
+
+        public async Task SendPurgingEmailAsync(PurgedSyncJob job, NotificationMessageType notificationType, Guid originalSyncJobId = default)
+        {
+            var groupName = await GetGroupNameAsync(job.TargetOfficeGroupId);
+
+            // [4]/[5] ISO UTC timestamps power the styled Final Notice fallback. The legacy
+            // adaptive card keeps reading [2] (the deletion date string).
+            var affiliationRemovedUtcIso = DateTime.UtcNow.ToString(
+                "o", System.Globalization.CultureInfo.InvariantCulture);
+            var lastSuccessfulRunIso = job.LastSuccessfulRunTime > _minRealDate
+                ? job.LastSuccessfulRunTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                : string.Empty;
+
+            // [6] Rejection timestamp for the SubmissionRejected variant. Look up the latest
+            // SubmissionRejected change for the ORIGINAL SyncJob.Id (the SyncJobs row is already
+            // deleted at this point, but SyncJobChanges rows survive — there is no FK/cascade).
+            string rejectedOnUtcIso = string.Empty;
+            if (originalSyncJobId != Guid.Empty &&
+                string.Equals(job.Status, "SubmissionRejected", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var lastRejection = await _syncJobChangeRepository
+                        .GetLatestSubmissionRejectedChangeBySyncJobIdAsync(originalSyncJobId);
+                    if (lastRejection != null && lastRejection.ChangeTime > _minRealDate)
+                    {
+                        rejectedOnUtcIso = DateTime.SpecifyKind(lastRejection.ChangeTime, DateTimeKind.Utc)
+                            .ToString("o", System.Globalization.CultureInfo.InvariantCulture);
+                    }
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Failed to load latest SubmissionRejected change for original SyncJob {SyncJobId} during Final Notice email.",
+                        originalSyncJobId);
+                }
+            }
+
+            var additionalContentParams = new[]
+            {
+                job.TargetOfficeGroupId.ToString(),
+                groupName,
+                DateTime.UtcNow.AddDays(_handleInactiveJobsConfig.NumberOfDaysBeforeDeletion).ToString(),
+                // [3] Prior status drives the Generic vs SubmissionRejected variant in the fallback.
+                job.Status ?? string.Empty,
+                affiliationRemovedUtcIso,
+                lastSuccessfulRunIso,
+                // [6] Rejected-on ISO UTC (SubmissionRejected variant only; empty otherwise).
+                rejectedOnUtcIso
+            };
+
+            var messageContent = new Dictionary<string, Object>
+            {
+                { "SyncJob", job },
+                { "AdditionalContentParameters", additionalContentParams }
+            };
+
+            await SendEmailAsync(messageContent, job.Id, job.RunId, notificationType);
+        }
+
+        public async Task SendWarningEmailAsync(SyncJob job, NotificationMessageType notificationType)
+        {
+            var groupName = await GetGroupNameAsync(job.TargetOfficeGroupId);
+            string[] additionalContentParams;
+
+            // Show creation date for never-run jobs instead of the LastRunTime sentinel.
+            var inactivitySince = job.LastRunTime > _minRealDate ? job.LastRunTime : job.InitialOnboardingDate;
+            if (inactivitySince <= _minRealDate)
+            {
+                inactivitySince = DateTime.UtcNow; // Fallback to current date if both are sentinel
+            }
+            var purgeDate = inactivitySince.AddDays(_handleInactiveJobsConfig.NumberOfDaysBeforePurging);
+
+            // Always emit LastSuccessfulRunTimeIso so the fallback can render the Last Sync row
+            // (PST timestamp when set, otherwise "Never - new onboarding attempt"). RejectionReason
+            // stays SubmissionRejected-only because it's only meaningful for that variant.
+            string lastSuccessfulRunTimeIso = job.LastSuccessfulRunTime > _minRealDate
+                ? job.LastSuccessfulRunTime.ToString("o", System.Globalization.CultureInfo.InvariantCulture)
+                : string.Empty;
+
+            string rejectionReason = string.Empty;
+            if (string.Equals(job.Status, "SubmissionRejected", StringComparison.OrdinalIgnoreCase))
+            {
+                try
+                {
+                    var lastRejection = await _syncJobChangeRepository
+                        .GetLatestSubmissionRejectedChangeBySyncJobIdAsync(job.Id);
+                    rejectionReason = lastRejection?.BusinessJustification ?? string.Empty;
+                }
+                catch (Exception ex)
+                {
+                    _logger.LogError(ex,
+                        "Failed to load latest SubmissionRejected change for SyncJob {SyncJobId}.",
+                        job.Id);
+                }
+            }
+
+            additionalContentParams = new[]
+            {
+                job.Status,
+                inactivitySince.ToString("MMMM dd, yyyy"),
+                _handleInactiveJobsConfig.NumberOfDaysBeforePurging.ToString(),
+                purgeDate.ToString("MMMM dd, yyyy"),
+                job.TargetOfficeGroupId.ToString(),
+                groupName,
+                // [6]/[7] ISO UTC timestamps for the fallback HTML email; adaptive card keeps using [1]/[3].
+                inactivitySince.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                purgeDate.ToString("o", System.Globalization.CultureInfo.InvariantCulture),
+                // [8] LastSuccessfulRunTimeUtc (ISO 8601, empty when never run); always emitted so
+                //     the fallback can render the Last Sync row for every status. [9] is rejection
+                //     reason (SubmissionRejected only; empty otherwise).
+                lastSuccessfulRunTimeIso,
+                rejectionReason,
+                // [10] GMM owner app name for the NotOwnerOfDestinationGroup action-checklist token.
+                _gmmOwnerAppName
+            };
+
+            var messageContent = new Dictionary<string, Object>
+            {
+                { "SyncJob", job },
+                { "AdditionalContentParameters", additionalContentParams }
+            };
+
+            await SendEmailAsync(messageContent, job.Id, job.RunId, notificationType);
+        }
+
+        private async Task SendEmailAsync(Dictionary<string, Object> messageContent, Guid jobId, Guid? runId, NotificationMessageType notificationType)
+        {
+            var body = Encoding.UTF8.GetBytes(System.Text.Json.JsonSerializer.Serialize(messageContent));
+            var message = new ServiceBusMessage
+            {
+                MessageId = $"{jobId}_{runId}_{notificationType}",
+                Body = body
+            };
+            message.ApplicationProperties.Add("MessageType", notificationType.ToString());
+            await _notificationsQueueRepository.SendMessageAsync(message);
+            _logger.SentNotificationMessage(message.MessageId);
+        }
+        private async Task<Guid> GetGroupIdAsync(SyncJob syncJob)
+        {
+            var destination = await _destinationResolver.ResolveAsync(syncJob);
+            return destination switch
+            {
+                ResolvedGroupDestination groupDestination => groupDestination.ObjectId,
+                ResolvedTeamsChannelDestination channelDestination => channelDestination.TeamObjectId,
+                _ => Guid.Empty
+            };
+        }
+
+        public async Task<List<PurgedSyncJob>> BackupInactiveJobsAsync(List<SyncJob> syncJobs)
+        {
+            if (syncJobs.Count <= 0) return new List<PurgedSyncJob>();
+
+            var purgedJobs = await MapSyncJobsToPurgedSyncJobsAsync(syncJobs);
+
+            _logger.PurgedJobs(purgedJobs.Count);
+
+            await _purgedSyncJobRepository.InsertPurgedSyncJobsAsync(purgedJobs);
+
+            return purgedJobs;
+        }
+
+        private async Task<List<PurgedSyncJob>> MapSyncJobsToPurgedSyncJobsAsync(List<SyncJob> syncJobs)
+        {
+            var purgedSyncJobs = new List<PurgedSyncJob>();
+
+            foreach (var job in syncJobs)
+            {
+                var purgedJob = await MapSyncJobToPurgedSyncJobAsync(job);
+                var groupName = await GetGroupNameAsync(purgedJob.TargetOfficeGroupId);
+                _logger.PurgingJob(purgedJob.TargetOfficeGroupId, groupName, purgedJob.Status);
+                purgedSyncJobs.Add(purgedJob);
+            }
+
+            return purgedSyncJobs;
+        }
+
+        private async Task<PurgedSyncJob> MapSyncJobToPurgedSyncJobAsync(SyncJob job)
+        {
+            var groupId = await GetGroupIdAsync(job);
+            var destination = JsonSerializer.Serialize(new[]
+            {
+                new { type = job.MembershipType.ToString(), value = new { objectId = groupId } }
+            });
+
+            return new PurgedSyncJob
+            {
+                Id = Guid.NewGuid(),
+                IgnoreThresholdOnce = job.IgnoreThresholdOnce,
+                IsDryRunEnabled = job.IsDryRunEnabled,
+                DryRunTimeStamp = job.DryRunTimeStamp,
+                LastRunTime = job.LastRunTime,
+                LastSuccessfulRunTime = job.LastSuccessfulRunTime,
+                LastSuccessfulStartTime = job.LastSuccessfulStartTime,
+                StartDate = job.StartDate,
+                TargetOfficeGroupId = groupId,
+                Destination = destination,
+                AllowEmptyDestination = job.AllowEmptyDestination,
+                RunId = job.RunId,
+                Period = job.Period,
+                ThresholdPercentageForAdditions = job.ThresholdPercentageForAdditions,
+                ThresholdPercentageForRemovals = job.ThresholdPercentageForRemovals,
+                Query = job.Query,
+                Requestor = job.Requestor,
+                Status = job.Status,
+                PurgedAt = DateTime.UtcNow
+            };
+        }
+
+        public async Task<int> RemoveBackupsAsync()
+        {
+            var cutOffDate = DateTime.UtcNow.AddDays(-_handleInactiveJobsConfig.NumberOfDaysBeforeDeletion);
+            var jobs = await _purgedSyncJobRepository.GetPurgedSyncJobsAsync(cutOffDate);
+            if (jobs.ToList().Count <= 0) return 0;
+            _logger.JobsToBeDeleted(jobs.Count());
+            return await _purgedSyncJobRepository.DeletePurgedSyncJobsAsync(jobs);
+        }
+
+        public async Task RemoveInactiveJobsAsync(IEnumerable<SyncJob> jobs)
+        {
+            await _syncJobRepository.DeleteSyncJobsAsync(jobs);
+            _logger.JobsDeleted(jobs.Count());
+        }
+
+        public async Task<List<SyncJob>> GetJobsApproachingPurgingAsync()
+        {
+            var jobsEligibleForPurging = await _syncJobRepository.GetSyncJobsAsync(false, PurgeEligibleStatuses.All);
+
+            var warningTargetDate = DateTime.UtcNow.Date.AddDays(_handleInactiveJobsConfig.NumberOfDaysBeforePurgingToSendWarning - _handleInactiveJobsConfig.NumberOfDaysBeforePurging);
+
+            var jobsNeedingWarning = jobsEligibleForPurging
+                .Where(job =>
+                {
+                    // Same anchor rule as ApplyPurgingFilters: fall back to
+                    // InitialOnboardingDate when the job has never run.
+                    var inactivitySince = job.LastRunTime > _minRealDate ? job.LastRunTime : job.InitialOnboardingDate;
+                    return inactivitySince > _minRealDate && inactivitySince.Date == warningTargetDate;
+                })
+                .ToList();
+
+            _logger.JobsNeedingWarning(warningTargetDate, jobsNeedingWarning.Count);
+
+            return jobsNeedingWarning;
+        }
+
+        public async Task<int> PurgeOldHistoryAsync()
+        {
+            var retentionDays = _handleInactiveJobsConfig.JobHistoryRetentionDays > 0
+                ? _handleInactiveJobsConfig.JobHistoryRetentionDays
+                : 30;
+
+            var cutoffDate = DateTime.UtcNow.AddDays(-retentionDays);
+
+            _logger.StartingHistoryPurge(cutoffDate);
+
+            var deletedCount = await _syncJobHistoryRepository.DeleteOlderThanAsync(cutoffDate);
+
+            _logger.HistoryPurged(deletedCount, retentionDays);
+
+            return deletedCount;
+        }
+    }
+}

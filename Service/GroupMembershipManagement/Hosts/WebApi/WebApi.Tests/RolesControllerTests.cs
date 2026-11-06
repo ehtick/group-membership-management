@@ -1,0 +1,180 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using System.Security.Claims;
+using WebApi.Controllers.v1.Roles;
+using WebApi.Models;
+using WebApi.Models.DTOs;
+
+namespace Services.Tests
+{
+    [TestClass]
+    public class RolesControllerTests
+    {
+
+        private RolesController _rolesController = null!;
+
+        [TestInitialize]
+        public void Initialize()
+        {
+            _rolesController = new RolesController();
+        }
+
+        [TestMethod]
+        public void GetAllRolesStatus_ForVariousUsers()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_WRITER),
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_ENABLER),
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_DELETER),
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_CONFIGURATION_EDITOR),
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_READER),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim(ClaimTypes.Role, Roles.SUBMISSION_REVIEWER),
+                new Claim(ClaimTypes.Role, Roles.AUTO_APPROVER_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.CUSTOM_MEMBERSHIP_PROVIDER_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.RESET_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.GENERAL_SETTINGS_ADMINISTRATOR)
+            };
+
+            _rolesController.ControllerContext = CreateControllerContext(claims);
+
+            var result = _rolesController.GetAllRoles();
+
+            Assert.IsNotNull(result);
+            var okResult = result.Result as OkObjectResult;
+            Assert.IsNotNull(okResult);
+            var rolesStatuses = okResult.Value as RolesObject;
+            Assert.IsNotNull(rolesStatuses);
+            Assert.IsTrue(rolesStatuses.IsJobOwnerReader);
+            Assert.IsTrue(rolesStatuses.IsJobOwnerEnabler);
+            Assert.IsTrue(rolesStatuses.IsJobOwnerDeleter);
+            Assert.IsTrue(rolesStatuses.IsJobOwnerWriter);
+            Assert.IsTrue(rolesStatuses.IsJobTenantReader);
+            Assert.IsTrue(rolesStatuses.IsJobTenantWriter);
+            Assert.IsTrue(rolesStatuses.IsSubmissionReviewer);
+            Assert.IsTrue(rolesStatuses.IsAutoApproverAdministrator);
+            Assert.IsTrue(rolesStatuses.IsCustomMembershipProviderAdministrator);
+            Assert.IsTrue(rolesStatuses.IsOperationsResetAdministrator);
+            Assert.IsTrue(rolesStatuses.IsGeneralSettingsAdministrator);
+        }
+
+        [TestMethod]
+        public void GetAllRoles_ReflectsTeamsChannelOnboarder()
+        {
+            // getAllRoles exposes whether the user has the TeamsChannel onboarder role.
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_WRITER),
+                new Claim(ClaimTypes.Role, Roles.TEAMS_CHANNEL_ONBOARDER)
+            });
+
+            var withRole = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+            Assert.IsTrue(withRole.IsTeamsChannelOnboarder, "Should be true when the caller holds TEAMS_CHANNEL_ONBOARDER");
+
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_WRITER)
+            });
+
+            var withoutRole = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+            Assert.IsFalse(withoutRole.IsTeamsChannelOnboarder, "Should be false when the caller lacks TEAMS_CHANNEL_ONBOARDER");
+        }
+
+        [TestMethod]
+        public void GetAllRoles_ReaderFlagsReflectReadRoles()
+        {
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.GENERAL_SETTINGS_READER),
+                new Claim(ClaimTypes.Role, Roles.AUTO_APPROVER_READER),
+                new Claim(ClaimTypes.Role, Roles.AI_SETTINGS_READER),
+                new Claim(ClaimTypes.Role, Roles.CUSTOM_MEMBERSHIP_PROVIDER_READER)
+            });
+
+            var roles = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+
+            Assert.IsTrue(roles.IsGeneralSettingsReader);
+            Assert.IsTrue(roles.IsAutoApproverReader);
+            Assert.IsTrue(roles.IsAISettingsReader);
+            Assert.IsTrue(roles.IsCustomMembershipProviderReader);
+
+            // A reader must never be reported as able to change anything.
+            Assert.IsFalse(roles.IsGeneralSettingsAdministrator);
+            Assert.IsFalse(roles.IsAutoApproverAdministrator);
+            Assert.IsFalse(roles.IsAISettingsAdministrator);
+            Assert.IsFalse(roles.IsCustomMembershipProviderAdministrator);
+        }
+
+        [TestMethod]
+        public void GetAllRoles_AdministratorImpliesReader()
+        {
+            // Existing administrators must report as readers without being granted the new roles,
+            // otherwise the Admin Center would become unreachable for them on deployment.
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.GENERAL_SETTINGS_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.AUTO_APPROVER_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.AI_SETTINGS_ADMINISTRATOR),
+                new Claim(ClaimTypes.Role, Roles.CUSTOM_MEMBERSHIP_PROVIDER_ADMINISTRATOR)
+            });
+
+            var roles = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+
+            Assert.IsTrue(roles.IsGeneralSettingsReader);
+            Assert.IsTrue(roles.IsAutoApproverReader);
+            Assert.IsTrue(roles.IsAISettingsReader);
+            Assert.IsTrue(roles.IsCustomMembershipProviderReader);
+
+            Assert.IsTrue(roles.IsGeneralSettingsAdministrator);
+            Assert.IsTrue(roles.IsAutoApproverAdministrator);
+            Assert.IsTrue(roles.IsAISettingsAdministrator);
+            Assert.IsTrue(roles.IsCustomMembershipProviderAdministrator);
+        }
+
+        [TestMethod]
+        public void GetAllRoles_ReaderAreasAreIndependent()
+        {
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.AI_SETTINGS_READER)
+            });
+
+            var roles = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+
+            Assert.IsTrue(roles.IsAISettingsReader);
+            Assert.IsFalse(roles.IsGeneralSettingsReader);
+            Assert.IsFalse(roles.IsAutoApproverReader);
+            Assert.IsFalse(roles.IsCustomMembershipProviderReader);
+        }
+
+        [TestMethod]
+        public void GetAllRoles_ReaderFlagsAreFalseWithoutSettingsRoles()
+        {
+            _rolesController.ControllerContext = CreateControllerContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_READER)
+            });
+
+            var roles = ((_rolesController.GetAllRoles().Result as OkObjectResult)!.Value as RolesObject)!;
+
+            Assert.IsFalse(roles.IsGeneralSettingsReader);
+            Assert.IsFalse(roles.IsAutoApproverReader);
+            Assert.IsFalse(roles.IsAISettingsReader);
+            Assert.IsFalse(roles.IsCustomMembershipProviderReader);
+        }
+
+        private ControllerContext CreateControllerContext(List<Claim> claims)
+        {
+            var identity = new ClaimsIdentity(claims, "TestAuthType");
+            var principal = new ClaimsPrincipal(identity);
+            var httpContext = new DefaultHttpContext();
+            httpContext.User = principal;
+
+            return new ControllerContext { HttpContext = httpContext };
+        }
+    }
+}

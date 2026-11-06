@@ -1,0 +1,296 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Hosts.WebApi;
+using Microsoft.AspNetCore.Http;
+using Microsoft.EntityFrameworkCore;
+using Models;
+using Models.SyncJobChange;
+using Repositories.Contracts;
+using Repositories.Contracts.InjectConfig;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using System.Net;
+using System.Text.Json;
+using WebApi.Models;
+using Microsoft.Extensions.Logging;
+using SyncJobDetailsDTO = WebApi.Models.DTOs.SyncJobDetails;
+
+namespace Services
+{
+    public class GetJobDetailsHandler : RequestHandlerBase<GetJobDetailsRequest, GetJobDetailsResponse>
+    {
+        private readonly ILogger<GetJobDetailsHandler> _logger;
+        private readonly IDatabaseSyncJobsRepository _databaseSyncJobsRepository;
+        private readonly ISyncJobChangeRepository _syncJobChangesRepository;
+        private readonly IDatabaseTitlesRepository _titlesRepository;
+        private readonly IGraphGroupRepository _graphGroupRepository;
+        private readonly ITeamsChannelRepository _teamsChannelRepository;
+        private readonly IHttpContextAccessor _httpContextAccessor;
+        private readonly IHandleInactiveJobsConfig _handleInactiveJobsConfig;
+
+        public GetJobDetailsHandler(ILogger<GetJobDetailsHandler> logger,
+                              IDatabaseSyncJobsRepository databaseSyncJobsRepository,
+                              ISyncJobChangeRepository syncJobChangesRepository,
+                              IDatabaseTitlesRepository titlesRepository,
+                              IGraphGroupRepository graphGroupRepository,
+                              ITeamsChannelRepository teamsChannelRepository,
+                              IHttpContextAccessor httpContextAccessor,
+                              IHandleInactiveJobsConfig handleInactiveJobsConfig) : base(logger)
+        {
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _databaseSyncJobsRepository = databaseSyncJobsRepository ?? throw new ArgumentNullException(nameof(databaseSyncJobsRepository));
+            _syncJobChangesRepository = syncJobChangesRepository ?? throw new ArgumentNullException(nameof(syncJobChangesRepository));
+            _titlesRepository = titlesRepository ?? throw new ArgumentNullException(nameof(titlesRepository));
+            _graphGroupRepository = graphGroupRepository ?? throw new ArgumentNullException(nameof(graphGroupRepository));
+            _teamsChannelRepository = teamsChannelRepository ?? throw new ArgumentNullException(nameof(teamsChannelRepository));
+            _httpContextAccessor = httpContextAccessor ?? throw new ArgumentNullException(nameof(httpContextAccessor));
+            _handleInactiveJobsConfig = handleInactiveJobsConfig ?? throw new ArgumentNullException(nameof(handleInactiveJobsConfig));
+        }
+
+        protected override async Task<GetJobDetailsResponse> ExecuteCoreAsync(GetJobDetailsRequest request)
+        {
+            var endpoints = new List<string>();
+            var response = new GetJobDetailsResponse
+            {
+                StatusCode = HttpStatusCode.OK
+            };
+
+            var (job, statusCode) = await GetSyncJobAsync(request.SyncJobId);
+
+            if (statusCode != HttpStatusCode.OK)
+            {
+                response.StatusCode = statusCode;
+                return response;
+            }
+
+            var type = job.MembershipType;
+            var groupId = job.MembershipType == MembershipTypes.GroupMembership.ToString() ? job.Group.GroupId : job.Channel.GroupId;
+
+            try
+            {
+                endpoints = await _graphGroupRepository.GetGroupEndpointsAsync(groupId);
+            }
+            catch (Exception ex)
+            {
+                _logger.JobDetailsGroupEndpointsRetrievalFailed(ex);
+            }
+
+            string? vivaEngageUrl = null;
+            try
+            {
+                vivaEngageUrl = await _graphGroupRepository.GetGroupVivaEngageUrlAsync(groupId);
+            }
+            catch (Exception ex)
+            {
+                _logger.VivaEngageUrlRetrievalFailed(ex);
+            }
+
+
+            var titles = await _titlesRepository.GetTitlesAsync(request.SyncJobId);
+            var targetGroupName = await _graphGroupRepository.GetGroupNameAsync(groupId);
+
+            var targetChannelId = job.Channel?.ChannelId;
+            var targetChannelName = job.MembershipType == MembershipTypes.TeamsChannelMembership.ToString() ?
+                    await _teamsChannelRepository.GetTeamsChannelNameAsync(new Models.Entities.AzureADTeamsChannel { ObjectId = groupId, ChannelId = job.Channel!.ChannelId }) : null;
+
+            var hiddenMembershipSourceIds = await GetHiddenMembershipSourceIdsAsync(job.Query);
+               
+            var currentTime = DateTime.UtcNow;
+            var jobStartsInFuture = currentTime < job.StartDate;
+            var jobScheduledForFuture = currentTime < job.ScheduledDate;
+
+            var lastModifiedByDisplayName = string.Empty;
+            var lastModifiedByObjectId = string.Empty;
+            var lastModifiedOnBehalfOfDisplayName = string.Empty;
+            var lastModifiedOnBehalfOfObjectId = string.Empty;
+            var groupSettings = string.Empty;
+
+            var res = await _syncJobChangesRepository.GetLastSyncJobChangeBySyncJobIdAsync(request.SyncJobId);
+            if (res != null)
+            {
+                lastModifiedByDisplayName = res.ChangedByDisplayName;
+                lastModifiedByObjectId = res.ChangedByObjectId.ToString();
+                lastModifiedOnBehalfOfDisplayName = res.ChangedOnBehalfOfDisplayName;
+                lastModifiedOnBehalfOfObjectId = res.ChangedOnBehalfOfObjectId.ToString();
+                if (!string.IsNullOrEmpty(lastModifiedOnBehalfOfDisplayName) && string.IsNullOrEmpty(lastModifiedOnBehalfOfObjectId))
+                {
+                    lastModifiedOnBehalfOfObjectId = await UpdateChangedOnBehalfOfObjectIdAsync(res, lastModifiedOnBehalfOfDisplayName);
+                }
+            }
+
+            var gs = await _syncJobChangesRepository.GetRecentGroupSettingsBySyncJobIdAsync(request.SyncJobId);
+            if (gs != null) groupSettings = gs?.ChangeDetails?.ToString();
+
+            DateTime estimatedNextRunTime;
+            if (!jobStartsInFuture && !jobScheduledForFuture)
+            {
+                // Round current time up to next 5-minute boundary for estimated run time
+                var now = DateTime.UtcNow;
+                var minutesToAdd = 5 - (now.Minute % 5);
+                estimatedNextRunTime = new DateTime(now.Year, now.Month, now.Day, now.Hour, now.Minute, 0)
+                    .AddMinutes(minutesToAdd);
+            }
+            else if (jobStartsInFuture)
+            {
+                estimatedNextRunTime = job.StartDate;
+            }
+            else
+            {
+                estimatedNextRunTime = job.ScheduledDate;
+            }
+
+            // Calculate estimated purge date for inactive jobs
+            // Matches the purge-eligible statuses in AzureMaintenanceService._purgeEligibleStatuses.
+            // Uses the same anchor logic: LastRunTime if real, otherwise InitialOnboardingDate.
+            var minRealDate = new DateTime(1900, 1, 1, 0, 0, 0, DateTimeKind.Utc);
+            var purgeEligibleStatuses = new HashSet<string>
+            {
+                SyncStatus.CustomerPaused.ToString(),
+                SyncStatus.DestinationGroupNotFound.ToString(),
+                SyncStatus.MembershipDataNotFound.ToString(),
+                SyncStatus.NotOwnerOfDestinationGroup.ToString(),
+                SyncStatus.SecurityGroupNotFound.ToString(),
+                SyncStatus.ThresholdExceeded.ToString(),
+                SyncStatus.SubmissionRejected.ToString(),
+                SyncStatus.GuestUsersCannotBeAddedToUnifiedGroup.ToString(),
+                SyncStatus.NestedGroupsFound.ToString()
+            };
+            DateTime? estimatedPurgeDate = null;
+            if (purgeEligibleStatuses.Contains(job.Status))
+            {
+                var inactivitySince = job.LastRunTime > minRealDate ? job.LastRunTime : job.InitialOnboardingDate;
+                if (inactivitySince > minRealDate)
+                    estimatedPurgeDate = inactivitySince.AddDays(_handleInactiveJobsConfig.NumberOfDaysBeforePurging);
+            }
+
+            var dto = new SyncJobDetailsDTO
+            (
+                startDate: job.StartDate,
+                lastSuccessfulStartTime: job.LastSuccessfulStartTime,
+                query: job.Query,
+                requestor: job.Requestor,
+                thresholdPercentageForAdditions: job.ThresholdPercentageForAdditions,
+                thresholdPercentageForRemovals: job.ThresholdPercentageForRemovals,
+                endpoints: endpoints,
+                period: job.Period
+            )
+            {
+                SyncJobId = job.Id,
+                TargetGroupId = groupId,
+                TargetGroupName = targetGroupName,
+                TargetChannelId = targetChannelId,
+                TargetChannelName = targetChannelName,
+                TargetDestinationType = type,
+                LastSuccessfulRunTime = job.LastSuccessfulRunTime,
+                EstimatedNextRunTime = estimatedNextRunTime,
+                EstimatedPurgeDate = estimatedPurgeDate,
+                Status = job.Status,
+                Titles = titles,
+                LastModifiedByDisplayName = lastModifiedByDisplayName,
+                LastModifiedByObjectId = lastModifiedByObjectId,
+                LastModifiedOnBehalfOfDisplayName = lastModifiedOnBehalfOfDisplayName,
+                LastModifiedOnBehalfOfObjectId = lastModifiedOnBehalfOfObjectId,
+                GroupSettings = groupSettings,
+                HiddenMembershipSourceIds = hiddenMembershipSourceIds,
+                HasHiddenMembershipSources = hiddenMembershipSourceIds.Count > 0,
+                VivaEngageUrl = vivaEngageUrl
+            };
+
+            response.Model = dto;
+
+            return response;
+        }
+
+        private async Task<List<Guid>> GetHiddenMembershipSourceIdsAsync(string? query)
+        {
+            if (string.IsNullOrWhiteSpace(query))
+            {
+                return new List<Guid>();
+            }
+
+            try
+            {
+                using var json = JsonDocument.Parse(query);
+                if (json.RootElement.ValueKind != JsonValueKind.Array)
+                {
+                    return new List<Guid>();
+                }
+
+                var groupIds = new HashSet<Guid>();
+                foreach (var element in json.RootElement.EnumerateArray())
+                {
+                    if (!element.TryGetProperty("type", out var typeProperty))
+                    {
+                        continue;
+                    }
+
+                    var typeValue = typeProperty.GetString();
+                    if (!string.Equals(typeValue, MembershipTypes.GroupMembership.ToString(), StringComparison.OrdinalIgnoreCase))
+                    {
+                        continue;
+                    }
+
+                    if (!element.TryGetProperty("source", out var sourceProperty))
+                    {
+                        continue;
+                    }
+
+                    var sourceValue = sourceProperty.GetString();
+                    if (Guid.TryParse(sourceValue, out var groupId))
+                    {
+                        groupIds.Add(groupId);
+                    }
+                }
+
+                if (groupIds.Count == 0)
+                {
+                    return new List<Guid>();
+                }
+
+                var groups = await _graphGroupRepository.GetGroupsAsync(groupIds.ToList());
+                return groups
+                    .Where(group => string.Equals(group.Visibility, "HiddenMembership", StringComparison.OrdinalIgnoreCase))
+                    .Select(group => group.ObjectId)
+                    .ToList();
+            }
+            catch (JsonException ex)
+            {
+                _logger.HiddenMembershipSourcesParseFailed(ex);
+                return new List<Guid>();
+            }
+        }
+
+        private async Task<string> UpdateChangedOnBehalfOfObjectIdAsync(SyncJobChange res, string userIdentifier)
+        {
+            var userResponse = await _graphGroupRepository.GetUserByUpnOrIdAsync(userIdentifier, false);
+            if (userResponse == null) return string.Empty;
+            res.ChangedOnBehalfOfObjectId = userResponse.ObjectId;
+            await _syncJobChangesRepository.UpdateSyncJobChangeAsync(res);
+            return userResponse.ObjectId.ToString();
+        }
+
+        private async Task<(SyncJob? syncJob, HttpStatusCode statusCode)> GetSyncJobAsync(Guid syncJobId)
+        {
+            var userId = _httpContextAccessor.HttpContext.User.Claims.FirstOrDefault(x => x.Type == "http://schemas.microsoft.com/identity/claims/objectidentifier")?.Value;
+            if (string.IsNullOrWhiteSpace(userId)) return (null, HttpStatusCode.Forbidden);
+
+            if (_httpContextAccessor.HttpContext.User.IsInRole(Roles.JOB_TENANT_READER) || 
+                _httpContextAccessor.HttpContext.User.IsInRole(Roles.JOB_TENANT_WRITER))
+            {
+                return (await _databaseSyncJobsRepository.GetSyncJobAsync(syncJobId), HttpStatusCode.OK);
+            }
+
+            if (!await _databaseSyncJobsRepository.GetSyncJobs(true).AnyAsync(x => x.Id == syncJobId))
+            {
+                return (null, HttpStatusCode.NotFound);
+            }
+
+            var job = await _databaseSyncJobsRepository
+                            .GetSyncJobs(true)
+                            .FirstOrDefaultAsync(x => x.Id == syncJobId && x.DestinationOwners.Any(o => o.ObjectId == Guid.Parse(userId)));
+
+            return job != null ? (job, HttpStatusCode.OK) : (null, HttpStatusCode.Forbidden);
+        }
+    }
+}

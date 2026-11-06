@@ -1,54 +1,80 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Repositories.Contracts;
+using Azure;
+using Azure.Core;
+using Hosts.JobScheduler;
+using Microsoft.Extensions.Logging;
+using Models;
 using Repositories.Contracts.InjectConfig;
 using Services.Contracts;
-using Services.Entities;
 using System;
 using System.Collections.Generic;
+using System.Linq;
+using System.Text;
 using System.Threading.Tasks;
 
 namespace Services
 {
-    public class ApplicationService: IApplicationService
+    public class ApplicationService : IApplicationService
     {
         private readonly IJobSchedulingService _jobSchedulingService;
         private readonly IJobSchedulerConfig _jobSchedulerConfig;
-        private readonly ILoggingRepository _loggingRepository;
+        private readonly ILogger<ApplicationService> _logger;
 
-        public ApplicationService(IJobSchedulingService jobSchedulingService, IJobSchedulerConfig jobSchedulerConfig, ILoggingRepository loggingRepository)
+        public ApplicationService(IJobSchedulingService jobSchedulingService, IJobSchedulerConfig jobSchedulerConfig, ILogger<ApplicationService> logger)
         {
             _jobSchedulingService = jobSchedulingService;
             _jobSchedulerConfig = jobSchedulerConfig;
-            _loggingRepository = loggingRepository;
+            _logger = logger;
         }
 
 
         public async Task RunAsync()
         {
-            List<SchedulerSyncJob> jobs = await _jobSchedulingService.GetAllSyncJobsAsync(_jobSchedulerConfig.IncludeFutureJobs);
+            if (!_jobSchedulerConfig.ResetJobs && !_jobSchedulerConfig.DistributeJobs)
+            {
+                _logger.ConfigurationSetToDoNothing();
+
+                return;
+            }
+
+            List<DistributionSyncJob> jobsToUpdate = await GetSyncJobsAsync();
+            List<DistributionSyncJob> jobsWithUpdates = null;
 
             if (_jobSchedulerConfig.ResetJobs)
             {
                 var newStartTime = DateTime.UtcNow.AddDays(_jobSchedulerConfig.DaysToAddForReset);
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Updating {jobs.Count} jobs to have StartDate of {newStartTime}" });
+                _logger.ResettingJobs(jobsToUpdate.Count, newStartTime);
 
-                List<SchedulerSyncJob> updatedJobs = _jobSchedulingService.ResetJobStartTimes(jobs, newStartTime, _jobSchedulerConfig.IncludeFutureJobs);
-                await _jobSchedulingService.UpdateSyncJobsAsync(updatedJobs);
- 
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Updated {jobs.Count} jobs to have StartDate of {newStartTime}" });
+                jobsWithUpdates = await _jobSchedulingService.ResetJobsAsync(jobsToUpdate, _jobSchedulerConfig.DaysToAddForReset);
+
+                _logger.ResetJobs(jobsWithUpdates.Count, newStartTime);
             }
 
-            if (_jobSchedulerConfig.DistributeJobs)
+            else if (_jobSchedulerConfig.DistributeJobs)
             {
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Distributing {jobs.Count} jobs" });
+                _logger.DistributingJobsInApplicationService(jobsToUpdate.Count);
 
-                List<SchedulerSyncJob> updatedJobs = await _jobSchedulingService.DistributeJobStartTimesAsync(jobs);
-                await _jobSchedulingService.UpdateSyncJobsAsync(updatedJobs);
+                jobsWithUpdates = await _jobSchedulingService.DistributeJobsAsync(jobsToUpdate, _jobSchedulerConfig.StartTimeDelayMinutes, _jobSchedulerConfig.DelayBetweenSyncsSeconds);
 
-                await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"Distributed {jobs.Count} jobs" });
+                _logger.DistributedJobsInApplicationService(jobsWithUpdates.Count);
             }
+
+            if (jobsWithUpdates != null && jobsWithUpdates.Count > 0)
+            {
+                await UpdateSyncJobsAsync(jobsWithUpdates);
+            }
+        }
+
+        private async Task<List<DistributionSyncJob>> GetSyncJobsAsync()
+        {
+            var jobs = await _jobSchedulingService.GetSyncJobsAsync();
+            return jobs.Select(x => new DistributionSyncJob(x)).ToList();
+        }
+
+        private async Task UpdateSyncJobsAsync(List<DistributionSyncJob> jobsToUpdate)
+        {
+            await _jobSchedulingService.BatchUpdateSyncJobsAsync(jobsToUpdate);
         }
     }
 }

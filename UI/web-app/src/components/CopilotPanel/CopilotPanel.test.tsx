@@ -1,0 +1,616 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import React from 'react';
+import { fireEvent, screen, waitFor } from '@testing-library/react';
+import { initializeIcons } from '@fluentui/react';
+import { beforeAll, describe, expect, it, vi } from 'vitest';
+
+vi.mock('uuid', () => ({ v4: () => 'mock-uuid' }));
+
+const localStorageMock = {
+  getItem: vi.fn(() => null),
+  setItem: vi.fn(),
+  removeItem: vi.fn(),
+  clear: vi.fn(),
+  key: vi.fn(() => null),
+  length: 0,
+};
+
+Object.defineProperty(globalThis, 'localStorage', {
+  value: localStorageMock,
+  configurable: true,
+});
+
+const mockSourcePart = {
+  id: 'copilot-part-1',
+  title: 'FTEs',
+  query: {
+    type: 'SqlMembership',
+    source: {
+      filter: "EmployeeType_Code = 'FTE'",
+    },
+    exclusionary: false,
+  },
+  isNew: true,
+  isExpanded: false,
+  useOrgStructure: false,
+};
+
+let cachedModules:
+  | Promise<{
+      defaultStrings: any;
+      renderWithProviders: any;
+      setupStore: any;
+      CopilotPanel: any;
+    }>
+  | undefined;
+
+const loadModules = async () => {
+  if (!cachedModules) {
+    cachedModules = Promise.all([
+      import('../../services/localization'),
+      import('../../testing/renderWithProviders'),
+      import('../../store'),
+      import('./CopilotPanel'),
+    ]).then(([localization, testing, store, component]) => ({
+      defaultStrings: localization.defaultStrings,
+      renderWithProviders: testing.renderWithProviders,
+      setupStore: store.setupStore,
+      CopilotPanel: component.CopilotPanel,
+    }));
+  }
+
+  return cachedModules;
+};
+
+beforeAll(() => {
+  initializeIcons(undefined, { disableWarnings: true });
+  window.HTMLElement.prototype.scrollIntoView = vi.fn();
+});
+
+const buildPreloadedState = async (overrides: Record<string, any> = {}) => {
+  const { setupStore, defaultStrings } = await loadModules();
+  const baseState = setupStore().getState();
+  const {
+    copilot,
+    localization,
+    manageMembership,
+    orgLeaderDetails,
+    ...rest
+  } = overrides;
+
+  return {
+    ...baseState,
+    ...rest,
+    copilot: {
+      ...baseState.copilot,
+      messages: [],
+      isLoading: false,
+      error: null,
+      isPanelOpen: false,
+      lastSourceParts: [],
+      lastAppliedOperations: [],
+      useOrgStructure: false,
+      ...copilot,
+    },
+    localization: {
+      ...baseState.localization,
+      language: 'en',
+      strings: defaultStrings,
+      ...localization,
+    },
+    manageMembership: {
+      ...baseState.manageMembership,
+      sourceParts: [],
+      ...manageMembership,
+    },
+    orgLeaderDetails: {
+      ...baseState.orgLeaderDetails,
+      ...orgLeaderDetails,
+    },
+  };
+};
+
+const renderCopilotPanel = async ({
+  isOpen = true,
+  preloadedState = {},
+  dismissPanel = vi.fn(),
+}: {
+  isOpen?: boolean;
+  preloadedState?: Record<string, any>;
+  dismissPanel?: () => void;
+} = {}) => {
+  const { renderWithProviders, CopilotPanel } = await loadModules();
+  const result = renderWithProviders(
+    <CopilotPanel isOpen={isOpen} dismissPanel={dismissPanel} />,
+    {
+      preloadedState: await buildPreloadedState(preloadedState),
+    }
+  );
+
+  return {
+    dismissPanel,
+    ...result,
+  };
+};
+
+describe('CopilotPanel', () => {
+  it('does not render panel content when isOpen is false', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({ isOpen: false });
+
+    expect(screen.queryByText(defaultStrings.Copilot.welcomeMessage)).not.toBeInTheDocument();
+  }, 15000);
+
+  it('renders welcome message with steps when open and no messages', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel();
+
+    expect(screen.getByText(defaultStrings.Copilot.welcomeMessage)).toBeInTheDocument();
+    expect(screen.getByText(defaultStrings.Copilot.welcomeStep1Bold)).toBeInTheDocument();
+    expect(screen.getByText(defaultStrings.Copilot.welcomeStep2Bold)).toBeInTheDocument();
+    expect(screen.getByText(defaultStrings.Copilot.welcomeStep3Bold)).toBeInTheDocument();
+  });
+
+  it('renders user and assistant messages from state', async () => {
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'user-message',
+              role: 'user',
+              content: 'Show me FTEs.',
+              timestamp: '2026-01-01T00:00:00.000Z',
+            },
+            {
+              id: 'assistant-message',
+              role: 'assistant',
+              content: 'Here is a filter for FTEs.',
+              timestamp: '2026-01-01T00:00:01.000Z',
+            },
+          ],
+        },
+      },
+    });
+
+    expect(screen.getByText('Show me FTEs.')).toBeInTheDocument();
+    expect(screen.getByText('Here is a filter for FTEs.')).toBeInTheDocument();
+  });
+
+  it('shows loading spinner when isLoading is true', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          isLoading: true,
+        },
+      },
+    });
+
+    expect(screen.getByText(defaultStrings.Copilot.thinking)).toBeInTheDocument();
+  });
+
+  it('displays error message', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'error-message',
+              role: 'assistant',
+              content: 'Failed to communicate with GMM Copilot. Please try again.',
+              timestamp: '2026-01-01T00:00:02.000Z',
+              isError: true,
+            },
+          ],
+          error: 'Failed to communicate with GMM Copilot. Please try again.',
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+    expect(await screen.findByText(defaultStrings.Copilot.errorMessage)).toBeInTheDocument();
+  });
+
+  it('shows Accept & Apply button when lastSourceParts exist', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'assistant-message',
+              role: 'assistant',
+              content: 'Here is a filter for FTEs.',
+              timestamp: '2026-01-01T00:00:01.000Z',
+            },
+          ],
+          lastSourceParts: [mockSourcePart],
+          lastAppliedOperations: [{ op: 'add', partId: 'p1' }],
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+    expect(
+      await screen.findByRole('button', { name: defaultStrings.Copilot.acceptAndApply })
+    ).toBeInTheDocument();
+  });
+
+  it('hides Accept & Apply button on a no-op turn (no applied operations)', async () => {
+    // Describe/clarify/refuse turns return the query unchanged (lastSourceParts populated) but
+    // with no applied operations. Offering Accept & Apply would re-apply an identical query.
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'assistant-message',
+              role: 'assistant',
+              content: 'I do not see a vertical attribute in your data.',
+              timestamp: '2026-01-01T00:00:01.000Z',
+            },
+          ],
+          lastSourceParts: [mockSourcePart],
+          lastAppliedOperations: [],
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+    expect(
+      screen.queryByRole('button', { name: defaultStrings.Copilot.acceptAndApply })
+    ).not.toBeInTheDocument();
+  });
+
+  it('keeps Accept & Apply visible on the last bot message when only errors follow it', async () => {
+    const { defaultStrings } = await loadModules();
+    await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'assistant-message',
+              role: 'assistant',
+              content: 'Here is a filter for FTEs.',
+              timestamp: '2026-01-01T00:00:01.000Z',
+            },
+            {
+              id: 'error-message',
+              role: 'assistant',
+              content: 'Failed to communicate with GMM Copilot. Please try again.',
+              timestamp: '2026-01-01T00:00:02.000Z',
+              isError: true,
+            },
+          ],
+          lastSourceParts: [mockSourcePart],
+          lastAppliedOperations: [{ op: 'add', partId: 'p1' }],
+        },
+      },
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+    expect(
+      await screen.findByRole('button', { name: defaultStrings.Copilot.acceptAndApply })
+    ).toBeInTheDocument();
+  });
+
+  it('calls dismissPanel on close button click', async () => {
+    const { defaultStrings } = await loadModules();
+    const dismissPanel = vi.fn();
+    await renderCopilotPanel({ dismissPanel });
+
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.closeButton }));
+
+    expect(dismissPanel).toHaveBeenCalledTimes(1);
+  });
+
+  it('calls clearMessages on new conversation button', async () => {
+    const { defaultStrings } = await loadModules();
+    const { store } = await renderCopilotPanel({
+      preloadedState: {
+        copilot: {
+          messages: [
+            {
+              id: 'user-message',
+              role: 'user',
+              content: 'Show me FTEs.',
+              timestamp: '2026-01-01T00:00:00.000Z',
+            },
+          ],
+          error: 'Old error',
+          lastSourceParts: [mockSourcePart],
+          useOrgStructure: true,
+        },
+      },
+    });
+    
+    fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+    
+    fireEvent.click(
+      await screen.findByRole('button', { name: defaultStrings.Copilot.newConversation })
+    );
+    
+    expect(store.getState().copilot.messages).toEqual([]);
+    expect(store.getState().copilot.error).toBeNull();
+    expect(store.getState().copilot.lastSourceParts).toEqual([]);
+    expect(store.getState().copilot.useOrgStructure).toBe(false);
+  });
+
+  describe('copy conversation', () => {
+  const setupClipboardMock = () => {
+  const writeText = vi.fn().mockResolvedValue(undefined);
+  Object.defineProperty(navigator, 'clipboard', {
+    configurable: true,
+    value: { writeText },
+  });
+  return writeText;
+  };
+
+  it('renders copy conversation button disabled when there are no messages', async () => {
+  const { defaultStrings } = await loadModules();
+  setupClipboardMock();
+  await renderCopilotPanel();
+
+  const copyButton = screen.getByRole('button', { name: defaultStrings.Copilot.copyConversation });
+  expect(copyButton).toBeDisabled();
+  });
+
+  it('copies conversation JSON to clipboard when messages exist', async () => {
+  const { defaultStrings } = await loadModules();
+  const writeText = setupClipboardMock();
+  const messages = [
+    {
+      id: 'user-message',
+      role: 'user',
+      content: 'Show me FTEs.',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    },
+    {
+      id: 'assistant-message',
+      role: 'assistant',
+      content: 'Here is a filter for FTEs.',
+      timestamp: '2026-01-01T00:00:01.000Z',
+    },
+  ];
+  await renderCopilotPanel({
+    preloadedState: {
+      copilot: { messages },
+    },
+  });
+
+  fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+  const copyButton = await screen.findByRole('button', { name: defaultStrings.Copilot.copyConversation });
+  expect(copyButton).toBeEnabled();
+
+  fireEvent.click(copyButton);
+
+  await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+  const written = writeText.mock.calls[0][0];
+  const parsed = JSON.parse(written);
+  expect(parsed.messages).toEqual(messages);
+  expect(parsed.messageCount).toBe(messages.length);
+  expect(typeof parsed.sessionId).toBe('string');
+  expect(parsed.sessionId.length).toBeGreaterThan(0);
+  expect(typeof parsed.copiedAt).toBe('string');
+  expect(parsed.error).toBeNull();
+  expect(parsed.warning).toBeNull();
+  });
+
+  it('includes the session id and error banner in the copied diagnostics', async () => {
+  const { defaultStrings } = await loadModules();
+  const writeText = setupClipboardMock();
+  const messages = [
+    {
+      id: 'user-message',
+      role: 'user',
+      content: 'Show me FTEs.',
+      timestamp: '2026-01-01T00:00:00.000Z',
+    },
+  ];
+  await renderCopilotPanel({
+    preloadedState: {
+      copilot: {
+        messages,
+        conversationId: 'session-abc-123',
+        error: 'Failed to communicate with GMM Copilot. Please try again.',
+      },
+    },
+  });
+
+  fireEvent.click(screen.getByRole('button', { name: defaultStrings.Copilot.resumeDialogContinue }));
+
+  const copyButton = await screen.findByRole('button', { name: defaultStrings.Copilot.copyConversation });
+  fireEvent.click(copyButton);
+
+  await waitFor(() => expect(writeText).toHaveBeenCalledTimes(1));
+  const parsed = JSON.parse(writeText.mock.calls[0][0]);
+  expect(parsed.sessionId).toBe('session-abc-123');
+  expect(parsed.error).toBe('Failed to communicate with GMM Copilot. Please try again.');
+  expect(parsed.messages).toEqual(messages);
+  });
+  });
+
+  describe('suggested prompts', () => {
+    const validPromptsJson = JSON.stringify([
+      { label: 'Include reports', prompt: 'Include all reports who roll up to an employee' },
+      { label: 'Include group members', prompt: 'Include all members of a specific group' },
+    ]);
+
+    it('renders suggested prompt buttons when settings contain prompts', async () => {
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: validPromptsJson },
+            ],
+          },
+        },
+      });
+
+      expect(screen.getByText('Include reports')).toBeInTheDocument();
+      expect(screen.getByText('Include group members')).toBeInTheDocument();
+    });
+
+    it('renders localized header when suggested prompts are present', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: validPromptsJson },
+            ],
+          },
+        },
+      });
+
+      expect(
+        screen.getByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)
+      ).toBeInTheDocument();
+    });
+
+    it('does not render suggested prompts when setting is empty', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: '' },
+            ],
+          },
+        },
+      });
+
+      expect(screen.queryByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)).not.toBeInTheDocument();
+      expect(screen.queryAllByRole('button', { name: /Include/i })).toHaveLength(0);
+    });
+
+    it('does not render suggested prompts when setting is missing', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel();
+
+      expect(screen.queryByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)).not.toBeInTheDocument();
+      expect(screen.queryAllByRole('button', { name: /Include/i })).toHaveLength(0);
+    });
+
+    it('handles malformed JSON gracefully', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: 'not valid json{{{' },
+            ],
+          },
+        },
+      });
+
+      expect(screen.queryByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)).not.toBeInTheDocument();
+    });
+
+    it('does not render suggested prompts for empty JSON array', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: '[]' },
+            ],
+          },
+        },
+      });
+
+      expect(screen.queryByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)).not.toBeInTheDocument();
+      expect(screen.queryAllByRole('button', { name: /Include/i })).toHaveLength(0);
+    });
+
+    it('filters out prompts with non-string label or prompt values', async () => {
+      const mixedJson = JSON.stringify([
+        { label: 'Valid prompt', prompt: 'Valid prompt text' },
+        { label: 42, prompt: 'Number label' },
+        { label: 'Missing prompt', prompt: null },
+        { label: '', prompt: 'Empty label' },
+      ]);
+
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: mixedJson },
+            ],
+          },
+        },
+      });
+
+      expect(screen.getByText('Valid prompt')).toBeInTheDocument();
+      expect(screen.queryByText('Number label')).not.toBeInTheDocument();
+      expect(screen.queryByText('Missing prompt')).not.toBeInTheDocument();
+      expect(screen.queryByText('Empty label')).not.toBeInTheDocument();
+    });
+
+    it('filters out non-object entries from JSON array', async () => {
+      const badJson = JSON.stringify([
+        'just a string',
+        null,
+        42,
+        { label: 'Real prompt', prompt: 'Real prompt text' },
+      ]);
+
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: badJson },
+            ],
+          },
+        },
+      });
+
+      expect(screen.getByText('Real prompt')).toBeInTheDocument();
+    });
+
+    it('does not render prompts when JSON is a non-array value', async () => {
+      const { defaultStrings } = await loadModules();
+      await renderCopilotPanel({
+        preloadedState: {
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: JSON.stringify({ label: 'Not array', prompt: 'Not array' }) },
+            ],
+          },
+        },
+      });
+
+      expect(screen.queryByText(defaultStrings.Copilot.tryOneOfTheseToGetStarted)).not.toBeInTheDocument();
+      expect(screen.queryByText('Not array')).not.toBeInTheDocument();
+    });
+
+    it('disables prompt buttons when loading', async () => {
+      await renderCopilotPanel({
+        preloadedState: {
+          copilot: { isLoading: true },
+          settings: {
+            settings: [
+              { settingKey: 15, settingValue: validPromptsJson },
+            ],
+          },
+        },
+      });
+
+      const buttons = screen.getAllByRole('button', { name: /Include/i });
+      expect(buttons).toHaveLength(2);
+      for (const button of buttons) {
+        expect(button).toBeDisabled();
+      }
+    });
+  });
+});

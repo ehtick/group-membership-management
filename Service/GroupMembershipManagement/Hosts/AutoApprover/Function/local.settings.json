@@ -1,0 +1,14 @@
+{
+  "IsEncrypted": false,
+  "Values": {
+    "AZURE_TOKEN_CREDENTIALS": "VisualStudioCredential",
+    "AzureWebJobsStorage": "UseDevelopmentStorage=true",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "appConfigurationEndpoint": "https://gmm-appconfig-<env>.azconfig.io",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+    "gmmServiceBus__fullyQualifiedNamespace": "",
+    "ConnectionStrings__JobsContext": "",
+    "ConnectionStrings__JobsContextReadOnly": "",
+    "serviceBusAutoApproverQueue": "autoApprover"
+  }
+}

@@ -1,0 +1,221 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Hosts.TeamsChannelMembershipObtainer;
+using Microsoft.Extensions.Configuration.AzureAppConfiguration;
+using Microsoft.Extensions.Logging;
+using Models;
+using Models.Entities;
+using Models.Helpers;
+using Models.ServiceBus;
+using Repositories.Contracts;
+using Services.Contracts;
+using Models.SyncJobHistory;
+using System.Text.Json;
+using System.Text.Json.Serialization;
+using TeamsChannelMembershipObtainer.Service.Contracts;
+
+
+namespace TeamsChannelMembershipObtainer.Service
+{
+    public class TeamsChannelMembershipObtainerService : ITeamsChannelService
+    {
+        private readonly ITeamsChannelRepository _teamsChannelRepository;
+        private readonly IBlobStorageRepository _blobStorageRepository;
+        private readonly IDatabaseSyncJobsRepository _syncJobRepository;
+        private readonly IDatabaseChannelsRepository _databaseChannelsRepository;
+        private readonly ILogger<TeamsChannelMembershipObtainerService> _logger;
+        private readonly IServiceBusQueueRepository _serviceBusQueueRepository;
+        private readonly ISyncJobStatusService _syncJobStatusService;
+
+        public TeamsChannelMembershipObtainerService(
+            ITeamsChannelRepository teamsChannelRepository,
+            IBlobStorageRepository blobStorageRepository,
+            IHttpClientFactory httpClientFactory,
+            IDatabaseSyncJobsRepository syncJobRepository,
+            IDatabaseChannelsRepository channelsRepository,
+            ILogger<TeamsChannelMembershipObtainerService> logger,
+            IConfigurationRefresherProvider refresherProvider,
+            IServiceBusQueueRepository serviceBusQueueRepository,
+            ISyncJobStatusService syncJobStatusService)
+        {
+            _teamsChannelRepository = teamsChannelRepository ?? throw new ArgumentNullException(nameof(teamsChannelRepository));
+            _blobStorageRepository = blobStorageRepository ?? throw new ArgumentNullException(nameof(blobStorageRepository));
+            _syncJobRepository = syncJobRepository ?? throw new ArgumentNullException(nameof(syncJobRepository));
+            _databaseChannelsRepository = channelsRepository ?? throw new ArgumentException(nameof(channelsRepository));
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _serviceBusQueueRepository = serviceBusQueueRepository ?? throw new ArgumentNullException(nameof(serviceBusQueueRepository));
+            _syncJobStatusService = syncJobStatusService ?? throw new ArgumentNullException(nameof(syncJobStatusService));
+        }
+
+        public async Task<Channel> GetDestinationAsync(SyncJob syncJob)
+        {
+            var channel = new Channel();
+            if (syncJob.MembershipType == MembershipTypes.TeamsChannelMembership.ToString())
+            {
+                return syncJob.Channel ?? await _databaseChannelsRepository.GetChannelUsingSyncJobIdAsync(syncJob.Id);
+            }
+            return channel;
+        }
+
+        public async Task<ValidateChannelResponse> VerifyChannelAsync(ChannelSyncInfo channelSyncInfo)
+        {
+            Guid runId = channelSyncInfo.SyncJob.RunId.GetValueOrDefault(Guid.Empty);
+
+            var channel = await GetDestinationAsync(channelSyncInfo.SyncJob);
+
+            if (channel.GroupId == Guid.Empty || channel.ChannelId == null)
+            {
+                _logger.DestinationDetailsNotFound();
+                await _syncJobRepository.UpdateSyncJobStatusAsync(new[] { channelSyncInfo.SyncJob }, SyncStatus.Error);
+                return new ValidateChannelResponse { ParsedChannel = null, IsValid = false };
+            }
+
+            var azureADTeamsChannel = new AzureADTeamsChannel
+            {
+                ObjectId = channel.GroupId,
+                ChannelId = channel.ChannelId
+            };
+
+            if (!channelSyncInfo.IsDestinationPart)
+            {
+                // Re-scoped US3: a TeamsChannel source part is permitted only when it references the
+                // same channel as the job's TeamsChannel destination (enforced at submit by the WebAPI).
+                // Its identity is therefore the destination channel, already resolved above, so it is
+                // read as a source rather than rejected. Re-verify the channel is shared as
+                // defense-in-depth before contributing its members as a source.
+                var sourceType = await _teamsChannelRepository.GetChannelTypeAsync(azureADTeamsChannel, runId);
+
+                if (!IsAllowedChannelType(sourceType))
+                {
+                    _logger.StandardChannelDetected(azureADTeamsChannel.ChannelId, azureADTeamsChannel.ObjectId);
+                    await _syncJobRepository.UpdateSyncJobStatusAsync(new[] { channelSyncInfo.SyncJob }, SyncStatus.StandardTeamsChannel);
+                    return new ValidateChannelResponse
+                    {
+                        ParsedChannel = azureADTeamsChannel,
+                        IsValid = false
+                    };
+                }
+
+                _logger.ChannelTypeDetected(azureADTeamsChannel.ChannelId, azureADTeamsChannel.ObjectId, sourceType);
+
+                return new ValidateChannelResponse
+                {
+                    ParsedChannel = azureADTeamsChannel,
+                    IsValid = true
+                };
+            }
+
+            var destType = await _teamsChannelRepository.GetChannelTypeAsync(azureADTeamsChannel, runId);
+
+            if (destType == "standard")
+            {
+                _logger.StandardChannelDetected(azureADTeamsChannel.ChannelId, azureADTeamsChannel.ObjectId);
+                await _syncJobRepository.UpdateSyncJobStatusAsync(new[] { channelSyncInfo.SyncJob }, SyncStatus.StandardTeamsChannel);
+                return new ValidateChannelResponse {
+                    ParsedChannel = azureADTeamsChannel,
+                    IsValid = false };
+            }
+
+            _logger.ChannelTypeDetected(azureADTeamsChannel.ChannelId, azureADTeamsChannel.ObjectId, destType);
+
+            return new ValidateChannelResponse {
+                    ParsedChannel = azureADTeamsChannel,
+                    IsValid = true };
+        }
+
+        // A channel is allowed as a source when its membership type is neither Standard nor Private
+        // (i.e. shared, or an undefined/unknown/future type, which is treated as eligible). The
+        // Microsoft Graph ChannelMembershipType enum's ToString() yields PascalCase
+        // ("Standard"/"Private"/"Shared"), so the comparison is case-insensitive and MUST NOT rely
+        // on a lowercase-only literal match.
+        private static bool IsAllowedChannelType(string? channelType)
+        {
+            return !string.Equals(channelType, "standard", StringComparison.OrdinalIgnoreCase)
+                && !string.Equals(channelType, "private", StringComparison.OrdinalIgnoreCase);
+        }
+
+        public Task<List<AzureADTeamsUser>> GetUsersFromTeamAsync(AzureADTeamsChannel azureADTeamsChannel, Guid runId)
+        {
+            _logger.ReadingFromChannel(azureADTeamsChannel.ObjectId, azureADTeamsChannel.ChannelId);
+            return _teamsChannelRepository.ReadUsersFromChannelAsync(azureADTeamsChannel, runId);
+        }
+
+        public async Task<string> UploadMembershipAsync(List<AzureADTeamsUser> users, ChannelSyncInfo channelSyncInfo, bool dryRun, Guid targetOfficeGroupId)
+        {
+            Guid runId = channelSyncInfo.SyncJob.RunId.GetValueOrDefault(Guid.Empty);
+
+            var sourceMembers = new List<AzureADUser>(users);
+            sourceMembers.Sort(CanonicalMemberComparer<AzureADUser>.Instance);
+            var groupMembership = new GroupMembership
+            {
+                SourceMembers = sourceMembers,
+                RunId = runId,
+                Exclusionary = channelSyncInfo.Exclusionary,
+                SyncJobId = channelSyncInfo.SyncJob.Id,
+                MembershipObtainerDryRunEnabled = dryRun,
+                Query = channelSyncInfo.SyncJob.Query
+            };
+
+            var timeStamp = channelSyncInfo.SyncJob.Timestamp.GetValueOrDefault().ToString("MMddyyyy-HHmmss");
+            var fileName = $"/{targetOfficeGroupId}/{timeStamp}_{runId}_TeamsChannelMembership_{channelSyncInfo.CurrentPart}.json";
+            var serializerSettings = new JsonSerializerOptions
+            {
+                DefaultIgnoreCondition = JsonIgnoreCondition.WhenWritingDefault,
+            };
+
+            _logger.UploadingMembership(users.Count, fileName);
+            await _blobStorageRepository.UploadFileAsync(fileName, JsonSerializer.Serialize(groupMembership, serializerSettings));
+            _logger.UploadedMembership(users.Count, fileName);
+
+            return fileName;
+        }
+
+        public async Task MakeMembershipAggregatorRequestAsync(ChannelSyncInfo syncInfo, string blobFilePath)
+        {
+            var aggregatorRequest = new MembershipAggregatorHttpRequest
+            {
+                FilePath = blobFilePath,
+                PartNumber = syncInfo.CurrentPart,
+                PartsCount = syncInfo.TotalParts,
+                SyncJob = syncInfo.SyncJob,
+                IsDestinationPart = syncInfo.IsDestinationPart
+            };
+
+            await SendMembershipAggregatorMessageAsync(aggregatorRequest);
+        }
+
+        public async Task UpdateSyncJobStatusAsync(SyncJob syncJob, SyncStatus? status, int? beforeSyncUserCount = null)
+        {
+            var history = new SyncJobHistory
+            {
+                SyncJobId = syncJob.Id,
+                RunId = syncJob.RunId ?? Guid.Empty,
+                Status = status?.ToString() ?? syncJob.Status,
+                UpdatedByFunction = "TeamsChannelMembershipObtainer",
+                EndTime = status.HasValue && status.Value != SyncStatus.InProgress ? DateTime.UtcNow : null,
+                UpdatedAt = DateTime.UtcNow,
+                BeforeSyncUserCount = beforeSyncUserCount
+            };
+
+            await _syncJobStatusService.UpdateJobStatusAsync(syncJob, status, history, "TeamsChannelMembershipObtainer");
+        }
+
+        private async Task SendMembershipAggregatorMessageAsync(MembershipAggregatorHttpRequest request)
+        {
+            var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(request));
+
+            var message = new ServiceBusMessage
+            {
+                MessageId = $"{request.SyncJob.Id}_{request.SyncJob.RunId}_{Guid.NewGuid()}",
+                Body = body
+            };
+
+            _logger.SendingAggregatorMessage(message.MessageId);
+
+            await _serviceBusQueueRepository.SendMessageAsync(message);
+
+            _logger.SentAggregatorMessage(message.MessageId);
+        }
+    }
+}

@@ -1,0 +1,326 @@
+@minLength(2)
+@maxLength(3)
+@description('Enter an abbreviation for the solution.')
+param solutionAbbreviation string
+
+@minLength(2)
+@maxLength(6)
+@description('Enter an abbreviation for the environment.')
+param environmentAbbreviation string
+
+@description('Whether or not this environment is a production environment that needs to have authorization locks.')
+param isProduction bool
+
+@description('Resource location.')
+param location string
+
+@description('Tenant Id.')
+param tenantId string
+
+@description('SQL SKU Name')
+param sqlSkuName string
+
+@description('SQL SKU Tier')
+param sqlSkuTier string
+
+@description('SQL SKU Family')
+param sqlSkuFamily string
+
+@description('SQL SKU Capacity')
+param sqlSkuCapacity int
+
+@description('Administrators Azure AD Group Object Id')
+param sqlAdministratorsGroupId string
+
+@description('Deploy GMM across two Azure regions. A single switch for the whole multi-region posture: every tier that becomes multi-region gates on it, so enabling it provisions all of them. Today that is the SyncJobs database - a secondary SQL server, a read replica in the secondary region, and an auto-failover group.')
+param enableMultiRegion bool = false
+
+@description('Resource id of the secondary SQL server that partners the primary server in the failover group.')
+param secondaryServerId string = ''
+
+var dataKeyVaultName = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+var sqlServerName = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+var primaryDatabaseName = '${sqlDatabaseName}'
+var replicaSqlServerName = '${sqlServerName}-R'
+var replicaSqlDatabaseName = '${primaryDatabaseName}-R'
+var sqlDatabaseName = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+var logAnalyticsName = '${solutionAbbreviation}-data-${environmentAbbreviation}'
+var sqlServerUrl = 'Server=tcp:${sqlServerName}${environment().suffixes.sqlServerHostname},1433;'
+var sqlServerDataBaseName = 'Initial Catalog=${sqlServerName};'
+var sqlServerAdditionalSettings = 'MultipleActiveResultSets=False;Encrypt=True;TrustServerCertificate=False;Connection Timeout=90;'
+var jobsSqlDataBaseName = 'Initial Catalog=${solutionAbbreviation}-data-${environmentAbbreviation};'
+var replicaJobsSqlDataBaseName = 'Initial Catalog=${solutionAbbreviation}-data-${environmentAbbreviation}-R;'
+var replicaConnectionString = 'Server=tcp:${replicaSqlServerName}${environment().suffixes.sqlServerHostname},1433;Initial Catalog=${replicaSqlDatabaseName};${sqlServerAdditionalSettings}'
+var failoverGroupName = '${sqlServerName}-fog'
+// The write endpoint resolves to the failover group listener when the multi-region topology is
+// enabled, and to the primary server otherwise.
+var writeServerHost = enableMultiRegion
+  ? '${failoverGroupName}${environment().suffixes.sqlServerHostname}'
+  : '${sqlServerName}${environment().suffixes.sqlServerHostname}'
+var jobsMSIConnectionString = 'Server=tcp:${writeServerHost},1433;${jobsSqlDataBaseName}Authentication=Active Directory Default;Connection Timeout=90;'
+var replicaJobsMSIConnectionString = 'Server=tcp:${replicaSqlServerName}${environment().suffixes.sqlServerHostname},1433;${replicaJobsSqlDataBaseName}Authentication=Active Directory Default;Connection Timeout=90;'
+
+// primary sql server resources
+resource sqlServer 'Microsoft.Sql/servers@2021-02-01-preview' = {
+  name: sqlServerName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  properties: {
+    minimalTlsVersion: '1.2'
+    administrators: {
+      administratorType: 'ActiveDirectory'
+      principalType: 'Group'
+      login: 'GMM SQL admin group: ${sqlAdministratorsGroupId}'
+      sid: sqlAdministratorsGroupId
+      tenantId: tenantId
+      azureADOnlyAuthentication: true
+    }
+  }
+
+  resource aadAuthentication 'azureADOnlyAuthentications@2022-11-01-preview' = {
+    name: 'Default'
+    properties: {
+      azureADOnlyAuthentication: true
+    }
+  }
+
+  resource sqlServerFirewall 'firewallRules@2021-02-01-preview' = {
+    name: 'AllowAllWindowsAzureIps'
+    properties: {
+      startIpAddress: '0.0.0.0'
+      endIpAddress: '0.0.0.0'
+    }
+  }
+
+  resource masterDataBase 'databases@2021-02-01-preview' = {
+    location: location
+    name: 'master'
+    properties: {}
+  }
+
+  resource auditingSettings 'auditingSettings@2017-03-01-preview' = {
+    name: 'default'
+    properties: {
+      state: 'Enabled'
+      isAzureMonitorTargetEnabled: true
+    }
+  }
+}
+
+resource primaryDatabase 'Microsoft.Sql/servers/databases@2021-02-01-preview' = {
+  name: primaryDatabaseName
+  parent: sqlServer
+  location: location
+  properties: {
+    autoPauseDelay: -1
+  }
+  sku: {
+    name: sqlSkuName
+    tier: sqlSkuTier
+    family: sqlSkuFamily
+    capacity: sqlSkuCapacity
+  }
+  dependsOn: [
+    sqlServer::aadAuthentication
+    sqlServer::sqlServerFirewall
+    sqlServer::masterDataBase
+    sqlServer::auditingSettings
+  ]
+}
+
+resource longTermBackup 'Microsoft.Sql/servers/databases/backupLongTermRetentionPolicies@2022-05-01-preview' = {
+  parent: primaryDatabase
+  name: 'default'
+  properties: {
+    weeklyRetention: 'P1W'
+    monthlyRetention: 'P1M'
+    yearlyRetention: 'P1Y'
+    weekOfYear: 1
+  }
+}
+
+resource logAnalytics 'Microsoft.OperationalInsights/workspaces@2021-06-01' existing = {
+  name: logAnalyticsName
+}
+
+resource diagnosticSettings 'Microsoft.Insights/diagnosticSettings@2017-05-01-preview' = {
+  scope: sqlServer::masterDataBase
+  name: 'diagnosticSettings'
+  properties: {
+    workspaceId: logAnalytics.id
+    logs: [
+      {
+        category: 'SQLSecurityAuditEvents'
+        enabled: true
+        retentionPolicy: {
+          days: 0
+          enabled: false
+        }
+      }
+    ]
+  }
+  dependsOn: [
+    longTermBackup
+  ]
+}
+
+// replica sql server resources
+resource replicaSqlServer 'Microsoft.Sql/servers@2021-11-01-preview' = {
+  name: replicaSqlServerName
+  location: location
+  identity: {
+    type: 'SystemAssigned'
+  }
+  dependsOn: [
+    diagnosticSettings
+  ]
+  properties: {
+    minimalTlsVersion: '1.2'
+    administrators: {
+      administratorType: 'ActiveDirectory'
+      principalType: 'Group'
+      login: 'GMM SQL admin group: ${sqlAdministratorsGroupId}'
+      sid: sqlAdministratorsGroupId
+      tenantId: tenant().tenantId
+      azureADOnlyAuthentication: true
+    }
+  }
+
+  resource aadAuthentication 'azureADOnlyAuthentications@2022-11-01-preview' = {
+    name: 'Default'
+    properties: {
+      azureADOnlyAuthentication: true
+    }
+  }
+
+  resource sqlServerFirewall 'firewallRules@2021-02-01-preview' = {
+    name: 'AllowAllWindowsAzureIpsReplica'
+    properties: {
+      startIpAddress: '0.0.0.0'
+      endIpAddress: '0.0.0.0'
+    }
+  }
+}
+
+resource readReplicaDb 'Microsoft.Sql/servers/databases@2021-11-01-preview' = {
+  name: replicaSqlDatabaseName
+  parent: replicaSqlServer
+  location: location
+  properties: {
+    autoPauseDelay: -1
+    createMode: 'OnlineSecondary'
+    maxSizeBytes: -1
+    collation: 'SQL_Latin1_General_CP1_CI_AS'
+    catalogCollation: 'SQL_Latin1_General_CP1_CI_AS'
+    zoneRedundant: false
+    licenseType: 'LicenseIncluded'
+    readScale: 'Disabled'
+    secondaryType: 'Geo'
+    isLedgerOn: false
+    sourceDatabaseId: primaryDatabase.id
+  }
+  dependsOn: [
+    replicaSqlServer::aadAuthentication
+    replicaSqlServer::sqlServerFirewall
+  ]
+}
+
+// conditional resources
+// --- multi-region failover group
+// The failover group is a child of the primary server and references the secondary server across
+// resource groups by resource id. Listing the primary database in `databases` makes Azure create
+// the partner copy on the secondary server automatically, so the partner database is not created
+// here. It is declared in `secondaryReadReplicaDb.bicep`, which runs afterwards and sets the
+// properties the implicit copy does not inherit.
+resource failoverGroup 'Microsoft.Sql/servers/failoverGroups@2021-11-01-preview' = if (enableMultiRegion) {
+  name: failoverGroupName
+  parent: sqlServer
+  properties: {
+    // Manual only. The Automatic policy performs a forced, data-losing promotion after its grace
+    // period. The read-only listener is unused because it always resolves to the region compute
+    // is not in.
+    readWriteEndpoint: {
+      failoverPolicy: 'Manual'
+    }
+    readOnlyEndpoint: {
+      failoverPolicy: 'Disabled'
+    }
+    partnerServers: [
+      {
+        id: secondaryServerId
+      }
+    ]
+    databases: [
+      primaryDatabase.id
+    ]
+  }
+  dependsOn: [
+    readReplicaDb
+  ]
+}
+
+// --- primary sql server locks
+resource SqlDatabase_DeleteLock 'Microsoft.Authorization/locks@2020-05-01' = if(isProduction) {
+  scope: primaryDatabase
+  name: 'Do Not Delete'
+  properties: {
+    level: 'CanNotDelete'
+  }
+  dependsOn: [
+    diagnosticSettings
+    readReplicaDb
+  ]
+}
+
+/// --- replica sql server locks
+resource RSqlDatabase_DeleteLock 'Microsoft.Authorization/locks@2020-05-01' = if(isProduction) {
+  scope: readReplicaDb
+  name: 'Do Not Delete'
+  properties: {
+    level: 'CanNotDelete'
+  }
+  dependsOn: [
+    SqlDatabase_DeleteLock
+  ]
+}
+
+module secureKeyvaultSecrets 'keyVaultSecretsSecure.bicep' = {
+  name: 'secureKeyvaultSecrets'
+  params: {
+    keyVaultName: dataKeyVaultName
+    keyVaultSecrets: {
+      secrets: [
+        {
+          name: 'sqlServerManagedIdentity'
+          value: sqlServer.identity.principalId
+        }
+        {
+          name: 'sqlDatabaseConnectionString'
+          value: '${sqlServerUrl}${jobsSqlDataBaseName}${sqlServerAdditionalSettings}'
+        }
+        {
+          name: 'sqlServerName'
+          value: '${sqlServerName}${environment().suffixes.sqlServerHostname}'
+        }
+        {
+          name: 'replicaSqlServerConnectionString'
+          value: replicaConnectionString
+        }
+        {
+          name: 'jobsMSIConnectionString'
+          value: jobsMSIConnectionString
+        }
+        {
+          name: 'replicaJobsMSIConnectionString'
+          value: replicaJobsMSIConnectionString
+        }
+      ]
+    }
+  }
+}
+
+output sqlServerId string = sqlServer.id
+output replicaSqlServerId string = replicaSqlServer.id
+output primaryDatabaseId string = primaryDatabase.id

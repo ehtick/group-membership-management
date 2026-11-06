@@ -1,22 +1,24 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Entities.ServiceBus;
+using Azure.Messaging.ServiceBus;
+using DIConcreteTypes;
+using GraphUpdater.QueueMessageOrchestrator;
 using Hosts.GraphUpdater;
-using Microsoft.Azure.ServiceBus;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Microsoft.Extensions.Configuration;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Microsoft.DurableTask.Client;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
 using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Models;
+using Models.ServiceBus;
 using Moq;
-using Newtonsoft.Json;
-using Newtonsoft.Json.Linq;
-using Repositories.Mocks;
-using Services.Contracts;
-using Services.Entities;
 using System;
 using System.Collections.Generic;
 using System.Linq;
-using System.Text;
+using System.Text.Json;
+using System.Threading;
 using System.Threading.Tasks;
 
 namespace Services.Tests
@@ -25,313 +27,725 @@ namespace Services.Tests
     public class StarterFunctionTests
     {
         private string _instanceId;
-        private MockLoggingRepository _loggerMock;
-        private Mock<IDurableOrchestrationClient> _durableClientMock;
-        private Mock<IMessageSession> _messageSessionMock;
-        private Mock<IServiceBusMessageService> _messageService;
-        private Mock<IConfiguration> _configuration;
+        private ILogger<StarterFunction> _logger;
+        private Mock<DurableTaskClient> _durableClientMock;
+        private SyncJob _syncJob;
+        private MembershipUpdaters _membershipUpdaters;
+        private IOptions<MultiLaneConfig> _multilaneConfig;
+        private string _subscriptionName = "GraphUpdater";
+        private string _laneSize = "Small";
 
         [TestInitialize]
         public void SetupTest()
         {
             _instanceId = "1234567890";
-            _durableClientMock = new Mock<IDurableOrchestrationClient>();
-            _loggerMock = new MockLoggingRepository();
-            _messageSessionMock = new Mock<IMessageSession>();
-            _messageService = new Mock<IServiceBusMessageService>();
-            _configuration = new Mock<IConfiguration>();
-        }
-
-        [TestMethod]
-        public async Task ProcessSingleMessageSuccessTest()
-        {
-            var messageDetails = new MessageInformation
+            _durableClientMock = new Mock<DurableTaskClient>("test");
+            _logger = NullLogger<StarterFunction>.Instance;
+            _syncJob = new SyncJob
             {
-                Body = Encoding.UTF8.GetBytes(GetMessageBody()),
-                LockToken = Guid.NewGuid().ToString(),
-                SessionId = "dc04c21f-091a-44a9-a661-9211dd9ccf35",
-                MessageId = Guid.NewGuid().ToString()
-            };
-
-            var output = new GroupMembershipMessageResponse
-            {
-                CompletedGroupMembershipMessages = new List<GroupMembershipMessage>
+                Id = Guid.NewGuid(),
+                MembershipType = "GroupMembership",
+                Group = new Group
                 {
-                    new GroupMembershipMessage { LockToken = messageDetails.LockToken }
+                    GroupId = Guid.NewGuid()
                 },
-                ShouldCompleteMessage = true
+                ThresholdPercentageForAdditions = 80,
+                ThresholdPercentageForRemovals = 20,
+                LastRunTime = DateTime.UtcNow.AddDays(-1),
+                Requestor = "user@domail.com",
+                RunId = Guid.NewGuid(),
             };
 
-            var status = new DurableOrchestrationStatus
+            _multilaneConfig = Options.Create(new MultiLaneConfig
             {
-                RuntimeStatus = OrchestrationRuntimeStatus.Completed,
-                Output = JToken.FromObject(output)
-            };
-
-            _durableClientMock
-                  .Setup(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()))
-                  .ReturnsAsync(_instanceId);
-
-            _durableClientMock
-                .Setup(x => x.GetStatusAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
-                .ReturnsAsync(status);
-
-            _messageService.Setup(x => x.GetMessageProperties(It.IsAny<Message>())).Returns(messageDetails);
-
-            var starterFunction = new StarterFunction(_loggerMock, _messageService.Object, _configuration.Object);
-            await starterFunction.RunAsync(new Message(), _durableClientMock.Object, _messageSessionMock.Object);
-
-            _messageSessionMock.Verify(mock => mock.CompleteAsync(It.IsAny<IEnumerable<string>>()), Times.Once());
-            _messageSessionMock.Verify(mock => mock.CloseAsync(), Times.Once());
-
-            Assert.IsNotNull(_loggerMock.MessagesLogged.Single(x => x.Message.Contains("Instance processing completed")));
-            Assert.IsNotNull(_loggerMock.MessagesLogged.Single(x => x.Message.Contains("function complete")));
-        }
-
-        [TestMethod]
-        public async Task ProcessSingleMessageFailTest()
-        {
-            var messageDetails = new MessageInformation
-            {
-                Body = Encoding.UTF8.GetBytes(GetMessageBody()),
-                LockToken = Guid.NewGuid().ToString(),
-                SessionId = "dc04c21f-091a-44a9-a661-9211dd9ccf35",
-                MessageId = Guid.NewGuid().ToString()
-            };
-
-            var output = new GroupMembershipMessageResponse
-            {
-                CompletedGroupMembershipMessages = new List<GroupMembershipMessage>
-                {
-                    new GroupMembershipMessage { LockToken = messageDetails.LockToken }
-                },
-                ShouldCompleteMessage = true
-            };
-
-            var status = new DurableOrchestrationStatus
-            {
-                RuntimeStatus = OrchestrationRuntimeStatus.Running,
-                Output = JToken.FromObject(output)
-            };
-
-            _durableClientMock
-                  .Setup(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()))
-                  .ReturnsAsync(_instanceId);
-
-            var attempt = 1;
-            _durableClientMock
-                .Setup(x => x.GetStatusAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
-                .Callback(() =>
-                    {
-                        if (attempt > 1)
-                            status.RuntimeStatus = OrchestrationRuntimeStatus.Terminated;
-
-                        attempt++;
-                    })
-                .ReturnsAsync(status);
-
-            _messageService.Setup(x => x.GetMessageProperties(It.IsAny<Message>())).Returns(messageDetails);
-
-            var starterFunction = new StarterFunction(_loggerMock, _messageService.Object, _configuration.Object);
-            await starterFunction.RunAsync(new Message(), _durableClientMock.Object, _messageSessionMock.Object);
-
-            _messageSessionMock.Verify(mock => mock.CompleteAsync(It.IsAny<IEnumerable<string>>()), Times.Never());
-            _messageSessionMock.Verify(mock => mock.CloseAsync(), Times.Never());
-
-            Assert.IsNotNull(_loggerMock.MessagesLogged.Single(x => x.Message.Contains("Error: Status of instance")));
-            Assert.IsNotNull(_loggerMock.MessagesLogged.Single(x => x.Message.Contains("function complete")));
-        }
-
-        [TestMethod]
-        [Timeout(180000)]
-        public async Task ProcessSessionWithNoLastMessageTest()
-        {
-            var groupMembership = JsonConvert.DeserializeObject<GroupMembership>(GetMessageBody());
-            groupMembership.IsLastMessage = false;
-
-            var messageDetails = new MessageInformation
-            {
-                Body = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(groupMembership)),
-                LockToken = Guid.NewGuid().ToString(),
-                SessionId = "dc04c21f-091a-44a9-a661-9211dd9ccf35"
-            };
-
-            var output = new GroupMembershipMessageResponse
-            {
-                CompletedGroupMembershipMessages = new List<GroupMembershipMessage>
-                {
-                    new GroupMembershipMessage { LockToken = messageDetails.LockToken }
-                },
-                ShouldCompleteMessage = false
-            };
-
-            var status = new DurableOrchestrationStatus
-            {
-                RuntimeStatus = OrchestrationRuntimeStatus.Completed,
-                Output = JToken.FromObject(output)
-            };
-
-            _messageService.Setup(x => x.GetMessageProperties(It.IsAny<Message>()))
-                            .Returns(() =>
-                            {
-                                messageDetails.MessageId = Guid.NewGuid().ToString();
-                                return messageDetails;
-                            });
-
-
-            _messageSessionMock.SetupGet(x => x.SessionId).Returns(messageDetails.SessionId);
-            _configuration.SetupGet(x => x["GraphUpdater:LastMessageWaitTimeout"]).Returns("1");
-
-            var cancelationRequestCount = 0;
-
-            _durableClientMock
-                 .Setup(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()))
-                 .Callback<string, object>((name, request) =>
-                 {
-                     var graphUpdaterRequest = request as GraphUpdaterFunctionRequest;
-                     if (graphUpdaterRequest != null && graphUpdaterRequest.IsCancelationRequest)
-                         cancelationRequestCount++;
-                 })
-                 .ReturnsAsync(_instanceId);
-
-            _durableClientMock
-                .Setup(x => x.GetStatusAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
-                .ReturnsAsync(status);
-
-            var starterFunction = new StarterFunction(_loggerMock, _messageService.Object, _configuration.Object);
-            await starterFunction.RunAsync(new Message(), _durableClientMock.Object, _messageSessionMock.Object);
-            await starterFunction.RunAsync(new Message(), _durableClientMock.Object, _messageSessionMock.Object);
-
-            await Task.Delay(TimeSpan.FromSeconds(90));
-
-            _durableClientMock.Verify(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()), Times.Exactly(3));
-            Assert.AreEqual(1, cancelationRequestCount);
-        }
-
-        [TestMethod]
-        [Timeout(180000)]
-        public async Task ProcessSessionWithLastMessageTest()
-        {
-            var messageCount = 5;
-            var messages = new List<MessageInformation>();
-            var messageResponses = new List<GroupMembershipMessageResponse>();
-            var orchestrationStatuses = new List<DurableOrchestrationStatus>();
-
-            for (int i = 0; i < messageCount; i++)
-            {
-                // Generate sample messages
-                var isLastMessage = messageCount - 1 == i;
-                var groupMembership = JsonConvert.DeserializeObject<GroupMembership>(GetMessageBody());
-
-                groupMembership.IsLastMessage = isLastMessage;
-
-                var messageDetails = new MessageInformation
-                {
-                    Body = Encoding.UTF8.GetBytes(JsonConvert.SerializeObject(groupMembership)),
-                    LockToken = Guid.NewGuid().ToString(),
-                    SessionId = "dc04c21f-091a-44a9-a661-9211dd9ccf35"
-                };
-
-                messages.Add(messageDetails);
-
-                // Generate sample membership message responses
-                var output = new GroupMembershipMessageResponse
-                {
-                    CompletedGroupMembershipMessages = new List<GroupMembershipMessage>
-                    {
-                        new GroupMembershipMessage { LockToken = messageDetails.LockToken }
-                    },
-                    ShouldCompleteMessage = isLastMessage
-                };
-
-                messageResponses.Add(output);
-
-                // Generate sample orchestration statuses
-                orchestrationStatuses.Add
-                (
-                    new DurableOrchestrationStatus
-                    {
-                        RuntimeStatus = OrchestrationRuntimeStatus.Completed,
-                        Output = JToken.FromObject(output)
-                    }
-                );
-            }
-
-            var messageIndex = 0;
-            _messageService.Setup(x => x.GetMessageProperties(It.IsAny<Message>()))
-                            .Returns(() =>
-                            {
-                                messages[messageIndex].MessageId = Guid.NewGuid().ToString();
-                                var message = messages[messageIndex];
-                                messageIndex++;
-                                return message;
-                            });
-
-            var messageSessionIndex = 0;
-            _messageSessionMock.SetupGet(x => x.SessionId).Returns(() =>
-            {
-                var sessionId = messages[messageSessionIndex].SessionId;
-                messageSessionIndex++;
-                return sessionId;
+                IsEnabled = false,
+                Small = 400,
             });
 
-            _configuration.SetupGet(x => x["GraphUpdater:LastMessageWaitTimeout"]).Returns("1");
-
-            var cancelationRequestCount = 0;
-
-            _durableClientMock
-                 .Setup(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()))
-                 .Callback<string, object>((name, request) =>
-                 {
-                     var graphUpdaterRequest = request as GraphUpdaterFunctionRequest;
-                     if (graphUpdaterRequest != null && graphUpdaterRequest.IsCancelationRequest)
-                         cancelationRequestCount++;
-                 })
-                 .ReturnsAsync(_instanceId);
-
-            var statusIndex = 0;
-            _durableClientMock
-                .Setup(x => x.GetStatusAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<bool>(), It.IsAny<bool>()))
-                .ReturnsAsync(() =>
-                {
-                    var status = orchestrationStatuses[statusIndex];
-                    statusIndex++;
-                    return status;
-                });
-
-            var starterFunction = new StarterFunction(_loggerMock, _messageService.Object, _configuration.Object);
-            for(int i = 0; i < messageCount; i++)
-            {
-                await starterFunction.RunAsync(new Message(), _durableClientMock.Object, _messageSessionMock.Object);
-            }
-
-            await Task.Delay(TimeSpan.FromSeconds(90));
-
-            _durableClientMock.Verify(x => x.StartNewAsync(It.IsAny<string>(), It.IsAny<GraphUpdaterFunctionRequest>()), Times.Exactly(messageCount));
-            Assert.AreEqual(0, cancelationRequestCount);
+            _membershipUpdaters = Helpers.GetAvailableMembershipUpdaters(currentLaneSize: _laneSize);
         }
 
-        private string GetMessageBody()
+        [TestMethod]
+        public async Task ProcessValidRequestTest()
         {
-            var json =
-            "{" +
-            "  'Sources': [" +
-            "    {" +
-            "      'ObjectId': '8032abf6-b4b1-45b1-8e7e-40b0bd16d6eb'" +
-            "    }" +
-            "  ]," +
-            "  'Destination': {" +
-            "    'ObjectId': 'dc04c21f-091a-44a9-a661-9211dd9ccf35'" +
-            "  }," +
-            "  'SourceMembers': []," +
-            "  'RunId': '501f6c70-8fe1-496f-8446-befb15b5249a'," +
-            "  'SyncJobRowKey': '0a4cc250-69a0-4019-8298-96bf492aca01'," +
-            "  'SyncJobPartitionKey': '2021-01-01'," +
-            "  'Errored': false," +
-            "  'IsLastMessage': true" +
-            "}";
+            _multilaneConfig.Value.IsEnabled = false;
+            _membershipUpdaters = Helpers.GetAvailableMembershipUpdaters(currentLaneSize: null);
 
-            return json;
+            _instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_{_subscriptionName.ToLowerInvariant()}";
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<object>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(_instanceId);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()), Times.Once());
+        }
+        [TestMethod]
+        public async Task ProcessValidMultiLaneRequestTest()
+        {
+            _multilaneConfig.Value.IsEnabled = true;
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<object>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(_instanceId);
+
+            var instanceIdPrefix = $"{nameof(QueueMessageOrchestratorFunction)}_{_subscriptionName.ToLowerInvariant()}_";
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            var laneInstances = _membershipUpdaters.AvailableInstances["GroupMembership"][_laneSize].Instances;
+
+
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()), Times.Exactly(laneInstances));
+
+        }
+
+        [TestMethod]
+        public async Task RunSmallLaneAsync_ProcessesMessageSuccessfully()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                TotalMembersToAdd = 100,
+                TotalMembersToRemove = 50,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id"
+            );
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<OrchestratorMultiLaneRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("test-instance-id");
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunSmallLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.Is<OrchestratorMultiLaneRequest>(req =>
+                    req.GroupMembership.RunId == groupMembership.RunId &&
+                    req.SubscriptionName == "GraphUpdater_small_1" &&
+                    req.LaneSize == "small" &&
+                    req.TopicName == _membershipUpdaters.CurrentTopicName
+                ),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Once);
+
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithNewInstance_StartsOrchestrator()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                TotalMembersToAdd = 1000,
+                TotalMembersToRemove = 500,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var sequenceNumber = 12345L;
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: sequenceNumber
+            );
+
+            var expectedInstanceId = $"{groupMembership.RunId}_{sequenceNumber}";
+
+            _durableClientMock
+                .SetupSequence(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((OrchestrationMetadata)null)
+                .ReturnsAsync(new OrchestrationMetadata("test", "test") { RuntimeStatus = OrchestrationRuntimeStatus.Running })
+                .ReturnsAsync(new OrchestrationMetadata("test", "test") { RuntimeStatus = OrchestrationRuntimeStatus.Completed });
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<OrchestratorMultiLaneRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(expectedInstanceId);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.Is<OrchestratorMultiLaneRequest>(req =>
+                    req.GroupMembership.RunId == groupMembership.RunId &&
+                    req.SubscriptionName == "GraphUpdater_large_1" &&
+                    req.LaneSize == "large" &&
+                    req.TopicName == _membershipUpdaters.CurrentTopicName
+                ),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Once);
+
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithRunningInstance_WaitsForCompletion()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var sequenceNumber = 12345L;
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: sequenceNumber
+            );
+
+            var expectedInstanceId = $"{groupMembership.RunId}_{sequenceNumber}";
+
+            _durableClientMock
+                .SetupSequence(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")  // First call - instance is running
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Running
+                })
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")  // Second call - still running
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Running
+                })
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Completed // Completed (exists WaitForInstanceAsync)
+                });
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<OrchestratorMultiLaneRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);  // Should not start a new instance
+
+            _durableClientMock.Verify(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()), Times.AtLeast(2));
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithCompletedInstance_LogsAndReturns()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var sequenceNumber = 12345L;
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: sequenceNumber
+            );
+
+            var expectedInstanceId = $"{groupMembership.RunId}_{sequenceNumber}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Completed
+                });
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<OrchestratorMultiLaneRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);
+
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithException_LogsAndRethrows()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: 12345L
+            );
+
+            var expectedException = new InvalidOperationException("Test exception");
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ThrowsAsync(expectedException);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act & Assert
+            await Assert.ThrowsExceptionAsync<InvalidOperationException>(
+                async () => await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object));
+
+        }
+
+        [TestMethod]
+        public async Task GetInstanceInformation_ReturnsCorrectInstanceNames()
+        {
+            // Arrange
+            var smallLaneUpdaters = Helpers.GetAvailableMembershipUpdaters(
+                "[{\"name\":\"GroupMembership\",\"lanes\":[{\"name\":\"small\",\"instances\":1,\"messageSize\":400},{\"name\":\"large\",\"instances\":1,\"messageSize\":400}]}]",
+                "small");
+
+            var starterFunction = new StarterFunction(_logger, smallLaneUpdaters, _multilaneConfig);
+
+            // Act - Use reflection to test the private method
+            var method = typeof(StarterFunction).GetMethod("GetInstanceInformation",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+            var result = (List<string>)method.Invoke(starterFunction, null);
+
+            // Assert
+            Assert.AreEqual(1, result.Count);
+            Assert.AreEqual("GraphUpdater_small_1", result[0]);
+        }
+
+        [TestMethod]
+        public async Task RunAsync_WithMultiLaneDisabled_ProcessesSingleTimer()
+        {
+            // Arrange
+            _multilaneConfig.Value.IsEnabled = false;
+            _membershipUpdaters = Helpers.GetAvailableMembershipUpdaters(currentLaneSize: null);
+
+            var instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_graphupdater";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(instanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((OrchestrationMetadata)null);
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(instanceId);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            // Act
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.Is<QueueMessageOrchestratorRequest>(req =>
+                    req.SubscriptionName == "GraphUpdater" &&
+                    req.IsMultiLaneEnabled == false
+                ),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task RunAsync_WithMultiLaneEnabled_ProcessesMultipleInstances()
+        {
+            // Arrange
+            _multilaneConfig.Value.IsEnabled = true;
+            _multilaneConfig.Value.TriggerDelay = 0;
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((OrchestrationMetadata)null);
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("instance-id");
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            // Act
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            // Assert
+            var laneInstances = _membershipUpdaters.AvailableInstances["GroupMembership"][_laneSize].Instances;
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<QueueMessageOrchestratorRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.AtLeast(1));  // At least one instance should be started
+        }
+
+        [TestMethod]
+        public async Task RunAsync_WithMultiLaneEnabledButNoLaneSize_Returns()
+        {
+            // Arrange
+            _multilaneConfig.Value.IsEnabled = true;
+            _membershipUpdaters = Helpers.GetAvailableMembershipUpdaters(currentLaneSize: null);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            // Act
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<QueueMessageOrchestratorRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task RunAsync_WithMultiLaneDisabledButHasLaneSize_Returns()
+        {
+            // Arrange
+            _multilaneConfig.Value.IsEnabled = false;
+            _membershipUpdaters = Helpers.GetAvailableMembershipUpdaters(currentLaneSize: "small");
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            // Act
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<QueueMessageOrchestratorRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task ProcessTimerAsync_WithRunningOrchestrator_DoesNotStartNew()
+        {
+            // Arrange
+            var subscriptionName = "GraphUpdater_small_1";
+            var instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_{subscriptionName.ToLowerInvariant()}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(instanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Running
+                });
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act - Use reflection to test the private method
+            var method = typeof(StarterFunction).GetMethod("ProcessTimerAsync",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            var task = (Task)method.Invoke(starterFunction, new object[] { _durableClientMock.Object, subscriptionName });
+            await task;
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<QueueMessageOrchestratorRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);
+
+        }
+
+        [TestMethod]
+        public async Task ProcessTimerAsync_WithFailedOrchestrator_StartsNew()
+        {
+            // Arrange
+            var subscriptionName = "GraphUpdater_small_1";
+            var instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_{subscriptionName.ToLowerInvariant()}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(instanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Failed
+                });
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(instanceId);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act - Use reflection to test the private method
+            var method = typeof(StarterFunction).GetMethod("ProcessTimerAsync",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            var task = (Task)method.Invoke(starterFunction, new object[] { _durableClientMock.Object, subscriptionName });
+            await task;
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.Is<QueueMessageOrchestratorRequest>(req =>
+                    req.SubscriptionName == subscriptionName &&
+                    req.IsMultiLaneEnabled == _multilaneConfig.Value.IsEnabled
+                ),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Once);
+
+        }
+
+        [TestMethod]
+        public async Task ProcessTimerAsync_WithTerminatedOrchestrator_StartsNew()
+        {
+            // Arrange
+            var subscriptionName = "GraphUpdater_large_1";
+            var instanceId = $"{nameof(QueueMessageOrchestratorFunction)}_{subscriptionName.ToLowerInvariant()}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(instanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Terminated
+                });
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(instanceId);
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act - Use reflection to test the private method
+            var method = typeof(StarterFunction).GetMethod("ProcessTimerAsync",
+                System.Reflection.BindingFlags.NonPublic | System.Reflection.BindingFlags.Instance);
+
+            var task = (Task)method.Invoke(starterFunction, new object[] { _durableClientMock.Object, subscriptionName });
+            await task;
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.Is<QueueMessageOrchestratorRequest>(req =>
+                    req.SubscriptionName == subscriptionName
+                ),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Once);
+
+        }
+
+        [TestMethod]
+        public async Task RunAsync_WithTriggerDelay_ProcessesWithDelay()
+        {
+            // Arrange
+            _multilaneConfig.Value.IsEnabled = true;
+            _multilaneConfig.Value.TriggerDelay = 1; // 1 second delay for faster test
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(It.IsAny<string>(), It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync((OrchestrationMetadata)null);
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<QueueMessageOrchestratorRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("instance-id");
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+            var timer = new TimerInfo();
+
+            // Act
+            await starterFunction.RunAsync(timer, _durableClientMock.Object);
+
+            // Assert - Verify that the delay configuration was set and the orchestrator was started
+            Assert.AreEqual(1, _multilaneConfig.Value.TriggerDelay);
+
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<QueueMessageOrchestratorRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.AtLeast(1));
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithFailedInstance_LogsCorrectStatus()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var sequenceNumber = 12345L;
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: sequenceNumber
+            );
+
+            var expectedInstanceId = $"{groupMembership.RunId}_{sequenceNumber}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Failed
+                });
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+            _durableClientMock.Verify(x => x.ScheduleNewOrchestrationInstanceAsync(
+                It.IsAny<TaskName>(),
+                It.IsAny<OrchestratorMultiLaneRequest>(),
+                It.IsAny<StartOrchestrationOptions>(),
+                It.IsAny<CancellationToken>()
+            ), Times.Never);
+
+        }
+
+        [TestMethod]
+        public async Task RunLargeLaneAsync_WithTerminatedInstance_LogsCorrectStatus()
+        {
+            // Arrange
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                SourceMembers = new List<AzureADUser>()
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var sequenceNumber = 12345L;
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id",
+                sequenceNumber: sequenceNumber
+            );
+
+            var expectedInstanceId = $"{groupMembership.RunId}_{sequenceNumber}";
+
+            _durableClientMock
+                .Setup(x => x.GetInstanceAsync(expectedInstanceId, It.IsAny<bool>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync(new OrchestrationMetadata("test", "test")
+                {
+                    RuntimeStatus = OrchestrationRuntimeStatus.Terminated
+                });
+
+            var starterFunction = new StarterFunction(_logger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunLargeLaneAsync(message, _durableClientMock.Object);
+
+            // Assert
+        }
+
+        [TestMethod]
+        public async Task RunSmallLaneAsync_LogsPerMessageAdditionsAndRemovals()
+        {
+            // Arrange: a single message carrying 3 add-tagged and 2 remove-tagged users.
+            // The whole-job totals are deliberately different (50000/0) to prove the log
+            // reports this message's counts, not the job totals stamped on every chunk.
+            var sourceMembers = new List<AzureADUser>();
+            for (var i = 0; i < 3; i++)
+                sourceMembers.Add(new AzureADUser { ObjectId = Guid.NewGuid(), MembershipAction = MembershipAction.Add });
+            for (var i = 0; i < 2; i++)
+                sourceMembers.Add(new AzureADUser { ObjectId = Guid.NewGuid(), MembershipAction = MembershipAction.Remove });
+
+            var groupMembership = new GroupMembership
+            {
+                RunId = Guid.NewGuid(),
+                SyncJob = _syncJob,
+                TotalMembersToAdd = 50000,
+                TotalMembersToRemove = 0,
+                TotalMessageCount = 150,
+                SourceMembers = sourceMembers
+            };
+
+            var messageBody = JsonSerializer.SerializeToUtf8Bytes(groupMembership);
+            var message = ServiceBusModelFactory.ServiceBusReceivedMessage(
+                body: BinaryData.FromBytes(messageBody),
+                messageId: "test-message-id"
+            );
+
+            _durableClientMock
+                .Setup(x => x.ScheduleNewOrchestrationInstanceAsync(It.IsAny<TaskName>(), It.IsAny<OrchestratorMultiLaneRequest>(), It.IsAny<StartOrchestrationOptions>(), It.IsAny<CancellationToken>()))
+                .ReturnsAsync("test-instance-id");
+
+            var capturingLogger = new CapturingLogger<StarterFunction>();
+            var starterFunction = new StarterFunction(capturingLogger, _membershipUpdaters, _multilaneConfig);
+
+            // Act
+            await starterFunction.RunSmallLaneAsync(message, _durableClientMock.Object);
+
+            // Assert: EventId 20010 reports THIS message's 3 adds / 2 removes, not the 50000/0 job totals.
+            var processingLog = capturingLogger.Entries.SingleOrDefault(e => e.EventId == 20010);
+            Assert.IsNotNull(processingLog.Message, "Expected the ProcessingMessage (EventId 20010) log to be emitted.");
+            StringAssert.Contains(processingLog.Message, "with 3 additions and 2 removals");
+            StringAssert.Contains(processingLog.Message, "(of 150)", "EventId 20010 must show the total message count so progress (index of total) is visible.");
+            Assert.IsFalse(processingLog.Message.Contains("50000"), "The log must report per-message counts, not the whole-job totals.");
+        }
+
+        private sealed class CapturingLogger<T> : ILogger<T>
+        {
+            public List<(int EventId, string Message)> Entries { get; } = new List<(int EventId, string Message)>();
+
+            public IDisposable BeginScope<TState>(TState state) => NullScope.Instance;
+
+            public bool IsEnabled(Microsoft.Extensions.Logging.LogLevel logLevel) => true;
+
+            public void Log<TState>(Microsoft.Extensions.Logging.LogLevel logLevel, EventId eventId, TState state, Exception exception, Func<TState, Exception, string> formatter)
+                => Entries.Add((eventId.Id, formatter(state, exception)));
+
+            private sealed class NullScope : IDisposable
+            {
+                public static readonly NullScope Instance = new NullScope();
+                public void Dispose() { }
+            }
         }
     }
 }
+
+

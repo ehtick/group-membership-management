@@ -5,9 +5,17 @@
 name: $(major).$(minor).$(Date:yyMM).$(Rev:r)
 
 trigger:
-- develop
-- master
-- users/*
+- stable
+- release
+- main
+
+schedules:
+  - cron: "0 0 * * 0"
+    displayName: Weekly Build
+    branches:
+      include:
+      - main
+    always: true
 
 pool:
   vmImage: "windows-latest"
@@ -16,112 +24,99 @@ variables:
   "major": '2'
   "minor": '0'
   "BuildConfiguration": 'debug'
-  "SolutionAbbreviation": 'gmm'
   disable.coverage.autogenerate: 'true'
+  "buildRelease": ${{ in(variables['Build.SourceBranch'], 'refs/heads/main') }}
+
+parameters:
+  - name: buildSourceCode
+    displayName: Build source code?
+    type: boolean
+    default: true
 
 stages:
 
-- template: build-services.yml
+- template: build-tag.yml
   parameters:
-    repoToCheckout: ''
-    checkoutPath: ''
+    tagName: $(Build.BuildNumber)
 
-- template: yaml/build-functionapps.yml
-  parameters:
-    dependsOn: Build_Common
-    condition: succeeded('Build_Common')
-    repoToCheckout: ''
-    checkoutPath: ''
-    functionApps:
-    - function:
-       name: 'JobTrigger'
-       coverageThreshold: 97
-    - function:
-       name: 'GraphUpdater'
-       coverageThreshold: 78
-    - function:
-       name: 'SecurityGroup'
-       coverageThreshold: 95
-    - function:
-        name: 'AzureTableBackup'
-        coverageThreshold: 95
-    - function:
-        name: 'AzureUserReader'
-        coverageThreshold: 45
-    - function:
-        name: 'JobScheduler'
-        coverageThreshold: 65
+- ${{ if or(eq( variables['Build.Reason'], 'Schedule' ), eq(parameters.buildSourceCode, true)) }}:
+  - template: build-services.yml
+    parameters:
+      repoToCheckout: self
+      checkoutPath: '$(Build.BuildNumber)'
+      buildRelease: ${{variables.buildRelease}}
 
-- template: yaml/deploy-pipeline.yml
-  parameters:
-    solutionAbbreviation: '$(SolutionAbbreviation)'
-    environmentAbbreviation: 'int'
-    tenantId: $(tenantId)
-    keyVaultReaders: $(keyVaultReaders_nonprod)
-    location: $(location)
-    serviceConnection: '$(SolutionAbbreviation)-serviceconnection-int'
-    dependsOn: Build_Functions
-    stageName: 'NonProd_int'
-    functionApps:
-    - name: 'JobTrigger'
-    - name: 'GraphUpdater'
-    - name: 'SecurityGroup'
-    - name: 'AzureTableBackup'
-    - name: 'AzureUserReader'
-    - name: 'JobScheduler'
-    condition: |
-      and(
-        succeeded('Build_Functions'),
-        eq(variables['Build.SourceBranch'], 'refs/heads/develop'),
-        in(variables['Build.Reason'], 'IndividualCI', 'Manual')
-      )
+  - template: yaml/build-functionapps.yml
+    parameters:
+      dependsOn: Build_Common
+      condition: succeeded('Build_Common')
+      repoToCheckout: self
+      checkoutPath: '$(Build.BuildNumber)'
+      buildRelease: ${{variables.buildRelease}}
+      functionApps:
+      - function:
+         name: 'NonProdService'
+         coverageThreshold: 100
+      - function:
+         name: 'JobTrigger'
+         coverageThreshold: 83
+      - function:
+         name: 'GraphUpdater'
+         coverageThreshold: 74
+      - function:
+         name: 'TeamsChannelUpdater'
+         coverageThreshold: 69
+      - function:
+         name: 'DestinationAttributesUpdater'
+         coverageThreshold: 64
+      - function:
+         name: 'GroupMembershipObtainer'
+         coverageThreshold: 73
+      - function:
+         name: 'SqlMembershipObtainer'
+         coverageThreshold: 40
+      - function:
+         name: 'PlaceMembershipObtainer'
+         coverageThreshold: 45
+      - function:
+         name: 'TeamsChannelMembershipObtainer'
+         coverageThreshold: 72
+      - function:
+         name: 'AzureMaintenance'
+         coverageThreshold: 95
+      - function:
+         name: 'AzureUserReader'
+         coverageThreshold: 62
+      - function:
+         name: 'JobScheduler'
+         coverageThreshold: 48
+      - function:
+         name: 'MembershipAggregator'
+         coverageThreshold: 74
+      - function:
+         name: 'Notifier'
+         coverageThreshold: 75
+      - function:
+         name: 'GroupOwnershipObtainer'
+         coverageThreshold: 80
+      - function:
+         name: 'SyncJobUpdater'
+         coverageThreshold: 40
+      - function:
+         name: 'MessageSplitter'
+         coverageThreshold: 40
+      - function:
+         name: 'AutoApprover'
+         coverageThreshold: 0
+      - function:
+         name: 'SqlDataChecker'
+         coverageThreshold: 0
+      - function:
+         name: 'AgentReader'
+         coverageThreshold: 55
 
-- template: yaml/deploy-pipeline.yml
-  parameters:
-    solutionAbbreviation: '$(SolutionAbbreviation)'
-    environmentAbbreviation: 'ua'
-    tenantId: $(tenantId)
-    keyVaultReaders: $(keyVaultReaders_nonprod)
-    location: $(location)
-    serviceConnection: '$(SolutionAbbreviation)-serviceconnection-ua'
-    dependsOn: Build_Functions
-    stageName: 'NonProd_ua'
-    functionApps:
-    - name: 'JobTrigger'
-    - name: 'GraphUpdater'
-    - name: 'SecurityGroup'
-    - name: 'AzureTableBackup'
-    - name: 'AzureUserReader'
-    - name: 'JobScheduler'
-    condition: |
-      and(
-          succeeded('Build_Functions'),
-          eq(variables['Build.SourceBranch'], 'refs/heads/master'),
-          in(variables['Build.Reason'], 'IndividualCI', 'Manual')
-      )
-
-
-- template: yaml/deploy-pipeline.yml
-  parameters:
-    solutionAbbreviation: '$(SolutionAbbreviation)'
-    environmentAbbreviation: 'prodv2'
-    tenantId: $(tenantId)
-    keyVaultReaders: $(keyVaultReaders_prod)
-    location: $(location)
-    serviceConnection: '$(SolutionAbbreviation)-serviceconnection-prodv2'
-    dependsOn: NonProd_ua
-    stageName: 'Prod_production'
-    functionApps:
-    - name: 'JobTrigger'
-    - name: 'GraphUpdater'
-    - name: 'SecurityGroup'
-    - name: 'AzureTableBackup'
-    - name: 'AzureUserReader'
-    - name: 'JobScheduler'
-    condition: |
-      and(
-        succeeded('NonProd_ua'),
-        succeeded('Build_Functions'),
-        eq(variables['Build.SourceBranch'], 'refs/heads/master'),
-        in(variables['Build.Reason'], 'IndividualCI', 'Manual')
-      )
+  - template: yaml/build-release-package.yml
+    parameters:
+      repoToCheckout: self
+      checkoutPath: '$(Build.BuildNumber)'
+      buildRelease: ${{variables.buildRelease}}

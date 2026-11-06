@@ -1,0 +1,72 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Services;
+using Services.Contracts;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using Services.WebApi;
+
+namespace WebApi.Configuration
+{
+    public static class MessageHandlerInjector
+    {
+        public static IServiceCollection InjectMessageHandlers(this IServiceCollection services)
+        {
+            services.AddTransient<IRequestHandler<SearchGroupsRequest, SearchGroupsResponse>, SearchGroupsHandler>();
+            services.AddTransient<IRequestHandler<SearchChannelsRequest, SearchChannelsResponse>, SearchChannelsHandler>();
+            services.AddTransient<IRequestHandler<GetGroupEndpointsRequest, GetGroupEndpointsResponse>, GetGroupEndpointsHandler>();
+            services.AddTransient<IRequestHandler<GetGroupOwnersRequest, GetGroupOwnersResponse>, GetGroupOwnersHandler>();
+            services.AddTransient<IRequestHandler<GetGroupMembersRequest, GetGroupMembersResponse>, GetGroupMembersHandler>();
+            services.AddTransient<IRequestHandler<GetGroupOnboardingStatusRequest, GetOnboardingStatusResponse>, GetGroupOnboardingStatusHandler>();
+            services.AddTransient<IRequestHandler<GetChannelOnboardingStatusRequest, GetOnboardingStatusResponse>, GetChannelOnboardingStatusHandler>();
+            services.AddTransient<IRequestHandler<PostGroupRequest, PostGroupResponse>, PostGroupHandler>();
+
+            services.AddTransient<IRequestHandler<GetSettingRequest, GetSettingResponse>, GetSettingHandler>();
+            services.AddTransient<IRequestHandler<GetAllSettingsRequest, GetAllSettingsResponse>, GetAllSettingsHandler>();
+            services.AddTransient<IRequestHandler<PatchSettingRequest, NullResponse>, PatchSettingHandler>();
+
+            services.AddTransient<IRequestHandler<GetDefaultSqlMembershipSourceRequest, GetDefaultSqlMembershipSourceResponse>, GetDefaultSqlMembershipSourceHandler>();
+            services.AddTransient<IRequestHandler<GetDefaultSqlMembershipSourceAttributesRequest, GetDefaultSqlMembershipSourceAttributesResponse>, GetDefaultSqlMembershipSourceAttributesHandler>();
+            services.AddTransient<IRequestHandler<GetDefaultSqlMembershipSourceAttributeMappingsRequest, GetDefaultSqlMembershipSourceAttributeMappingsResponse>, GetDefaultSqlMembershipSourceAttributeMappingsHandler>();
+            services.AddTransient<IRequestHandler<ResolveDefaultSqlMembershipSourceAttributeMappingsRequest, ResolveDefaultSqlMembershipSourceAttributeMappingsResponse>, ResolveDefaultSqlMembershipSourceAttributeMappingsHandler>();
+            services.AddTransient<IRequestHandler<GetDefaultSqlMembershipSourceAttributeValuesRequest, GetDefaultSqlMembershipSourceAttributeValuesResponse>, GetDefaultSqlMembershipSourceAttributeValuesHandler>();
+            services.AddTransient<IRequestHandler<GetSupportEmailRequest, GetSupportEmailResponse>, GetSupportEmailHandler>();
+            services.AddTransient<IRequestHandler<PatchDefaultSqlMembershipSourceCustomLabelRequest, NullResponse>, PatchDefaultSqlMembershipSourceCustomLabelHandler>();
+            services.AddTransient<IRequestHandler<PatchDefaultSqlMembershipSourceAttributesRequest, NullResponse>, PatchDefaultSqlMembershipSourceAttributesHandler>();
+            services.AddTransient<IRequestHandler<GetSqlValidationRequest, GetSqlValidationResponse>, GetSqlValidationHandler>();
+
+            services.AddTransient<IRequestHandler<GetJobsRequest, GetJobsResponse>, GetJobsHandler>();
+            services.AddTransient<IRequestHandler<PatchJobsRequest, PatchJobsResponse>, PatchJobsHandler>();
+            services.AddTransient<IRequestHandler<GetJobDetailsRequest, GetJobDetailsResponse>, GetJobDetailsHandler>();
+            services.AddTransient<IRequestHandler<SpotCheckUserMembershipRequest, SpotCheckUserMembershipResponse>, SpotCheckUserMembershipHandler>();
+            services.AddTransient<IRequestHandler<GetGroupRequest, GetGroupResponse>, GetGroupHandler>();
+            services.AddTransient<IRequestHandler<GetChannelRequest, GetChannelResponse>, GetChannelHandler>();
+
+            services.AddTransient<IRequestHandler<ResolveNotificationRequest, ResolveNotificationResponse>, ResolveNotificationHandler>();
+
+            services.AddTransient<IRequestHandler<GetOrgLeaderDetailsRequest, GetOrgLeaderDetailsResponse>, GetOrgLeaderDetailsHandler>();
+            services.AddTransient<IRequestHandler<GetOrgLeaderRequest, GetOrgLeaderResponse>, GetOrgLeaderHandler>();
+
+            services.AddTransient<IRequestHandler<PatchJobRequest, PatchJobResponse>, PatchJobHandler>();
+            services.AddTransient<IRequestHandler<PostJobRequest, PostJobResponse>, PostJobHandler>();
+            services.AddTransient<IRequestHandler<RemoveGMMRequest, RemoveGMMResponse>, RemoveGMMHandler>();
+            services.AddTransient<IRequestHandler<GetJobChangesRequest, GetJobChangesResponse>, GetJobChangesHandler>();
+            services.AddTransient<IRequestHandler<GetSyncJobHistoryRequest, GetSyncJobHistoryResponse>, GetSyncJobHistoryHandler>();
+            services.AddTransient<IRequestHandler<SearchSyncHistoryByUserRequest, SearchSyncHistoryByUserResponse>, SearchSyncHistoryByUserHandler>();
+            services.AddTransient<IRequestHandler<GetSyncExplanationRequest, GetSyncExplanationResponse>, GetSyncExplanationHandler>();
+            services.AddTransient<IRequestHandler<GetRunExplanationRequest, GetRunExplanationResponse>, GetRunExplanationHandler>();
+            services.AddTransient<IRequestHandler<GetMembershipDownloadRequest, GetMembershipDownloadResponse>, GetMembershipDownloadHandler>();
+            services.AddTransient<IRequestHandler<GetThresholdNotificationRequest, GetThresholdNotificationResponse>, GetThresholdNotificationHandler>();
+
+            services.AddTransient<IRequestHandler<PostOperationRequest, PostOperationResponse>, PostOperationHandler>();
+            services.AddTransient<IRequestHandler<GetServiceStatusRequest, GetServiceStatusResponse>, GetServiceStatusHandler>();
+
+            services.AddTransient<IRequestHandler<CopilotChatRequest, CopilotChatResponse>, CopilotChatHandler>();
+
+            services.AddTransient<IRequestHandler<RefineFeedbackRequest, RefineFeedbackResponse>, RefineFeedbackHandler>();
+
+            return services;
+        }
+    }
+}

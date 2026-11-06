@@ -1,0 +1,650 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Azure.Core;
+using Azure.Identity;
+using Azure.Messaging.ServiceBus;
+using Common.DependencyInjection;
+using DIConcreteTypes;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Authentication.JwtBearer;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.RateLimiting;
+using System.Security.Claims;
+using System.Threading.RateLimiting;
+using Microsoft.AspNetCore.Mvc.ApiExplorer;
+using Microsoft.AspNetCore.Mvc.Versioning;
+using Microsoft.AspNetCore.OData;
+using Microsoft.EntityFrameworkCore;
+using Microsoft.Extensions.Options;
+using Microsoft.Graph;
+using Microsoft.Identity.Web;
+using Microsoft.IdentityModel.Protocols;
+using Microsoft.IdentityModel.Protocols.OpenIdConnect;
+using Microsoft.IdentityModel.Tokens;
+using Microsoft.IdentityModel.Validators;
+using Microsoft.OpenApi.Models;
+using Repositories.BlobStorage;
+using Repositories.Contracts;
+using Repositories.Contracts.InjectConfig;
+using Repositories.DataFactory;
+using Repositories.EntityFramework;
+using Repositories.EntityFramework.Contexts;
+using Repositories.GraphGroups;
+using Repositories.Localization;
+using Repositories.NotificationsRepository;
+using Repositories.ServiceBusQueue;
+using Repositories.ServiceStatus;
+using Repositories.SqlMembershipRepository;
+using Repositories.TeamsChannel;
+using Services.Contracts;
+using Services.Entities;
+using Services.WebApi;
+using Services.WebApi.Contracts;
+using Services.WebApi.DependencyInjection;
+using WebApi.BackgroundServices;
+using WebApi.Configuration;
+using WebApi.Models;
+
+namespace WebApi
+{
+    public class Program
+    {
+        public static void Main(string[] args)
+        {
+            var builder = WebApplication.CreateBuilder(args);
+
+            if (builder.Environment.IsDevelopment())
+            {
+                builder.AddServiceDefaults();
+            }
+
+            builder.Services.AddHttpContextAccessor();
+
+            builder.Services.AddControllers(options =>
+            {
+                options.InputFormatters.Insert(0, JsonPatchFormatter.GetJsonPatchInputFormatter());
+            });
+
+            builder.Services.AddProblemDetails();
+            builder.Services.AddExceptionHandler<WebApi.ExceptionHandling.GmmExceptionHandler>();
+
+            var azureAdConfigSection = builder.Configuration.GetSection("AzureAd");
+            var azureAdTenantId = azureAdConfigSection.GetValue<string>("TenantId");
+            var azureAdClientId = azureAdConfigSection.GetValue<string>("ClientId");
+            var azureAdInstanceUrl = azureAdConfigSection.GetValue<string>("Instance");
+            azureAdInstanceUrl += azureAdInstanceUrl.Last() == '/' ? string.Empty : "/";
+
+            builder.Services.AddDbContext<GMMContext>(options =>
+                options.UseSqlServer(builder.Configuration.GetConnectionString("JobsContext"), sqlServerOptions =>
+                {
+                    sqlServerOptions.EnableRetryOnFailure();
+                }));
+
+            builder.Services.AddDbContext<GMMReadContext>(options =>
+                options.UseSqlServer(builder.Configuration.GetConnectionString("JobsContextReadOnly"), sqlServerOptions =>
+                {
+                    sqlServerOptions.EnableRetryOnFailure();
+                }));
+
+            builder.Services.Configure<WebAPISettings>(builder.Configuration.GetSection("WebAPI:Settings"));
+            builder.Configuration.AddAzureAppConfiguration(options =>
+            {
+                DefaultAzureCredential credential = new(DefaultAzureCredential.DefaultEnvironmentVariableName);
+
+                var appConfigurationEndpoint = builder.Configuration.GetValue<string>("Settings:appConfigurationEndpoint");
+                options.Connect(new Uri(appConfigurationEndpoint), credential)
+                    .Select("WebAPI:*")
+                    .ConfigureRefresh(refreshOptions =>
+                    {
+                        refreshOptions.Register("WebAPI:Settings:Sentinel", refreshAll: true);
+                    })
+                    .Select("Mail:*")
+                    .Select("GraphAPI:*")
+                    .Select("PendingConfiguration:*")
+                    .Select("TeamsChannel:*")
+                    .Select("AzureMaintenance:*");
+            });
+
+            // Add services to the container.
+            builder.Services.AddAzureAppConfiguration();
+
+            builder.Services
+                .AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
+                .AddMicrosoftIdentityWebApi(azureAdConfigSection);
+
+            builder.Services.Configure<JwtBearerOptions>(JwtBearerDefaults.AuthenticationScheme, async options =>
+            {
+                var tenantSigningKeys = await GetSigningKeysFromUrlAsync($"{azureAdInstanceUrl}{azureAdTenantId}/.well-known/openid-configuration");
+                var tenantSigningKeysv2 = await GetSigningKeysFromUrlAsync($"{azureAdInstanceUrl}{azureAdTenantId}/v2.0/.well-known/openid-configuration");
+
+                var validAudiences = new[] {
+                        $"api://{azureAdClientId}",
+                        azureAdClientId
+                    };
+
+                options.TokenValidationParameters = new TokenValidationParameters
+                {
+                    ValidateAudience = true,
+                    ValidAudiences = validAudiences,
+                    ValidateIssuer = true,
+                    ValidIssuers = new[] {
+                        $"https://sts.windows.net/{azureAdTenantId}/",
+                        $"https://login.microsoftonline.com/{azureAdTenantId}/v2.0"
+                    },
+                    ValidateIssuerSigningKey = true,
+                    IssuerSigningKeys = tenantSigningKeys.Concat(tenantSigningKeysv2)
+                };
+
+                options.TokenValidationParameters.EnableAadSigningKeyIssuerValidation();
+                
+                options.Events.OnTokenValidated = async context =>
+                {
+                    // Notification endpoints are reached with a delegated user token from the GMM UI
+                    var path = context.HttpContext.Request.Path.Value;
+                    if (path != null && path.Contains("/notifications", StringComparison.OrdinalIgnoreCase))
+                    {
+                        var scopeClaim = context.Principal?.Claims.FirstOrDefault(c => c.Type == "scp" || c.Type == "http://schemas.microsoft.com/identity/claims/scope")?.Value;
+                        var scopes = (scopeClaim ?? string.Empty).Split(' ', StringSplitOptions.RemoveEmptyEntries);
+
+                        if (!scopes.Contains("user_impersonation", StringComparer.Ordinal))
+                        {
+                            context.Fail("Required scope 'user_impersonation' not present in token");
+                            return;
+                        }
+                    }
+                    await Task.CompletedTask;
+                };
+                
+                options.Events.OnMessageReceived = async context =>
+                {
+                    context.Options.TokenValidationParameters.ConfigurationManager ??= options.ConfigurationManager as BaseConfigurationManager;
+                    await Task.CompletedTask.ConfigureAwait(false);
+                };
+            });
+
+            builder.Services.AddApiVersioning(opt =>
+                {
+                    opt.DefaultApiVersion = new ApiVersion(1, 0);
+                    opt.AssumeDefaultVersionWhenUnspecified = true;
+                    opt.ReportApiVersions = true;
+                    opt.ApiVersionReader = new UrlSegmentApiVersionReader();
+                });
+
+            // Add ApiExplorer to discover versions
+            builder.Services.AddVersionedApiExplorer(setup =>
+            {
+                setup.GroupNameFormat = "'v'VVV";
+                setup.SubstituteApiVersionInUrl = true;
+            });
+
+            builder.Services.AddControllers()
+                            .AddOData(options =>
+                            {
+                                options.Select().Filter().OrderBy().SetMaxTop(100);
+                            });
+            builder.Services.AddEndpointsApiExplorer();
+            builder.Services.AddSwaggerGen(options =>
+            {
+                // Hide ODataQueryOptions in Swagger
+                options.OperationFilter<IgnoreODataQueryOptionsOperationFilter>();
+
+                // Enabled OAuth security in Swagger
+                options.AddSecurityDefinition("WebApiAuth2", new OpenApiSecurityScheme
+                {
+                    Type = SecuritySchemeType.OAuth2,
+                    Flows = new OpenApiOAuthFlows
+                    {
+                        Implicit = new OpenApiOAuthFlow()
+                        {
+                            AuthorizationUrl = new Uri($"{azureAdInstanceUrl}{azureAdTenantId}/oauth2/authorize"),
+                            TokenUrl = new Uri($"{azureAdInstanceUrl}{azureAdTenantId}/oauth2/token")
+                        }
+                    }
+                });
+
+                options.AddSecurityRequirement(new OpenApiSecurityRequirement
+                    {
+                        {
+                            new OpenApiSecurityScheme
+                            {
+                                Reference = new OpenApiReference { Type = ReferenceType.SecurityScheme, Id = "WebApiAuth2" }
+                            },
+                            new[] { "user_impersonation" }
+                        }
+                    });
+
+            });
+
+            builder.Services.AddCors();
+
+            builder.Services.AddRateLimiter(options =>
+            {
+                options.RejectionStatusCode = StatusCodes.Status429TooManyRequests;
+
+                options.GlobalLimiter = PartitionedRateLimiter.Create<HttpContext, string>(httpContext =>
+                {
+                    // Exclude SignalR hub from rate limiting
+                    if (httpContext.Request.Path.StartsWithSegments("/servicestatus"))
+                    {
+                        return RateLimitPartition.GetNoLimiter("signalr");
+                    }
+
+                    // Partition authenticated users by their object ID for fairness
+                    var userId = httpContext.User?.FindFirstValue("http://schemas.microsoft.com/identity/claims/objectidentifier");
+                    if (!string.IsNullOrEmpty(userId))
+                    {
+                        return RateLimitPartition.GetSlidingWindowLimiter(
+                            partitionKey: $"user_{userId}",
+                            factory: _ => new SlidingWindowRateLimiterOptions
+                            {
+                                PermitLimit = 200,
+                                Window = TimeSpan.FromMinutes(1),
+                                SegmentsPerWindow = 4,
+                                QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                                QueueLimit = 0
+                            });
+                    }
+
+                    // Stricter limit for unauthenticated requests (bot probes, scanners)
+                    var clientIp = httpContext.Connection.RemoteIpAddress?.ToString() ?? "unknown";
+                    return RateLimitPartition.GetSlidingWindowLimiter(
+                        partitionKey: $"ip_{clientIp}",
+                        factory: _ => new SlidingWindowRateLimiterOptions
+                        {
+                            PermitLimit = 30,
+                            Window = TimeSpan.FromMinutes(1),
+                            SegmentsPerWindow = 4,
+                            QueueProcessingOrder = QueueProcessingOrder.OldestFirst,
+                            QueueLimit = 0
+                        });
+                });
+
+                options.OnRejected = async (context, cancellationToken) =>
+                {
+                    context.HttpContext.Response.Headers.RetryAfter = "60";
+
+                    var logger = context.HttpContext.RequestServices.GetService<ILogger<Program>>();
+                    logger?.LogWarning(
+                        "Rate limit exceeded: {Method} {Path} from {RemoteIp}",
+                        context.HttpContext.Request.Method,
+                        context.HttpContext.Request.Path,
+                        context.HttpContext.Connection.RemoteIpAddress);
+
+                    await context.HttpContext.Response.WriteAsync(
+                        "Too many requests. Please try again later.",
+                        cancellationToken);
+                };
+            });
+
+            builder.Services.ConfigureOptions<ConfigureSwaggerOptions>();
+            builder.Services.AddOptions<TelemetryInitializerConfig>().Configure<IConfiguration>((settings, configuration) =>
+            {
+                configuration.GetSection("Settings:TelemetryInitializer").Bind(settings);
+            });
+            builder.Services.AddSingleton(services =>
+            {
+                var config = services.GetRequiredService<IOptions<TelemetryInitializerConfig>>();
+                return config.Value;
+            });
+            builder.Services.AddApplicationInsightsTelemetry();
+            builder.Services.AddSingleton<ITelemetryInitializer>(sp => new ConstantOperationNameInitializer("WebAPI"));
+            builder.Services.AddSingleton<ITelemetryInitializer, TelemetryInitializer>();
+            builder.Services.AddApplicationInsightsTelemetryProcessor<TelemetryProcessor>();
+
+            builder.Services.InjectMessageHandlers();
+
+            builder.Services.AddTransient<INotificationService, NotificationService>();
+
+            builder.Services.AddLocalization(options =>
+            {
+                options.ResourcesPath = "Resources";
+            });
+            builder.Services.AddSingleton<ILocalizationRepository, LocalizationRepository>();
+
+            builder.Services.AddOptions<DataFactorySecrets<IDataFactoryRepository>>().Configure<IConfiguration>((settings, configuration) =>
+            {
+                settings.Pipeline = configuration.GetValue<string>("ADF:Pipeline");
+                settings.DataFactoryName = configuration.GetValue<string>("ADF:DataFactoryName");
+                settings.SubscriptionId = configuration.GetValue<string>("ADF:SubscriptionId");
+                settings.ResourceGroup = configuration.GetValue<string>("ADF:ResourceGroup");
+            });
+
+            builder.Services.AddSingleton<IDataFactorySecret<IDataFactoryRepository>>(services =>
+            {
+                var settings = services.GetRequiredService<IOptions<DataFactorySecrets<IDataFactoryRepository>>>();
+                return new DataFactorySecrets<IDataFactoryRepository>(
+                    settings.Value.Pipeline,
+                    settings.Value.DataFactoryName,
+                    settings.Value.SubscriptionId,
+                    settings.Value.ResourceGroup
+                );
+            });
+
+            builder.Services.AddSingleton<IKeyVaultSecret<ISqlMembershipRepository>>(services => new KeyVaultSecret<ISqlMembershipRepository>(services.GetService<IConfiguration>().GetValue<string>("Settings:SqlServerConnectionString")));
+            builder.Services.AddSingleton<ISqlMembershipRepository, SqlMembershipRepository>();
+
+            builder.Services.AddScoped<INotificationRepository, NotificationRepository>();
+
+            builder.Services.Configure<GraphCredentials>(options =>
+            {
+                builder.Configuration.GetSection("Settings:GraphCredentials").Bind(options);
+                options.AppRegistrationName = builder.Configuration["GraphAPI:GraphAppName"];
+                options.UAMIName = builder.Configuration["GraphAPI:GraphUAMIName"];
+            });
+
+            builder.Services.AddGraphAPIClient()
+            .AddScoped<IGraphGroupRepository, GraphGroupRepository>();
+
+            builder.Services.AddSingleton<ITeamsChannelConfig>(services =>
+            {
+                var configuration = services.GetService<IConfiguration>();
+                var gmmHasTeamChannelReadWriteApplicationPermissions = GetBoolSetting(configuration, "TeamsChannel:IsChannelReadWriteApplicationPermissionGranted", false);
+                var serviceAccountObjectId = configuration.GetValue<string>("Settings:TeamsGraphCredentials:serviceAccountObjectId");
+                var serviceAccountUserName = configuration.GetValue<string>("Settings:TeamsGraphCredentials:serviceAccountUsername");
+                var serviceAccountPassword = configuration.GetValue<string>("Settings:TeamsGraphCredentials:serviceAccountPassword");
+                var appRegistrationName = configuration.GetValue<string>("Settings:TeamsGraphCredentials:AppName");
+                var teamsChannelConfig = new TeamsChannelConfig(gmmHasTeamChannelReadWriteApplicationPermissions, serviceAccountObjectId, serviceAccountUserName, serviceAccountPassword);
+                teamsChannelConfig.TeamsChannelAppRegistrationName = appRegistrationName;
+                return teamsChannelConfig;
+            });
+
+            builder.Services.Configure<GraphCredentials>("TeamsGraphCredentials", builder.Configuration.GetSection("Settings:TeamsGraphCredentials"));
+
+            builder.Services.AddScoped<ITeamsChannelRepository, TeamsChannelRepository>(services =>
+            {
+                var teamsChannelConfig = services.GetService<ITeamsChannelConfig>();
+                var teamsGraphCredentials = services.GetService<IOptionsSnapshot<GraphCredentials>>().Get("TeamsGraphCredentials");
+
+                TokenCredential teamsTokenCredential;
+
+                if (teamsChannelConfig.GMMHasTeamsChannelApplicationPermissions)
+                {
+                    teamsTokenCredential = FunctionAppDI.CreateAuthProviderFromSecret(teamsGraphCredentials);
+                }
+                else
+                {
+                    teamsGraphCredentials.ServiceAccountUserName = teamsChannelConfig.TeamsChannelServiceAccountUsername;
+                    teamsGraphCredentials.ServiceAccountPassword = teamsChannelConfig.TeamsChannelServiceAccountPassword;
+
+                    teamsTokenCredential = FunctionAppDI.CreateServiceAccountAuthProvider(teamsGraphCredentials);
+                }
+
+                var graphClient = new GraphServiceClient(teamsTokenCredential);
+                var telemetryClient = services.GetRequiredService<TelemetryClient>();
+                var teamsChannelRepositoryLogger = services.GetRequiredService<ILogger<TeamsChannelRepository>>();
+                var loggerFactory = services.GetRequiredService<ILoggerFactory>();
+                return new TeamsChannelRepository(graphClient, telemetryClient, teamsChannelRepositoryLogger, loggerFactory);
+            });
+
+            builder.Services.AddOptions<HandleInactiveJobsConfig>().Configure<IConfiguration>((settings, configuration) =>
+            {
+                settings.HandleInactiveJobsEnabled = GetBoolSetting(configuration, "AzureMaintenance:HandleInactiveJobsEnabled", false);
+                settings.NumberOfDaysBeforePurging = GetIntSetting(configuration, "AzureMaintenance:NumberOfDaysBeforePurging", 30);
+                settings.NumberOfDaysBeforePurgingToSendWarning = GetIntSetting(configuration, "AzureMaintenance:NumberOfDaysBeforePurgingToSendWarning", 7);
+                settings.NumberOfDaysBeforeDeletion = GetIntSetting(configuration, "AzureMaintenance:NumberOfDaysBeforeDeletion", 35);
+                settings.JobHistoryRetentionDays = GetIntSetting(configuration, "AzureMaintenance:JobHistoryRetentionDays", 30);
+            });
+            builder.Services.AddSingleton<IHandleInactiveJobsConfig>(services =>
+            {
+                return new HandleInactiveJobsConfig(
+                    services.GetService<IOptions<HandleInactiveJobsConfig>>().Value.HandleInactiveJobsEnabled,
+                    services.GetService<IOptions<HandleInactiveJobsConfig>>().Value.NumberOfDaysBeforePurging,
+                    services.GetService<IOptions<HandleInactiveJobsConfig>>().Value.NumberOfDaysBeforePurgingToSendWarning,
+                    services.GetService<IOptions<HandleInactiveJobsConfig>>().Value.NumberOfDaysBeforeDeletion,
+                    services.GetService<IOptions<HandleInactiveJobsConfig>>().Value.JobHistoryRetentionDays);
+            });
+
+            builder.Services.AddOptions<WebApiSettings>().Configure<IConfiguration>((settings, configuration) =>
+            {
+                settings.KeyVaultName = configuration.GetValue<string>("Settings:GraphCredentials:KeyVaultName");
+            });
+
+            builder.Services.AddScoped<IDataFactoryRepository, DataFactoryRepository>();
+            builder.Services.AddScoped<IDatabaseSyncJobsRepository, DatabaseSyncJobsRepository>();
+            builder.Services.AddSingleton<IBlobStorageRepository>(sp =>
+            {
+                var configuration = sp.GetRequiredService<IConfiguration>();
+                var storageAccountName = configuration["Settings:membershipStorageAccountName"];
+                var containerName = configuration["Settings:membershipContainerName"];
+                return new BlobStorageRepository($"https://{storageAccountName}.blob.core.windows.net/{containerName}");
+            });
+            builder.Services.AddScoped<IDatabaseGroupsRepository, DatabaseGroupsRepository>();
+            builder.Services.AddScoped<IDatabaseChannelsRepository, DatabaseChannelsRepository>();
+            builder.Services.AddScoped<IDestinationResolver, LegacyDestinationResolver>();
+            builder.Services.AddScoped<ISyncJobChangeRepository, SyncJobChangeRepository>();
+            builder.Services.AddScoped<ISyncJobHistoryRepository, SyncJobHistoryRepository>();
+            builder.Services.AddScoped<IAdfRunRepository, AdfRunRepository>();
+            builder.Services.AddScoped<IDatabaseTitlesRepository, DatabaseTitlesRepository>();
+            builder.Services.AddScoped<IDatabaseSettingsRepository, DatabaseSettingsRepository>();
+            builder.Services.AddScoped<IDatabaseDestinationAttributesRepository, DatabaseDestinationAttributesRespository>();
+            builder.Services.AddScoped<IDatabaseSqlMembershipSourcesRepository, DatabaseSqlMembershipSourcesRepository>();
+            builder.Services.AddScoped<INotificationTypesRepository, NotificationTypesRepository>();
+            builder.Services.AddScoped<IJobNotificationsRepository, JobNotificationRepository>();
+            builder.Services.AddScoped<IServiceStatusRepository, ServiceStatusRepository>();
+
+            builder.Services.AddOptions<ResourceManagerServiceConfiguration>()
+                            .Configure<IConfiguration, IDataFactorySecret<IDataFactoryRepository>>((settings, configuration, dataFactorySecrets) =>
+                            {
+                                var computeResourceGroup = dataFactorySecrets.ResourceGroup.Replace("data", "compute", StringComparison.InvariantCultureIgnoreCase);
+                                settings.SubscriptionId = dataFactorySecrets.SubscriptionId;
+                                settings.DataResourceGroup = dataFactorySecrets.ResourceGroup;
+                                settings.ComputeResourceGroup = computeResourceGroup;
+                            });
+
+            builder.Services.AddSingleton<IResourceManagerService, ResourceManagerService>(services =>
+            {
+                var settings = services.GetRequiredService<IOptions<ResourceManagerServiceConfiguration>>();
+                var logger = services.GetRequiredService<ILogger<ResourceManagerService>>();
+                return new ResourceManagerService(settings.Value, logger);
+            });
+
+            builder.Services.AddOptions<OperationsSettings>().Configure<IConfiguration, IServiceProvider>((settings, configuration, services) =>
+            {
+                var rmsc = services.GetRequiredService<IOptions<ResourceManagerServiceConfiguration>>();
+                configuration.GetSection("Settings:ServiceBus").Bind(settings);
+                var functionBaseUrl = configuration.GetValue<string>("Settings:JobSchedulerFunctionBaseUrl");
+                var functionKey = configuration.GetValue<string>("Settings:JobSchedulerFunctionKey");
+                var functionAuthAppClientId = configuration.GetValue<string>("Settings:FunctionAuthAppClientId");
+                settings.JobSchedulerFunctionBaseUrl = functionBaseUrl;
+                settings.JobSchedulerFunctionKey = functionKey;
+                settings.FunctionAuthAppClientId = functionAuthAppClientId;
+                settings.DataResourceGroupName = rmsc.Value.DataResourceGroup;
+                settings.ComputeResourceGroupName = rmsc.Value.ComputeResourceGroup;
+                settings.FunctionsStorageAccountName = configuration.GetValue<string>("Settings:FunctionsStorageAccountName");
+            });
+
+            builder.Services.AddOptions<PendingConfigurationConfig>().Configure<IConfiguration>((settings, configuration) =>
+            {
+                settings.PendingConfigurationIsEnabled = GetBoolSetting(configuration, "PendingConfiguration:IsEnabled", false);
+            });
+            builder.Services.AddSingleton<IPendingConfigurationConfig>(services =>
+            {
+                return new PendingConfigurationConfig
+                    (
+                        services.GetService<IOptions<PendingConfigurationConfig>>().Value.PendingConfigurationIsEnabled
+                    );
+            });
+
+            builder.Services.AddSingleton(services =>
+            {
+                var settings = services.GetRequiredService<IOptions<OperationsSettings>>();
+                return settings.Value;
+            });
+
+            builder.Services.AddSingleton(services =>
+            {
+                var operationsSettings = services.GetRequiredService<OperationsSettings>();
+                var serviceBusFQN = operationsSettings.ServiceBusFQN;
+
+                if (string.IsNullOrWhiteSpace(serviceBusFQN))
+                    throw new ArgumentNullException($"Could not start because of missing configuration option: servicebus fully qualified namespace.");
+
+                DefaultAzureCredential credential = new(DefaultAzureCredential.DefaultEnvironmentVariableName);
+                return new ServiceBusClient(serviceBusFQN, credential);
+            });
+
+            builder.Services.AddSingleton<IServiceBusQueueRepository, ServiceBusQueueRepository>(services =>
+            {
+                var operationsSettings = services.GetRequiredService<OperationsSettings>();
+                var pendingConfigurationQueue = operationsSettings.PendingConfigurationQueue;
+                var notificationsQueue = operationsSettings.NotificationsQueue;
+                var client = services.GetRequiredService<ServiceBusClient>();
+                var sender = client.CreateSender(pendingConfigurationQueue);
+                return new ServiceBusQueueRepository(sender);
+            });
+
+            // Only register the AutoApprover queue sender when the feature is enabled. When it is not
+            // registered, PostJobHandler's [FromKeyedServices("AutoApprover")] dependency resolves to null,
+            // so new jobs stay in PendingReview and are never enqueued for (or moved to) auto-approval.
+            if (GetBoolSetting(builder.Configuration, "AutoApprover:IsEnabled", false))
+            {
+                builder.Services.AddKeyedSingleton<IServiceBusQueueRepository, ServiceBusQueueRepository>("AutoApprover", (services, key) =>
+                {
+                    var operationsSettings = services.GetRequiredService<OperationsSettings>();
+                    var autoApproverQueue = operationsSettings.AutoApproverQueue;
+                    var client = services.GetRequiredService<ServiceBusClient>();
+                    var sender = client.CreateSender(autoApproverQueue);
+                    return new ServiceBusQueueRepository(sender);
+                });
+            }
+
+            builder.Services.AddKeyedSingleton<IServiceBusQueueRepository, ServiceBusQueueRepository>("Notifications", (services, key) =>
+            {
+                var operationsSettings = services.GetRequiredService<OperationsSettings>();
+                var notificationsQueue = operationsSettings.NotificationsQueue;
+                var client = services.GetRequiredService<ServiceBusClient>();
+                var sender = client.CreateSender(notificationsQueue);
+                return new ServiceBusQueueRepository(sender);
+            });
+
+            builder.Services.AddCopilotServices(builder.Configuration);
+
+            builder.Services.AddSignalR().AddAzureSignalR(builder.Configuration["Settings:AzureSignalRConnectionString"]);
+
+            builder.WebHost.ConfigureServices(services =>
+            {
+                services.AddHostedService<OperationsBackgroundService>();
+            });
+
+            builder.Services.AddSingleton<IOperationsTaskQueue, OperationsTaskQueue>();
+
+            var app = builder.Build();
+
+            if (app.Environment.IsDevelopment())
+            {
+                // Configure the HTTP request pipeline.
+                // Note: IdentityModelEventSource.ShowPII = true; can be enabled here
+                // TEMPORARILY for local token-validation debugging. Leave OFF by
+                // default — it emits identity claims and token contents into logs.
+                app.UseDeveloperExceptionPage();
+
+                // Configure SwaggerUI
+                var apiVersionDescriptionProvider = app.Services.GetRequiredService<IApiVersionDescriptionProvider>();
+                app.UseSwaggerUI(options =>
+                {
+                    foreach (var description in apiVersionDescriptionProvider.ApiVersionDescriptions)
+                    {
+                        var url = $"/swagger/{description.GroupName}/swagger.json";
+                        options.SwaggerEndpoint(url, description.GroupName.ToUpperInvariant());
+                        options.OAuthAppName("Swagger Client");
+                        options.OAuthClientId(azureAdClientId);
+                        options.OAuthUseBasicAuthenticationWithAccessCodeGrant();
+                        options.OAuthAdditionalQueryStringParams(new Dictionary<string, string> {
+                                { "scope", $"https://{azureAdClientId}/.default" },
+                                { "nonce", Guid.NewGuid().ToString() },
+                                { "resource", azureAdClientId }
+                            });
+                    }
+                });
+
+                app.UseSwagger(c =>
+                {
+                    c.PreSerializeFilters.Add((swagger, _) =>
+                    {
+                        // Relative server URL keeps Try It Out on the browser's origin, which is the
+                        // Front Door endpoint rather than the origin host Front Door sends upstream.
+                        swagger.Servers = new List<OpenApiServer> { new OpenApiServer { Url = "/" } };
+                    });
+                });
+            }
+            else
+            {
+                app.UseExceptionHandler();
+            }
+
+            using (var scope = app.Services.CreateScope())
+            {
+                var db = scope.ServiceProvider.GetRequiredService<GMMContext>();
+                db.Database.Migrate();
+            }
+
+            app.UseAzureAppConfiguration();
+
+            app.UseHttpsRedirection();
+            app.UseStaticFiles();
+            app.UseRouting();
+
+            if (app.Environment.IsDevelopment())
+            {
+                var devCorsOrigins = builder.Configuration
+                    .GetSection("Cors:AllowedOrigins")
+                    .Get<string[]>() ?? [];
+
+                if (devCorsOrigins.Length > 0)
+                {
+                    app.UseCors(policy => policy
+                        .WithOrigins(devCorsOrigins)
+                        .AllowAnyMethod()
+                        .AllowAnyHeader()
+                        .AllowCredentials());
+                }
+            }
+
+            app.UseAuthentication();
+            app.UseRateLimiter();
+            app.UseAuthorization();
+
+            app.MapHub<SignalRService>("/servicestatus");
+
+            app.MapControllers();
+
+            // Anonymous, rate-limit-exempt liveness probe. Front Door health probes and the
+            // deployment warmup require a 200 here; it reports process liveness only.
+            app.MapMethods("/healthz", ["GET", "HEAD"], () => Results.Ok())
+                .AllowAnonymous()
+                .DisableRateLimiting()
+                .ExcludeFromDescription();
+
+            app.Run();
+        }
+
+        private static async Task<ICollection<SecurityKey>> GetSigningKeysFromUrlAsync(string url)
+        {
+            var openIdConfigManager = new ConfigurationManager<OpenIdConnectConfiguration>(
+                url,
+                new OpenIdConnectConfigurationRetriever(),
+                new HttpDocumentRetriever());
+
+            var config = await openIdConfigManager.GetConfigurationAsync();
+
+            return config.SigningKeys;
+        }
+
+        private static bool GetBoolSetting(IConfiguration configuration, string settingName, bool defaultValue)
+        {
+            var checkParse = bool.TryParse(configuration[settingName], out bool value);
+            if (checkParse)
+                return value;
+            return defaultValue;
+        }
+
+        private static int GetIntSetting(IConfiguration configuration, string settingName, int defaultValue)
+        {
+            var checkParse = int.TryParse(configuration[settingName], out int value);
+            if (checkParse)
+                return value;
+            return defaultValue;
+        }
+    }
+}

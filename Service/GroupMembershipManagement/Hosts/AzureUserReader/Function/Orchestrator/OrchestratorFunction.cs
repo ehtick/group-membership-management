@@ -1,10 +1,9 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
 
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
-using Repositories.Contracts;
+using Microsoft.Azure.Functions.Worker;
+using Microsoft.DurableTask;
+using Models;
 using System;
 using System.Collections.Generic;
 using System.Linq;
@@ -14,19 +13,12 @@ namespace Hosts.AzureUserReader
 {
     public class OrchestratorFunction
     {
-        private readonly ILoggingRepository _loggingRepository = null;
-
-        public OrchestratorFunction(ILoggingRepository loggingRepository)
-        {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
-        }
-
-        [FunctionName(nameof(OrchestratorFunction))]
+        [Function(nameof(OrchestratorFunction))]
         public async Task RunOrchestrator(
-            [OrchestrationTrigger] IDurableOrchestrationContext context)
+            [OrchestrationTrigger] TaskOrchestrationContext context)
         {
-            if (!context.IsReplaying)
-                _ = _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(OrchestratorFunction)} function started" });
+            var logger = context.CreateReplaySafeLogger("AzureUserReader.OrchestratorFunction");
+            logger.FunctionStarted(nameof(OrchestratorFunction));
 
             try
             {
@@ -52,12 +44,11 @@ namespace Hosts.AzureUserReader
             }
             catch (Exception ex)
             {
-                _ = _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(OrchestratorFunction)} failed with exception:\n{ex}" });
+                logger.FunctionFailed(nameof(OrchestratorFunction), ex);
                 throw;
             }
 
-            if (!context.IsReplaying)
-                _ = _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(OrchestratorFunction)} function completed" });
+            logger.FunctionCompleted(nameof(OrchestratorFunction));
         }
     }
 }

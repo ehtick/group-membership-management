@@ -9,6 +9,8 @@ parameters:
   type: object
 - name: condition
   type: object
+- name: buildRelease
+  type: boolean
 
 stages:
 
@@ -19,13 +21,17 @@ stages:
   jobs:
   - ${{ each app in parameters.functionApps }}:
       - job: Build_${{ app.function.name }}
-        strategy:
-          maxParallel: 2
-          matrix:
-            debug:
-              BuildConfiguration: debug
-            release:
-              BuildConfiguration: release
+        ${{ if parameters.buildRelease }}:
+          strategy:
+              maxParallel: 2
+              matrix:
+                debug:
+                  BuildConfiguration: debug
+                release:
+                  BuildConfiguration: release
+        ${{ else }}:
+          variables:
+            BuildConfiguration: 'debug'
 
         steps:
 
@@ -41,6 +47,14 @@ stages:
 
         - task: DotNetCoreCLI@2
           displayName: 'dotnet build ${{ app.function.name }} function'
+          retryCountOnTaskFailure: 3
+          env:
+            # Disable MSBuild node reuse / server so no persistent ".NET Host" worker node
+            # survives this step holding shared output DLLs (e.g. Models.dll) locked. Without
+            # this, a leftover node from build/test locks the file and the later publish step
+            # fails with MSB3027/MSB3021 on .NET 10.
+            MSBUILDDISABLENODEREUSE: 1
+            DOTNET_CLI_USE_MSBUILD_SERVER: 0
           inputs:
             command: build
             projects: 'Service/GroupMembershipManagement/Hosts/${{ app.function.name }}/Function/*.csproj'
@@ -48,6 +62,10 @@ stages:
 
         - task: DotNetCoreCLI@2
           displayName: 'dotnet test ${{ app.function.name }} function'
+          retryCountOnTaskFailure: 3
+          env:
+            MSBUILDDISABLENODEREUSE: 1
+            DOTNET_CLI_USE_MSBUILD_SERVER: 0
           inputs:
             command: test
             projects: 'Service/GroupMembershipManagement/Hosts/${{ app.function.name }}/Services.Tests'
@@ -58,7 +76,8 @@ stages:
                         /p:thresholdType=line
                         /p:thresholdStat=total
                         /p:CoverletOutput=$(Build.SourcesDirectory)\TestResults\Coverage\${{ app.function.name }}\
-                        /p:Exclude=[Repositories.*]*%2c[Entities]*%2c[*.Entities]*%2c[*.Tests]*%2c[*.Mocks]*%2c[Common.DependencyInjection]*%2c[Hosts.FunctionBase]*'
+                        /p:Exclude=[Repositories.*]*%2c[Entities]*%2c[*.Entities]*%2c[Models]*%2c[*.Models]*%2c[*.Tests]*%2c[*.Mocks]*%2c[Common.DependencyInjection]*%2c[Hosts.FunctionBase]*%2c[DIConcreteTypes]*%2c[Services.Contracts]*%2c[*.Services.Contracts]*%2c[*]*.*.Startup*%2c[*]*.*.Program
+                        /p:ExcludeByAttribute=Obsolete%2cGeneratedCodeAttribute%2cCompilerGeneratedAttribute'          
           condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
 
         - task: PublishCodeCoverageResults@1
@@ -70,11 +89,88 @@ stages:
             failIfCoverageEmpty: false
           condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
 
+        - task: PowerShell@2
+          displayName: 'Run dotnet package audit for ${{ app.function.name }}'
+          retryCountOnTaskFailure: 3
+          inputs:
+            targetType: inline
+            workingDirectory: 'Service/GroupMembershipManagement'
+            script: |
+              $projectPatterns = @(
+                "Hosts/${{ app.function.name }}/Function/*.csproj"
+                "Hosts/${{ app.function.name }}/Services.Tests/*.csproj"
+              )
+
+              $hasVulnerabilities = $false
+
+              foreach ($projectPattern in $projectPatterns) {
+                $projects = Get-ChildItem -Path $projectPattern -File -ErrorAction SilentlyContinue
+
+                if (-not $projects) {
+                  Write-Host "No projects found for pattern '$projectPattern', skipping."
+                  continue
+                }
+
+                foreach ($project in $projects) {
+                  Write-Host "Auditing vulnerable packages for $($project.FullName)"
+
+                  $auditOutput = dotnet list $project.FullName package --vulnerable --include-transitive --format json 2>&1 | Out-String
+                  $dotnetExitCode = $LASTEXITCODE
+
+                  try {
+                    $auditResult = $auditOutput | ConvertFrom-Json -Depth 100
+                  } catch {
+                    throw "dotnet package audit failed for '$($project.FullName)' (exit code $dotnetExitCode). Raw output:`n$auditOutput"
+                  }
+
+                  foreach ($projectResult in @($auditResult.projects)) {
+                    foreach ($framework in @($projectResult.frameworks)) {
+                      $packages = @()
+
+                      if ($framework.topLevelPackages) {
+                        $packages += @($framework.topLevelPackages)
+                      }
+
+                      if ($framework.transitivePackages) {
+                        $packages += @($framework.transitivePackages)
+                      }
+
+                      $vulnerablePackages = @($packages | Where-Object {
+                        $_ -and $_.vulnerabilities -and @($_.vulnerabilities).Count -gt 0
+                      })
+
+                      foreach ($package in $vulnerablePackages) {
+                        foreach ($vulnerability in @($package.vulnerabilities)) {
+                          $severity = if ($vulnerability.severity) { $vulnerability.severity } else { 'unknown' }
+                          $advisoryUrl = if ($vulnerability.advisoryUrl) { $vulnerability.advisoryUrl } else { 'n/a' }
+
+                          Write-Host "##vso[task.logissue type=error]$($projectResult.path) [$($framework.framework)] package '$($package.id)' version '$($package.resolvedVersion)' has a '$severity' severity vulnerability: $advisoryUrl"
+                          $hasVulnerabilities = $true
+                        }
+                      }
+                    }
+                  }
+                }
+              }
+
+              if ($hasVulnerabilities) {
+                throw 'Vulnerable NuGet packages were found. See errors above for details.'
+              }
+
+              Write-Host 'No vulnerable NuGet packages found.'
+              exit 0
+            pwsh: true
+          condition: and(succeeded(), eq(variables['BuildConfiguration'], 'debug'))
+
         - task: DotNetCoreCLI@2
           displayName: 'dotnet publish ${{ app.function.name }} function'
+          env:
+            # Match the build/test steps: no persistent node/server to hold shared DLL handles.
+            MSBUILDDISABLENODEREUSE: 1
+            DOTNET_CLI_USE_MSBUILD_SERVER: 0
           inputs:
             command: publish
-            arguments: '--configuration $(BuildConfiguration) --output ${{ app.function.name }}'
+            arguments: '--configuration $(BuildConfiguration) --output ${{ app.function.name }} /p:AssemblyVersion=$(Build.BuildNumber)'
             projects: 'Service/GroupMembershipManagement/Hosts/${{ app.function.name }}/Function/*.csproj'
             publishWebProjects: false
             modifyOutputPath: false
@@ -93,14 +189,6 @@ stages:
             SourceFolder: $(System.DefaultWorkingDirectory)/functions
             Contents: ${{ app.function.name }}.zip
             TargetFolder: '$(build.artifactstagingdirectory)/function_packages/'
-
-        - powershell: |
-                  $bicepTemplates = Get-ChildItem -Filter "template.bicep" -Recurse
-                  foreach($template in $bicepTemplates)
-                  {
-                    az bicep build --file $template.FullName
-                  }
-          displayName: 'Compile Bicep templates'
 
         - task: CopyFiles@2
           displayName: 'copy ${{ app.function.name }} function arm templates'

@@ -1,16 +1,15 @@
 {
   "IsEncrypted": false,
   "Values": {
+    "AZURE_TOKEN_CREDENTIALS": "VisualStudioCredential",
     "AzureWebJobsStorage": "UseDevelopmentStorage=true",
-    "FUNCTIONS_WORKER_RUNTIME": "dotnet",
-    "logAnalyticsCustomerId": "",
-    "logAnalyticsPrimarySharedKey": "",
-    "jobsStorageAccountConnectionString": "",
-    "jobsTableName": "",
-    "serviceBusConnectionString": "",
+    "FUNCTIONS_WORKER_RUNTIME": "dotnet-isolated",
+    "FUNCTIONS_EXTENSION_VERSION": "~4",
+    "ConnectionStrings:JobsContext": "",
+    "ConnectionStrings:JobsContextReadOnly": "",
+    "gmmServiceBus__fullyQualifiedNamespace": "<service_bus_namespace>.servicebus.windows.net",
     "serviceBusSyncJobTopic": "",
     "jobTriggerSchedule": "0 */1 * * * *",
-    "syncDisabledCCEmailAddresses": "",
     "supportEmailAddresses": "",
     "senderAddress": "",
     "senderPassword": "",
@@ -18,6 +17,16 @@
     "graphCredentials:ClientSecret": "",
     "graphCredentials:KeyVaultName": "gmm-prereqs-<env>",
     "graphCredentials:KeyVaultTenantId": "<demo-tenant-id>",
-    "graphCredentials:TenantId": "<demo-tenant-id>"
+    "graphCredentials:TenantId": "<demo-tenant-id>",
+    "graphCredentials:UserAssignedManagedIdentityClientId": "<guid>",
+    "teamsGraphCredentials:ClientId": "",
+    "teamsGraphCredentials:ClientSecret": "",
+    "teamsGraphCredentials:KeyVaultName": "gmm-prereqs-<env>",
+    "teamsGraphCredentials:KeyVaultTenantId": "<demo-tenant-id>",
+    "teamsGraphCredentials:TenantId": "<demo-tenant-id>",
+    "appConfigurationEndpoint": "https://gmm-appconfig-<env>.azconfig.io",
+    "serviceBusNotificationsQueue": "",
+    "APPLICATIONINSIGHTS_CONNECTION_STRING": "",
+    "enableTeamsChannel": false
   }
 }

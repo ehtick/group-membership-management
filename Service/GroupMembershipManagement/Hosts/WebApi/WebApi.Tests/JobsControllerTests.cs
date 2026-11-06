@@ -1,0 +1,3890 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Channel;
+using Microsoft.ApplicationInsights.DataContracts;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.AspNetCore.Http;
+using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.OData.Query;
+using Microsoft.Graph;
+using Microsoft.Kiota.Abstractions;
+using Microsoft.OData.ModelBuilder;
+using Microsoft.OData.UriParser;
+using Models;
+using Models.Entities;
+using Models.ServiceBus;
+using Models.SyncJobChange;
+using Moq;
+using Repositories.Contracts;
+using Repositories.Contracts.InjectConfig;
+using Services.Messages.Requests;
+using Services.Messages.Responses;
+using Services.WebApi;
+using Services.WebApi.Contracts;
+using System.Data;
+using System.Net;
+using System.Security.Claims;
+using WebApi.Controllers.v1.Jobs;
+using WebApi.Models;
+using Microsoft.Extensions.Logging;
+using Microsoft.Extensions.Logging.Abstractions;
+using Services.Contracts;
+using WebApi.Tests.ExceptionHandling;
+using NewTitle = WebApi.Models.DTOs.NewTitle;
+using NewSyncJobDTO = WebApi.Models.DTOs.NewSyncJob;
+using PagedResponseDTO = WebApi.Models.DTOs.PagedResponse<WebApi.Models.DTOs.SyncJob>;
+
+namespace Services.Tests
+{
+    [TestClass]
+    public class JobsControllerTests
+    {
+        private int _jobCount = 1000;
+        private NewSyncJobDTO _newSyncJob = null!;
+        private HttpContext _context = null!;
+        private List<string> _groupTypes = null!;
+        private List<SyncJob> _jobEntities = null!;
+        private List<string> _syncJobIds = null!;
+        private List<AzureADGroup> _groups = null!;
+        private JobsController _jobsController = null!;
+        private GetJobsHandler _getJobsHandler = null!;
+        private PatchJobsHandler _patchJobsHandler = null!;
+        private PostJobHandler _postJobHandler = null!;
+        private GetJobDetailsHandler _getJobDetailsHandler = null!;
+        private TelemetryClient _telemetryClient = null!;
+        private CapturingTelemetryChannel _capturingTelemetryChannel = null!;
+        private Mock<IRequestAdapter> _requestAdapter = null!;
+        private Mock<IDatabaseSyncJobsRepository> _databaseSyncJobsRepository = null!;
+        private Mock<ISyncJobChangeRepository> _syncJobChangeRepository = null!;
+        private Mock<IDatabaseTitlesRepository> _titlesRepository = null!;
+        private Mock<IDatabaseDestinationAttributesRepository> _destinationAttributesRepository = null!;
+        private Mock<GraphServiceClient> _graphServiceClient = null!;
+        private Mock<IGraphGroupRepository> _graphGroupRepository = null!;
+        private Mock<ITeamsChannelRepository> _teamsChannelRepository = null!;
+        private Mock<IDatabaseSettingsRepository> _databaseSettingsRepository = null!;
+        private Mock<IPendingConfigurationConfig> _pendingConfigurationConfig = null!;
+        private Mock<IServiceBusQueueRepository> _serviceBusQueueRepository = null!;
+        private Mock<IServiceBusQueueRepository> _autoApproverQueueRepository = null!;
+        private ODataQueryOptions<SyncJob> _odataQueryOptions = null!;
+        private Mock<IHttpContextAccessor> _httpContextAccessor = null!;
+        private PostOperationHandler _postResetRequestHandler = null!;
+        private Mock<IServiceStatusRepository> _serviceStatusRepository = null!;
+        private Mock<IOperationsTaskQueue> _backgroundTaskService = null!;
+        private Mock<IHandleInactiveJobsConfig> _handleInactiveJobsConfig = null!;
+
+        [TestInitialize]
+        public void Initialize()
+        {
+            _groups = new List<AzureADGroup>();
+            _context = new DefaultHttpContext();
+            _requestAdapter = new Mock<IRequestAdapter>();
+            _databaseSyncJobsRepository = new Mock<IDatabaseSyncJobsRepository>();
+            _syncJobChangeRepository = new Mock<ISyncJobChangeRepository>();
+            _titlesRepository = new Mock<IDatabaseTitlesRepository>();
+            _destinationAttributesRepository = new Mock<IDatabaseDestinationAttributesRepository>();
+            _httpContextAccessor = new Mock<IHttpContextAccessor>();
+            _pendingConfigurationConfig = new Mock<IPendingConfigurationConfig>();
+            _serviceBusQueueRepository = new Mock<IServiceBusQueueRepository>();
+            _autoApproverQueueRepository = new Mock<IServiceBusQueueRepository>();
+            _handleInactiveJobsConfig = new Mock<IHandleInactiveJobsConfig>();
+            _handleInactiveJobsConfig.Setup(x => x.NumberOfDaysBeforePurging).Returns(30);
+
+            // Setup default pending configuration setting to false
+            _pendingConfigurationConfig.Setup(x => x.PendingConfigurationIsEnabled).Returns(false);
+
+            var builder = new ODataConventionModelBuilder();
+            builder.EntitySet<SyncJob>("SyncJob");
+            var edmModel = builder.GetEdmModel();
+
+            var odataContext = new ODataQueryContext(edmModel, typeof(SyncJob), new ODataPath());
+            _odataQueryOptions = new ODataQueryOptions<SyncJob>(odataContext, _context.Request);
+
+
+            _requestAdapter.SetupProperty(x => x.BaseUrl).SetReturnsDefault("https://graph.microsoft.com/v1.0");
+
+            _graphServiceClient = new Mock<GraphServiceClient>(_requestAdapter.Object,
+                                                               "https://graph.microsoft.com/v1.0");
+
+            _graphGroupRepository = new Mock<IGraphGroupRepository>();
+            _databaseSettingsRepository = new Mock<IDatabaseSettingsRepository>();
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAITitleEnabled))
+                                     .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAITitleEnabled, SettingValue = "true" });
+
+            // Setup default auto-approval setting to false
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                    .ReturnsAsync(() => _groups);
+
+            _graphGroupRepository.Setup(x => x.GetUserByUpnOrIdAsync(It.IsAny<string>(), false))
+                                    .ReturnsAsync(() => new AzureADUser { UserPrincipalName = "upn" } );
+
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(It.IsAny<string>(), It.IsAny<Guid?>()))
+                                    .ReturnsAsync(new AzureADUser { UserPrincipalName = "upn", OnPremisesImmutableId = "999" });
+
+            _graphGroupRepository.Setup(x => x.GetGroupNameAsync(It.IsAny<Guid>()))
+                                    .ReturnsAsync(() => "GroupNameTest");
+
+            _teamsChannelRepository = new Mock<ITeamsChannelRepository>();
+            _serviceStatusRepository = new Mock<IServiceStatusRepository>();
+            _backgroundTaskService = new Mock<IOperationsTaskQueue>();
+
+            var destinationGuid = Guid.NewGuid();
+            var ownerGuid = Guid.NewGuid();
+
+            var destination = new DestinationObject()
+            {
+                Type = "GroupMembership",
+                Value = new GroupDestinationValue() { ObjectId = destinationGuid }
+            };
+
+            var destinationAttributes = new DestinationAttributes()
+            {
+                Id = destinationGuid,
+                Name = "GroupNameTest",
+                Owners = new List<Guid> { ownerGuid }
+            };
+
+            _graphGroupRepository.Setup(x => x.GetDestinationOwnersAsync(It.IsAny<List<Guid>>()))
+                                    .ReturnsAsync(new Dictionary<Guid, List<Guid>>() { { destinationGuid, new List<Guid> { ownerGuid } } });
+
+            _destinationAttributesRepository.Setup(x => x.UpdateAttributes(It.IsAny<DestinationAttributes>())).Returns(Task.CompletedTask);
+
+            var telemetryConfiguration = new TelemetryConfiguration();
+            _capturingTelemetryChannel = new CapturingTelemetryChannel();
+            telemetryConfiguration.TelemetryChannel = _capturingTelemetryChannel;
+            _telemetryClient = new TelemetryClient(telemetryConfiguration);
+
+            _groupTypes = new List<string>
+            {
+                "Microsoft 365",
+                "Security",
+                "Mail enabled security",
+                "Distribution"
+            };
+
+            var currentDataTimeUtc = DateTime.UtcNow;
+            _jobEntities = Enumerable.Range(0, _jobCount).Select(x => new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = ((SyncStatus)Random.Shared.Next(1, 15)).ToString(),
+                LastSuccessfulRunTime = currentDataTimeUtc.AddHours(-4),
+                LastSuccessfulStartTime = currentDataTimeUtc.AddHours(-5),
+                StartDate = currentDataTimeUtc.AddMonths(-1),
+                ScheduledDate = currentDataTimeUtc.AddHours(2),
+                ThresholdPercentageForAdditions = 10,
+                ThresholdPercentageForRemovals = 10,
+                Period = 6,
+                StatusDetails = new Status
+                {
+                    Id = Guid.Parse("AC3604F9-5869-EE11-9937-6045BDE913DD"),
+                    Name = SyncStatus.Idle.ToString(),
+                    SortPriority = 1000
+                },
+                MembershipType = "GroupMembership",
+                Group = new Group
+                {
+                    SyncJobId = Guid.NewGuid(),
+                    GroupId = Guid.NewGuid()
+                }
+            }).ToList();
+
+            _jobEntities.ForEach(x =>
+            {
+                _groups.Add(new AzureADGroup
+                {
+                    ObjectId = x.Group.GroupId,
+                    Type = _groupTypes[Random.Shared.Next(0, _groupTypes.Count)]
+                });
+            });
+
+            _syncJobIds = new List<string>();
+            _jobEntities.ForEach(x =>
+            {
+                _syncJobIds.Add(x.Id.ToString());
+            });
+
+            _newSyncJob = new NewSyncJobDTO
+            {
+                Destination = $"[{{\"value\":{{\"objectId\":\"{destinationGuid}\"}},\"type\":\"GroupMembership\"}}]",
+                Status = SyncStatus.Idle.ToString(),
+                Period = 24,
+                Query = "[{ \"type\": \"GroupMembership\", \"source\": \"fc8f8e1a-6d91-4965-85ff-f911944f201d\"}]",
+                Requestor = "user@domain.com",
+                StartDate = DateTime.UtcNow.AddDays(-1).ToString(),
+                ThresholdPercentageForAdditions = 100,
+                ThresholdPercentageForRemovals = 20
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobsAsync())
+                              .ReturnsAsync(() => _jobEntities);
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                  .Returns(() => _jobEntities.AsQueryable());
+
+            _databaseSyncJobsRepository.Setup(repo => repo.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                .ReturnsAsync(Guid.NewGuid());
+
+            _postResetRequestHandler = new PostOperationHandler(NullLogger<PostOperationHandler>.Instance,
+                                                                _serviceStatusRepository.Object,
+                                                                _backgroundTaskService.Object);
+
+            _getJobsHandler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                                 _databaseSyncJobsRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _httpContextAccessor.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 Mock.Of<ITeamsChannelRepository>());
+
+            _patchJobsHandler = new PatchJobsHandler(NullLogger<PatchJobsHandler>.Instance,
+                                                 _databaseSyncJobsRepository.Object,
+                                                 _syncJobChangeRepository.Object);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _getJobDetailsHandler = new GetJobDetailsHandler(NullLogger<GetJobDetailsHandler>.Instance,
+                                                _databaseSyncJobsRepository.Object,
+                                                _syncJobChangeRepository.Object,
+                                                _titlesRepository.Object,
+                                                _graphGroupRepository.Object,
+                                                _teamsChannelRepository.Object,
+                                                _httpContextAccessor.Object,
+                                                _handleInactiveJobsConfig.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+        }
+
+        [TestMethod]
+        [DataRow(Roles.JOB_TENANT_READER)]
+        [DataRow(Roles.JOB_OWNER_WRITER)]
+        [DataRow("UserRole")]
+        public async Task GetJobsTestByRoleAsync(string role)
+        {
+            var userId = Guid.NewGuid().ToString();
+            foreach (var job in _jobEntities)
+            {
+                job.DestinationOwners = new List<DestinationOwner>
+                {
+                    new DestinationOwner
+                    {
+                        ObjectId = Guid.Parse(userId)
+                    }
+                };
+            }
+
+            _context = CreateHttpContext(new List<Claim>
+                {
+                    new Claim(ClaimTypes.Name, "user@domain.com"),
+                    new Claim(ClaimTypes.Role, role),
+                    new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+                });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            var response = await _jobsController.GetJobsAsync(_odataQueryOptions);
+            var result = response.Result as OkObjectResult;
+
+            Assert.IsNotNull(response);
+            Assert.IsNotNull(result);
+            Assert.IsNotNull(result.Value);
+            var pagedResponse = result.Value as PagedResponseDTO;
+
+            Assert.IsNotNull(pagedResponse);
+            Assert.IsNotNull(pagedResponse.Items);
+            Assert.IsTrue(pagedResponse.TotalNumberOfPages > 0);
+            Assert.IsTrue(pagedResponse.CurrentPage > 0);
+            Assert.IsTrue(pagedResponse.PageSize > 0);
+            Assert.IsTrue(pagedResponse.TotalItems >= 0);
+            var jobs = pagedResponse.Items.ToList();
+            Assert.AreEqual(_jobCount, jobs.Count);
+            Assert.AreEqual(_jobCount, jobs.Select(x => x.TargetGroupId).Distinct().Count());
+            Assert.IsTrue(jobs.All(x => x.SyncJobId.ToString() != null));
+            Assert.IsTrue(jobs.All(x => x.EstimatedNextRunTime == x.LastSuccessfulRunTime.AddHours(x.Period)));
+            Assert.IsTrue(jobs.All(x => x.Status != null));
+            Assert.IsTrue(jobs.All(x => x.TargetDestinationType != null));
+        }
+
+        [TestMethod]
+        [DataRow(Roles.JOB_TENANT_READER)]
+        public async Task GetJobsTestWithGraphAPIFailureAsync(string role)
+        {
+            _context = CreateHttpContext(new List<Claim>
+                {
+                    new Claim(ClaimTypes.Name, "user@domain.com"),
+                    new Claim(ClaimTypes.Role, role),
+                    new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+                });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _graphGroupRepository.Setup(x => x.GetGroupNameAsync(It.IsAny<Guid>()))
+                                    .ReturnsAsync(() => "Example Name");
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                .ReturnsAsync(new List<AzureADGroup>());
+
+            _getJobsHandler = new GetJobsHandler(
+                                     NullLogger<GetJobsHandler>.Instance,
+                                     _databaseSyncJobsRepository.Object,
+                                     _graphGroupRepository.Object,
+                                     _httpContextAccessor.Object,
+                                     _syncJobChangeRepository.Object,
+                                     Mock.Of<ITeamsChannelRepository>());
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.GetJobsAsync(_odataQueryOptions);
+            var result = response.Result as OkObjectResult;
+
+            Assert.IsNotNull(response);
+            Assert.IsNotNull(result);
+            Assert.IsNotNull(result.Value);
+            var pagedResponse = result.Value as PagedResponseDTO;
+
+            Assert.IsNotNull(pagedResponse);
+            Assert.IsNotNull(pagedResponse.Items);
+            Assert.IsTrue(pagedResponse.TotalNumberOfPages > 0);
+            Assert.IsTrue(pagedResponse.CurrentPage > 0);
+            Assert.IsTrue(pagedResponse.PageSize > 0);
+            Assert.IsTrue(pagedResponse.TotalItems >= 0);
+            var jobs = pagedResponse.Items.ToList();
+            Assert.AreEqual(_jobCount, jobs.Count);
+            Assert.AreEqual(_jobCount, jobs.Select(x => x.TargetGroupId).Distinct().Count());
+            Assert.IsTrue(jobs.All(x => x.SyncJobId.ToString() != null));
+            Assert.IsTrue(jobs.All(x => x.EstimatedNextRunTime == x.LastSuccessfulRunTime.AddHours(x.Period)));
+            Assert.IsTrue(jobs.All(x => x.Status != null));
+            Assert.IsTrue(jobs.All(x => x.TargetDestinationType == MembershipTypes.GroupMembership.ToString()));
+
+        }
+
+        [TestMethod]
+        public async Task PostJobSuccessfullyTestAsync()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+
+            var identity = new ClaimsIdentity(claims);
+            var user = new ClaimsPrincipal(identity);
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _getJobsHandler = new GetJobsHandler(
+                                     NullLogger<GetJobsHandler>.Instance,
+                                     _databaseSyncJobsRepository.Object,
+                                     _graphGroupRepository.Object,
+                                     _httpContextAccessor.Object,
+                                     _syncJobChangeRepository.Object,
+                                     Mock.Of<ITeamsChannelRepository>());
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            Assert.IsNotNull(result);
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJob_OnBehalfProvidedByTenantWriter_RecordsOnBehalfAndRequestorAsync()
+        {
+            // A Job Tenant Writer is allowed to record an "on behalf of" owner: the owner becomes the Requestor and is kept in the audit.
+            UseRolesContext(Roles.JOB_TENANT_WRITER);
+            var onBehalfId = Guid.NewGuid();
+            _newSyncJob.LastModifiedOnBehalfOfObjectId = onBehalfId.ToString();
+            _newSyncJob.LastModifiedOnBehalfOfDisplayName = "Paul Daly";
+            _graphGroupRepository.Setup(x => x.GetUserByUpnOrIdAsync(onBehalfId.ToString(), false))
+                .ReturnsAsync(new AzureADUser { UserPrincipalName = "paul@domain.com" });
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(CreatedResult));
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(j => j.Requestor == "paul@domain.com")), Times.Once);
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(
+                sjc => sjc.ChangedOnBehalfOfObjectId == onBehalfId
+                    && sjc.ChangedOnBehalfOfDisplayName == "Paul Daly")), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJob_OnBehalfProvidedByOwnerWriterWithReviewerRole_RecordsOnBehalfAsync()
+        {
+            // An owner-writer who is ALSO a Submission Reviewer is allowed to record an "on behalf of" owner.
+            UseRolesContext(Roles.JOB_OWNER_WRITER, Roles.SUBMISSION_REVIEWER);
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                .ReturnsAsync(true);
+            var onBehalfId = Guid.NewGuid();
+            _newSyncJob.LastModifiedOnBehalfOfObjectId = onBehalfId.ToString();
+            _newSyncJob.LastModifiedOnBehalfOfDisplayName = "Paul Daly";
+            _graphGroupRepository.Setup(x => x.GetUserByUpnOrIdAsync(onBehalfId.ToString(), false))
+                .ReturnsAsync(new AzureADUser { UserPrincipalName = "paul@domain.com" });
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(CreatedResult));
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(j => j.Requestor == "paul@domain.com")), Times.Once);
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(
+                sjc => sjc.ChangedOnBehalfOfObjectId == onBehalfId
+                    && sjc.ChangedOnBehalfOfDisplayName == "Paul Daly")), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJob_OnBehalfProvidedByOwnerWriterOnly_DropsOnBehalfAndUsesSubmitterAsync()
+        {
+            // An ordinary owner-writer is NOT allowed to record an "on behalf of" owner: the value is dropped and the submitter is the Requestor.
+            UseRolesContext(Roles.JOB_OWNER_WRITER);
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                .ReturnsAsync(true);
+            var onBehalfId = Guid.NewGuid();
+            _newSyncJob.LastModifiedOnBehalfOfObjectId = onBehalfId.ToString();
+            _newSyncJob.LastModifiedOnBehalfOfDisplayName = "Paul Daly";
+            _graphGroupRepository.Setup(x => x.GetUserByUpnOrIdAsync(onBehalfId.ToString(), false))
+                .ReturnsAsync(new AzureADUser { UserPrincipalName = "paul@domain.com" });
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(CreatedResult));
+            // Requestor falls back to the submitter (default GetUserByUpnOrIdAsync -> "upn") and the on-behalf UPN is never resolved.
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(j => j.Requestor == "upn")), Times.Once);
+            _graphGroupRepository.Verify(x => x.GetUserByUpnOrIdAsync(onBehalfId.ToString(), false), Times.Never);
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(
+                sjc => sjc.ChangedOnBehalfOfObjectId == null
+                    && sjc.ChangedOnBehalfOfDisplayName == null)), Times.Once);
+        }
+
+        private void UseTenantWriterContext()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+            _jobsController.ControllerContext = new ControllerContext { HttpContext = _context };
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_OwnerWriterWithoutOnboarderRole_ReturnsForbidden()
+        {
+            // The controller gate rejects TeamsChannel creation when the caller lacks the onboarder role.
+            // Owner + duplicate checks are set to succeed so the Forbid can ONLY originate from the controller gate.
+            UseRolesContext(Roles.JOB_OWNER_WRITER);
+            var teamId = Guid.NewGuid();
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, "19:channel-A"))
+                .ReturnsAsync((SyncJob)null);
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                .ReturnsAsync(true);
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, "19:channel-A"));
+
+            Assert.IsInstanceOfType(response, typeof(ForbidResult));
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_WithOnboardingAuthorization_PassesGate()
+        {
+            // Owner writer + onboarder clears the controller gate and the job proceeds.
+            UseRolesContext(Roles.JOB_OWNER_WRITER, Roles.TEAMS_CHANNEL_ONBOARDER);
+            var teamId = Guid.NewGuid();
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, "19:channel-A"))
+                .ReturnsAsync((SyncJob)null);
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                .ReturnsAsync(true);
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, "19:channel-A"));
+
+            Assert.IsNotInstanceOfType(response, typeof(ForbidResult));
+        }
+
+        [TestMethod]
+        public async Task PostGroupMembershipJob_WithoutOnboarderRole_IsNotGated()
+        {
+            // The onboarding gate applies only to TeamsChannel creation, not group jobs.
+            UseRolesContext(Roles.JOB_OWNER_WRITER);
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                .ReturnsAsync(true);
+            var groupJob = new NewSyncJobDTO
+            {
+                Destination = $"[{{\"value\":{{\"objectId\":\"{Guid.NewGuid()}\"}},\"type\":\"GroupMembership\"}}]",
+                Status = SyncStatus.Idle.ToString(),
+                Period = 24,
+                Query = "[{ \"type\": \"GroupMembership\", \"source\": \"fc8f8e1a-6d91-4965-85ff-f911944f201d\"}]",
+                Requestor = "user@domain.com",
+                StartDate = DateTime.UtcNow.AddDays(-1).ToString(),
+                ThresholdPercentageForAdditions = 100,
+                ThresholdPercentageForRemovals = 20
+            };
+
+            var response = await _jobsController.PostJobAsync(groupJob);
+
+            Assert.IsNotInstanceOfType(response, typeof(ForbidResult));
+        }
+
+        private void UseRolesContext(params string[] roles)
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+            claims.AddRange(roles.Select(r => new Claim(ClaimTypes.Role, r)));
+            _context = CreateHttpContext(claims);
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+            _jobsController.ControllerContext = new ControllerContext { HttpContext = _context };
+        }
+
+        private static NewSyncJobDTO TeamsChannelSyncJob(Guid teamId, string? channelId)
+        {
+            var value = channelId == null
+                ? $"{{\"objectId\":\"{teamId}\"}}"
+                : $"{{\"objectId\":\"{teamId}\",\"channelId\":\"{channelId}\"}}";
+            return new NewSyncJobDTO
+            {
+                Destination = $"[{{\"value\":{value},\"type\":\"TeamsChannelMembership\"}}]",
+                Status = SyncStatus.Idle.ToString(),
+                Period = 24,
+                Query = "[{ \"type\": \"GroupMembership\", \"source\": \"fc8f8e1a-6d91-4965-85ff-f911944f201d\"}]",
+                Requestor = "user@domain.com",
+                StartDate = DateTime.UtcNow.AddDays(-1).ToString(),
+                ThresholdPercentageForAdditions = 100,
+                ThresholdPercentageForRemovals = 20
+            };
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_DuplicateDestination_ReturnsConflict()
+        {
+            var teamId = Guid.NewGuid();
+            var channelId = "19:channel-A";
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, channelId))
+                .ReturnsAsync(new SyncJob { Id = Guid.NewGuid(), MembershipType = "TeamsChannelMembership", Channel = new Channel { GroupId = teamId, ChannelId = channelId } });
+            UseTenantWriterContext();
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, channelId));
+
+            var conflict = response as ConflictObjectResult;
+            Assert.IsNotNull(conflict);
+            var body = conflict!.Value as PostJobResponse;
+            Assert.AreEqual("DuplicateDestination", body!.ErrorCode);
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_MissingChannelId_ReturnsBadRequest()
+        {
+            var teamId = Guid.NewGuid();
+            UseTenantWriterContext();
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, null));
+
+            var badRequest = response as BadRequestObjectResult;
+            Assert.IsNotNull(badRequest);
+            var body = badRequest!.Value as PostJobResponse;
+            Assert.AreEqual("MissingChannelId", body!.ErrorCode);
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_DistinctSiblingChannel_Saves()
+        {
+            var teamId = Guid.NewGuid();
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, "19:channel-A"))
+                .ReturnsAsync(new SyncJob { Id = Guid.NewGuid(), MembershipType = "TeamsChannelMembership", Channel = new Channel { GroupId = teamId, ChannelId = "19:channel-A" } });
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, "19:channel-B"))
+                .ReturnsAsync((SyncJob)null);
+            UseTenantWriterContext();
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, "19:channel-B"));
+
+            Assert.IsNotNull(response as CreatedResult);
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostTeamsChannelJob_WhenGroupMembershipJobExistsForTeam_Saves()
+        {
+            // A GroupMembership job on the same Team must not block a TeamsChannel save.
+            var teamId = Guid.NewGuid();
+            var channelId = "19:channel-A";
+            // Team-level (old) lookup would match the group job; channel-level lookup finds no duplicate.
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByObjectIdAsync(teamId))
+                .ReturnsAsync(new SyncJob { Id = Guid.NewGuid(), MembershipType = "GroupMembership", Group = new Group { GroupId = teamId } });
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobByTeamIdAndChannelIdAsync(teamId, channelId))
+                .ReturnsAsync((SyncJob)null);
+            UseTenantWriterContext();
+
+            var response = await _jobsController.PostJobAsync(TeamsChannelSyncJob(teamId, channelId));
+
+            Assert.IsNotNull(response as CreatedResult);
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithPendingConfigurationEnabled_DoesNotEnqueueAutoApproverAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+            _pendingConfigurationConfig.Setup(x => x.PendingConfigurationIsEnabled).Returns(true);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+
+            Assert.IsNotNull(result);
+            _autoApproverQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithTitlesAsync()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+
+            var identity = new ClaimsIdentity(claims);
+            var user = new ClaimsPrincipal(identity);
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _getJobsHandler = new GetJobsHandler(
+                                     NullLogger<GetJobsHandler>.Instance,
+                                     _databaseSyncJobsRepository.Object,
+                                     _graphGroupRepository.Object,
+                                     _httpContextAccessor.Object,
+                                     _syncJobChangeRepository.Object,
+                                     Mock.Of<ITeamsChannelRepository>());
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _newSyncJob.Titles =
+            [
+                new NewTitle
+                {
+                    PartId = "f8a4308b-4483-4f52-876e-93bbcf558032",
+                    Name = "Everyone in Test User 8877's org with the following summarized criteria: Building 103565"
+                },
+                new NewTitle
+                {
+                    PartId = "008e32e6-0a9e-4cbb-842e-76e1773a8e52",
+                    Name = "All Users in TestGroup1Members"
+                }
+            ];
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            Assert.IsNotNull(result);
+            _titlesRepository.Verify(x => x.SaveTitlesAsync(It.IsAny<Dictionary<string, string>>(), It.IsAny<Guid>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithoutTitlesAsync()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+
+            var identity = new ClaimsIdentity(claims);
+            var user = new ClaimsPrincipal(identity);
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAITitleEnabled))
+                                     .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAITitleEnabled, SettingValue = "false" });
+
+            _getJobsHandler = new GetJobsHandler(
+                                     NullLogger<GetJobsHandler>.Instance,
+                                     _databaseSyncJobsRepository.Object,
+                                     _graphGroupRepository.Object,
+                                     _httpContextAccessor.Object,
+                                     _syncJobChangeRepository.Object,
+                                     Mock.Of<ITeamsChannelRepository>());
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _newSyncJob.Titles =
+            [
+                new NewTitle
+                {
+                    PartId = "f8a4308b-4483-4f52-876e-93bbcf558032",
+                    Name = "Everyone in Test User 8877's org with the following summarized criteria: Building 103565"
+                },
+                new NewTitle
+                {
+                    PartId = "008e32e6-0a9e-4cbb-842e-76e1773a8e52",
+                    Name = "All Users in TestGroup1Members"
+                }
+            ];
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            Assert.IsNotNull(result);
+            _titlesRepository.Verify(x => x.SaveTitlesAsync(It.IsAny<Dictionary<string, string>>(), It.IsAny<Guid>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobFailureDueToRepositoryExceptionTestAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _databaseSyncJobsRepository
+                .Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                .ThrowsAsync(new Exception("Database error"));
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(ObjectResult));
+            var result = response as ObjectResult;
+            Assert.IsNotNull(result);
+            Assert.AreEqual(StatusCodes.Status500InternalServerError, result.StatusCode);
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobCreationFailedTestAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ReturnsAsync(Guid.Empty);
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(ObjectResult));
+            var result = response as ObjectResult;
+            Assert.IsNotNull(result);
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobCreationWhenClaimIsNotFoundTestAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ReturnsAsync(Guid.Empty);
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(ForbidResult));
+            var result = response as ForbidResult;
+            Assert.IsInstanceOfType(result, typeof(ForbidResult));
+
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobCreationNotOwnerFailureForbiddenTestAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_OWNER_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                                    .ReturnsAsync(() => false);
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ReturnsAsync(Guid.Empty);
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(ForbidResult));
+            var result = response as ForbidResult;
+            Assert.IsInstanceOfType(result, typeof(ForbidResult));
+
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobCreationExceptionTestAsync()
+        {
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ThrowsAsync(new Exception("Database error"));
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsNotNull(response);
+            Assert.IsInstanceOfType(response, typeof(ObjectResult));
+            var result = response as ObjectResult;
+            Assert.IsNotNull(result);
+            Assert.AreEqual(StatusCodes.Status500InternalServerError, result.StatusCode);
+        }
+
+        [TestMethod]
+        public async Task PostJobAsync_SanitizesUnexpectedException()
+        {
+            var thrown = new InvalidOperationException("sensitive internal detail that must not leak (PostJob)");
+            var postJobHandlerMock = new Mock<IRequestHandler<PostJobRequest, PostJobResponse>>();
+            postJobHandlerMock.Setup(h => h.ExecuteAsync(It.IsAny<PostJobRequest>())).ThrowsAsync(thrown);
+            var loggerMock = new Mock<ILogger<JobsController>>();
+
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            var controller = new JobsController(
+                _getJobsHandler,
+                _patchJobsHandler,
+                postJobHandlerMock.Object,
+                _getJobDetailsHandler,
+                _postResetRequestHandler,
+                loggerMock.Object);
+            controller.ControllerContext = new ControllerContext { HttpContext = _context };
+
+            var response = await controller.PostJobAsync(_newSyncJob);
+
+            var result = response as ObjectResult;
+            Assert.IsNotNull(result);
+            Assert.AreEqual((int)HttpStatusCode.InternalServerError, result.StatusCode);
+
+            var problem = result.Value as ProblemDetails;
+            Assert.IsNotNull(problem);
+            AssertNoExceptionLeak.Assert(problem.Detail ?? string.Empty, thrown);
+
+            loggerMock.Verify(
+                l => l.Log(
+                    LogLevel.Error,
+                    It.IsAny<EventId>(),
+                    It.IsAny<It.IsAnyType>(),
+                    thrown,
+                    It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+                Times.Once,
+                "The full exception must be logged on the server side.");
+        }
+
+        [TestMethod]
+        public async Task BulkApproveTestAsync()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+
+            var identity = new ClaimsIdentity(claims);
+            var user = new ClaimsPrincipal(identity);
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _patchJobsHandler = new PatchJobsHandler(NullLogger<PatchJobsHandler>.Instance,
+                                                 _databaseSyncJobsRepository.Object,
+                                                 _syncJobChangeRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.BulkApproveJobsAsync(_syncJobIds.ToArray());
+            Assert.IsNotNull(response);
+            var okResult = response.Result as OkObjectResult;
+            Assert.IsNotNull(okResult);
+            Assert.IsNotNull(okResult.Value);
+            var res = okResult.Value as PatchJobsResponse;
+            Assert.IsNotNull(res);
+            _databaseSyncJobsRepository.Verify(x => x.BulkApproveSyncJobsAsync(It.IsAny<List<string>>()), Times.Once);
+            _syncJobChangeRepository.Verify(x => x.BulkSaveAsync(It.IsAny<IEnumerable<SyncJobChange>>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task BulkApproveJobsAsync_SanitizesUnexpectedException()
+        {
+            // Arrange: throw from the underlying repository to escape into the controller's
+            // top-level catch (Exception ex). The handler now logs the full exception via
+            // LogError and returns a sanitized ProblemDetails 500 (previously: empty 500).
+            var thrown = new InvalidOperationException("sensitive internal detail must not leak (BulkApprove)");
+            _databaseSyncJobsRepository
+                .Setup(x => x.BulkApproveSyncJobsAsync(It.IsAny<List<string>>()))
+                .ThrowsAsync(thrown);
+
+            var loggerMock = new Mock<ILogger<JobsController>>();
+
+            // Reuse the controller's wired-up _patchJobsHandler (constructed in test setup) so
+            // the repo exception propagates through PatchJobsHandler into the controller catch.
+            var controller = new JobsController(
+                _getJobsHandler,
+                _patchJobsHandler,
+                _postJobHandler,
+                _getJobDetailsHandler,
+                _postResetRequestHandler,
+                loggerMock.Object);
+            controller.ControllerContext = new ControllerContext { HttpContext = _context };
+
+            // Act
+            var response = await controller.BulkApproveJobsAsync(_syncJobIds.ToArray());
+
+            // Assert
+            var result = response.Result as ObjectResult;
+            Assert.IsNotNull(result, "BulkApproveJobsAsync must now return an ObjectResult (Problem), not an empty StatusCodeResult.");
+            Assert.AreEqual((int)HttpStatusCode.InternalServerError, result.StatusCode);
+
+            var problem = result.Value as ProblemDetails;
+            Assert.IsNotNull(problem, "Response body must be a ProblemDetails.");
+            AssertNoExceptionLeak.Assert(problem.Detail ?? string.Empty, thrown);
+
+            loggerMock.Verify(
+                l => l.Log(
+                    LogLevel.Error,
+                    It.IsAny<EventId>(),
+                    It.IsAny<It.IsAnyType>(),
+                    thrown,
+                    It.IsAny<Func<It.IsAnyType, Exception?, string>>()),
+                Times.Once,
+                "The full exception must be logged on the server side.");
+        }
+
+
+        [TestMethod]
+        public async Task GetJobs_LastModifiedTime_UsesAnyChangeReason()
+        {
+            // Arrange - override the large initialized dataset with a single controlled job
+            var job = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            var singleList = new List<SyncJob> { job };
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(singleList.AsQueryable());
+
+            var latestChangeTime = DateTime.UtcNow.AddMinutes(-17).AddSeconds(-DateTime.UtcNow.Second); // normalize seconds
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(job.Id))
+                                     .ReturnsAsync(new SyncJobChange
+                                     {
+                                         Id = Guid.NewGuid(),
+                                         SyncJobId = job.Id,
+                                         ChangeTime = latestChangeTime,
+                                         ChangeReason = SyncJobChangeReason.SubmissionApproved.ToString()
+                                     });
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup>{ new AzureADGroup { ObjectId = job.Group.GroupId, Name = "LastModTestGroup" } });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var response = await _jobsController.GetJobsAsync(_odataQueryOptions);
+            var ok = response.Result as OkObjectResult;
+            Assert.IsNotNull(ok, "Expected OkObjectResult");
+            var paged = ok!.Value as PagedResponseDTO;
+            Assert.IsNotNull(paged, "Expected paged response");
+            var first = paged!.Items.Single();
+
+            Assert.AreEqual(latestChangeTime, first.LastModifiedTime, "LastModifiedTime should reflect most recent ANY change (SubmissionApproved)");
+            _syncJobChangeRepository.Verify(x => x.GetLastSyncJobRecordBySyncJobIdAsync(job.Id), Times.AtLeastOnce);
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_Ascending()
+        {
+            var jobs = new List<SyncJob>
+            {
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                },
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                }
+            };
+
+            // Sorting is done on the destination name cached in SQL, so these must be populated.
+            jobs[0].DestinationName = new DestinationName { Id = jobs[0].Id, Name = "ZZZ Last Group" };
+            jobs[1].DestinationName = new DestinationName { Id = jobs[1].Id, Name = "AAA First Group" };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(jobs.AsQueryable());
+
+            var groups = new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = jobs[0].Group.GroupId, Name = "ZZZ Last Group" },
+                new AzureADGroup { ObjectId = jobs[1].Group.GroupId, Name = "AAA First Group" }
+            };
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(groups);
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            Assert.AreEqual(2, response.Model.Count);
+            Assert.AreEqual("AAA First Group", response.Model[0].TargetGroupName, "First job should be sorted alphabetically first");
+            Assert.AreEqual("ZZZ Last Group", response.Model[1].TargetGroupName, "Second job should be sorted alphabetically last");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_GroupOnly_DoesNotResolveChannelNamesAndNamesAreUnchanged()
+        {
+            // A tenant with only GroupMembership jobs must behave exactly as before: no channel-name
+            // resolution call, no "| team" concatenation, and no NRE on the null Channel navigation property.
+            // Runs both the default projection path and the targetGroupName custom-sort path.
+            var group1 = Guid.NewGuid();
+            var group2 = Guid.NewGuid();
+            SyncJob GroupJob(Guid gid) => new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = gid }
+            };
+            var jobA = GroupJob(group1);
+            var jobB = GroupJob(group2);
+
+            // Sorting is done on the destination name cached in SQL, so these must be populated.
+            jobA.DestinationName = new DestinationName { Id = jobA.Id, Name = "Zulu Group" };
+            jobB.DestinationName = new DestinationName { Id = jobB.Id, Name = "Alpha Group" };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { jobA, jobB }.AsQueryable());
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup>
+                                 {
+                                     new AzureADGroup { ObjectId = group1, Name = "Zulu Group" },
+                                     new AzureADGroup { ObjectId = group2, Name = "Alpha Group" }
+                                 });
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            // Teams repo is PRESENT but must never be invoked for group-only jobs.
+            var teamsRepo = new Mock<ITeamsChannelRepository>(MockBehavior.Strict);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             teamsRepo.Object);
+
+            // Default (non-custom-sort) path.
+            var defaultResponse = await handler.ExecuteAsync(new GetJobsRequest());
+            var nameA = defaultResponse.Model.Single(m => m.SyncJobId == jobA.Id).TargetGroupName;
+            var nameB = defaultResponse.Model.Single(m => m.SyncJobId == jobB.Id).TargetGroupName;
+            Assert.AreEqual("Zulu Group", nameA, "Group job name should be the plain group name (no ' | ')");
+            Assert.AreEqual("Alpha Group", nameB);
+            Assert.IsFalse(nameA.Contains("|"), "Group jobs must not have channel concatenation");
+
+            // Custom sort-by-name path.
+            var sortedResponse = await handler.ExecuteAsync(new GetJobsRequest
+            {
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            });
+            Assert.AreEqual("Alpha Group", sortedResponse.Model[0].TargetGroupName);
+            Assert.AreEqual("Zulu Group", sortedResponse.Model[1].TargetGroupName);
+
+            // The strict mock proves GetTeamsChannelNamesAsync was never called for a group-only tenant.
+            teamsRepo.VerifyNoOtherCalls();
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_SortsChannelJobsByResolvedName()
+        {
+            // A channel job sorts on the destination name cached in SQL (the channel name, which is the
+            // leading token of its displayed "channel | team" name), and must not NRE on the null Group
+            // navigation property during name-sorting.
+            var teamGroupId = Guid.NewGuid();
+            const string channelId = "19:abc123@thread.tacv2";
+            var channelJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.TeamsChannelMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Channel = new Models.Channel { SyncJobId = Guid.NewGuid(), GroupId = teamGroupId, ChannelId = channelId }
+            };
+            var groupJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            // Sorting is done on the destination name cached in SQL; for channel jobs that cached value
+            // is the channel name (kept fresh by DestinationAttributesUpdater), so these must be populated.
+            channelJob.DestinationName = new DestinationName { Id = channelJob.Id, Name = "Apple Channel" };
+            groupJob.DestinationName = new DestinationName { Id = groupJob.Id, Name = "Mango Group" };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { groupJob, channelJob }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup>
+                                 {
+                                     new AzureADGroup { ObjectId = teamGroupId, Name = "Banana Team" },
+                                     new AzureADGroup { ObjectId = groupJob.Group.GroupId, Name = "Mango Group" }
+                                 });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var teamsRepo = new Mock<ITeamsChannelRepository>();
+            teamsRepo.Setup(x => x.GetTeamsChannelNamesAsync(It.IsAny<List<AzureADTeamsChannel>>()))
+                     .ReturnsAsync(new Dictionary<string, string> { { channelId, "Apple Channel" } });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             teamsRepo.Object);
+
+            var response = await handler.ExecuteAsync(new GetJobsRequest
+            {
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            });
+
+            Assert.AreEqual(2, response.Model.Count);
+            // "Apple Channel | Banana Team" sorts before "Mango Group".
+            Assert.AreEqual("Apple Channel | Banana Team", response.Model[0].TargetGroupName, "Channel job sorts first by its cached destination name ('Apple Channel') and displays 'channel | team'");
+            Assert.AreEqual("Mango Group", response.Model[1].TargetGroupName);
+        }
+
+        [TestMethod]
+        public async Task GetJobs_TeamsChannelJob_TargetGroupNameIsChannelAndTeam()
+        {
+            // TeamsChannel jobs show "channel | team"; GroupMembership jobs stay unchanged.
+            var teamGroupId = Guid.NewGuid();
+            const string channelId = "19:abc123@thread.tacv2";
+            var channelJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.TeamsChannelMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Channel = new Models.Channel { SyncJobId = Guid.NewGuid(), GroupId = teamGroupId, ChannelId = channelId }
+            };
+            var groupJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { channelJob, groupJob }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup>
+                                 {
+                                     new AzureADGroup { ObjectId = teamGroupId, Name = "Parent Team Name" },
+                                     new AzureADGroup { ObjectId = groupJob.Group.GroupId, Name = "Regular Group Name" }
+                                 });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var teamsRepo = new Mock<ITeamsChannelRepository>();
+            teamsRepo.Setup(x => x.GetTeamsChannelNamesAsync(It.IsAny<List<AzureADTeamsChannel>>()))
+                     .ReturnsAsync(new Dictionary<string, string> { { channelId, "Shared Channel Display Name" } });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             teamsRepo.Object);
+
+            var response = await handler.ExecuteAsync(new GetJobsRequest());
+
+            var channelDto = response.Model.Single(m => m.SyncJobId == channelJob.Id);
+            var groupDto = response.Model.Single(m => m.SyncJobId == groupJob.Id);
+
+            Assert.AreEqual("Shared Channel Display Name | Parent Team Name", channelDto.TargetGroupName, "TeamsChannel job Name should be 'channel | team'");
+            Assert.AreEqual("Regular Group Name", groupDto.TargetGroupName, "GroupMembership job Name should be unchanged");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_Descending()
+        {
+            var jobs = new List<SyncJob>
+            {
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                },
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                }
+            };
+
+            // Sorting is done on the destination name cached in SQL, so these must be populated.
+            jobs[0].DestinationName = new DestinationName { Id = jobs[0].Id, Name = "AAA First Group" };
+            jobs[1].DestinationName = new DestinationName { Id = jobs[1].Id, Name = "ZZZ Last Group" };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(jobs.AsQueryable());
+
+            var groups = new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = jobs[0].Group.GroupId, Name = "AAA First Group" },
+                new AzureADGroup { ObjectId = jobs[1].Group.GroupId, Name = "ZZZ Last Group" }
+            };
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(groups);
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = true
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            // Assert
+            Assert.AreEqual(2, response.Model.Count);
+            Assert.AreEqual("ZZZ Last Group", response.Model[0].TargetGroupName, "First job should be sorted reverse alphabetically first");
+            Assert.AreEqual("AAA First Group", response.Model[1].TargetGroupName, "Second job should be sorted reverse alphabetically last");
+        }
+
+        private static ODataQueryOptions<SyncJob> CreatePagedQueryOptions(int top, int skip)
+        {
+            return CreateQueryOptions($"?$top={top}&$skip={skip}");
+        }
+
+        private static ODataQueryOptions<SyncJob> CreateQueryOptions(string queryString)
+        {
+            var builder = new ODataConventionModelBuilder();
+            builder.EntitySet<SyncJob>("SyncJob");
+            var edmModel = builder.GetEdmModel();
+            var odataContext = new ODataQueryContext(edmModel, typeof(SyncJob), new ODataPath());
+
+            var context = new DefaultHttpContext();
+            context.Request.QueryString = new QueryString(queryString);
+
+            return new ODataQueryOptions<SyncJob>(odataContext, context.Request);
+        }
+
+        private List<SyncJob> CreateJobsWithDestinationNames(int count)
+        {
+            return Enumerable.Range(0, count).Select(index =>
+            {
+                var jobId = Guid.NewGuid();
+                return new SyncJob
+                {
+                    Id = jobId,
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = jobId, GroupId = Guid.NewGuid() },
+                    DestinationName = new DestinationName { Id = jobId, Name = $"Group {index:D2}" }
+                };
+            }).ToList();
+        }
+
+        /// <summary>
+        /// Regression test for the RU exhaustion incident: sorting by target group name used to read
+        /// every destination group in the catalog from Graph before paging. Only the visible page
+        /// should ever be resolved against Graph.
+        /// </summary>
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_OnlyResolvesVisiblePageFromGraph()
+        {
+            var jobs = CreateJobsWithDestinationNames(50);
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(() => jobs.AsQueryable());
+
+            var requestedGroupIds = new List<List<Guid>>();
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .Callback<List<Guid>>(ids => requestedGroupIds.Add(ids))
+                                 .ReturnsAsync((List<Guid> ids) => ids.Select(id => new AzureADGroup
+                                 {
+                                     ObjectId = id,
+                                     Name = jobs.Single(job => job.Group.GroupId == id).DestinationName.Name
+                                 }).ToList());
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                QueryOptions = CreatePagedQueryOptions(top: 10, skip: 0),
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            Assert.AreEqual(10, response.Model.Count, "Only the requested page should be returned");
+            Assert.AreEqual(50, response.TotalItems, "Total items should reflect the full filtered result set");
+            Assert.AreEqual(5, response.TotalNumberOfPages);
+            Assert.AreEqual("Group 00", response.Model[0].TargetGroupName);
+            Assert.AreEqual("Group 09", response.Model[9].TargetGroupName);
+
+            Assert.AreEqual(1, requestedGroupIds.Count, "Graph should be called once");
+            Assert.AreEqual(10, requestedGroupIds[0].Count, "Graph should only be asked for the visible page, not the whole catalog");
+        }
+
+        /// <summary>
+        /// A caller can pass $top without $skip. The page must still be bounded before the Graph
+        /// call, otherwise the whole catalog gets resolved and the RU quota is exhausted again.
+        /// </summary>
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_TopWithoutSkip_StillPagesBeforeGraph()
+        {
+            var jobs = CreateJobsWithDestinationNames(50);
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(() => jobs.AsQueryable());
+
+            var requestedGroupIds = new List<List<Guid>>();
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .Callback<List<Guid>>(ids => requestedGroupIds.Add(ids))
+                                 .ReturnsAsync((List<Guid> ids) => ids.Select(id => new AzureADGroup
+                                 {
+                                     ObjectId = id,
+                                     Name = jobs.Single(job => job.Group.GroupId == id).DestinationName.Name
+                                 }).ToList());
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                QueryOptions = CreateQueryOptions("?$top=10"),
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            Assert.AreEqual(10, response.Model.Count, "$top alone must still bound the page");
+            Assert.AreEqual(1, response.CurrentPage, "A missing $skip should be treated as the first page");
+            Assert.AreEqual("Group 00", response.Model[0].TargetGroupName);
+            Assert.AreEqual(10, requestedGroupIds.Single().Count, "Graph must not be asked for the whole catalog when $skip is omitted");
+        }
+
+        /// <summary>
+        /// DestinationName is nullable and not unique, so paging needs a deterministic tie-breaker.
+        /// Without one, a job can show up on two pages or be skipped entirely.
+        /// </summary>
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_DuplicateAndNullNames_PagesWithoutOverlapOrGaps()
+        {
+            var jobs = CreateJobsWithDestinationNames(30);
+
+            // Tie groups are deliberately 15 wide against a page size of 10, so a group of equal
+            // sort keys straddles a page boundary. Aligned groups would page consistently even
+            // without a tie-breaker and would not exercise the fix.
+            for (var i = 0; i < 15; i++)
+            {
+                jobs[i].DestinationName = null;
+            }
+            for (var i = 15; i < 30; i++)
+            {
+                jobs[i].DestinationName.Name = "Duplicate Group";
+            }
+
+            // SQL is free to return tied rows in a different order on each query. Shuffling the source
+            // per call reproduces that, so this test fails if the deterministic tie-breaker is removed.
+            var shuffleSeed = 0;
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(() => jobs.OrderBy(_ => (shuffleSeed++ * 7919) % 31).AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync((List<Guid> ids) => ids.Select(id => new AzureADGroup
+                                 {
+                                     ObjectId = id,
+                                     Name = jobs.Single(job => job.Group.GroupId == id).DestinationName?.Name
+                                 }).ToList());
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var seenJobIds = new List<Guid>();
+            for (var skip = 0; skip < 30; skip += 10)
+            {
+                var page = await handler.ExecuteAsync(new GetJobsRequest
+                {
+                    QueryOptions = CreatePagedQueryOptions(top: 10, skip: skip),
+                    CustomSortBy = "targetGroupName",
+                    IsSortedDescending = false
+                });
+
+                Assert.AreEqual(10, page.Model.Count, $"Page at skip {skip} should be full");
+                seenJobIds.AddRange(page.Model.Select(job => job.SyncJobId));
+            }
+
+            CollectionAssert.AllItemsAreUnique(seenJobIds, "Paging must not return the same job on more than one page");
+            Assert.AreEqual(30, seenJobIds.Distinct().Count(), "Paging must not skip any job");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_SecondPage_OnlyResolvesVisiblePageFromGraph()
+        {
+            var jobs = CreateJobsWithDestinationNames(50);
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(() => jobs.AsQueryable());
+
+            var requestedGroupIds = new List<List<Guid>>();
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .Callback<List<Guid>>(ids => requestedGroupIds.Add(ids))
+                                 .ReturnsAsync((List<Guid> ids) => ids.Select(id => new AzureADGroup
+                                 {
+                                     ObjectId = id,
+                                     Name = jobs.Single(job => job.Group.GroupId == id).DestinationName.Name
+                                 }).ToList());
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                QueryOptions = CreatePagedQueryOptions(top: 10, skip: 20),
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            Assert.AreEqual(10, response.Model.Count);
+            Assert.AreEqual(3, response.CurrentPage);
+            Assert.AreEqual("Group 20", response.Model[0].TargetGroupName, "Paging must be applied to the sorted result set");
+            Assert.AreEqual("Group 29", response.Model[9].TargetGroupName);
+            Assert.AreEqual(10, requestedGroupIds.Single().Count, "Graph should only be asked for the visible page");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_LastModifiedTime_OnlyResolvesVisiblePageFromGraph()
+        {
+            var jobs = CreateJobsWithDestinationNames(50);
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(() => jobs.AsQueryable());
+
+            var requestedGroupIds = new List<List<Guid>>();
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .Callback<List<Guid>>(ids => requestedGroupIds.Add(ids))
+                                 .ReturnsAsync((List<Guid> ids) => ids.Select(id => new AzureADGroup
+                                 {
+                                     ObjectId = id,
+                                     Name = jobs.Single(job => job.Group.GroupId == id).DestinationName.Name
+                                 }).ToList());
+
+            // Oldest change belongs to the last job, so ascending order reverses the list.
+            var baseTime = DateTime.UtcNow.AddDays(-1);
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((Guid syncJobId) => new SyncJobChange
+                                     {
+                                         Id = Guid.NewGuid(),
+                                         SyncJobId = syncJobId,
+                                         ChangeTime = baseTime.AddMinutes(-jobs.FindIndex(job => job.Id == syncJobId))
+                                     });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var request = new GetJobsRequest
+            {
+                QueryOptions = CreatePagedQueryOptions(top: 10, skip: 0),
+                CustomSortBy = "lastModifiedTime",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(request);
+
+            Assert.AreEqual(10, response.Model.Count);
+            Assert.AreEqual(50, response.TotalItems);
+            Assert.AreEqual("Group 49", response.Model[0].TargetGroupName, "Oldest change should sort first when ascending");
+            Assert.AreEqual(10, requestedGroupIds.Single().Count, "Graph should only be asked for the visible page");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_LastModifiedTime_Ascending()
+        {
+            // Arrange - create multiple jobs with different last modified times
+            var jobs = new List<SyncJob>
+            {
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                },
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(jobs.AsQueryable());
+
+            var groups = new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = jobs[0].Group.GroupId, Name = "Group A" },
+                new AzureADGroup { ObjectId = jobs[1].Group.GroupId, Name = "Group B" }
+            };
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(groups);
+
+            var earlierTime = DateTime.UtcNow.AddHours(-2);
+            var laterTime = DateTime.UtcNow.AddHours(-1);
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(jobs[0].Id))
+                                     .ReturnsAsync(new SyncJobChange { Id = Guid.NewGuid(), SyncJobId = jobs[0].Id, ChangeTime = laterTime });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(jobs[1].Id))
+                                     .ReturnsAsync(new SyncJobChange { Id = Guid.NewGuid(), SyncJobId = jobs[1].Id, ChangeTime = earlierTime });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            // Create request with custom sort by lastModifiedTime ascending
+            var request = new GetJobsRequest
+            {
+                CustomSortBy = "lastModifiedTime",
+                IsSortedDescending = false
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act
+            var response = await handler.ExecuteAsync(request);
+
+            // Assert
+            Assert.AreEqual(2, response.Model.Count);
+            Assert.AreEqual(earlierTime, response.Model[0].LastModifiedTime, "Earlier modified job should be first");
+            Assert.AreEqual(laterTime, response.Model[1].LastModifiedTime, "Later modified job should be second");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_LastModifiedTime_Descending()
+        {
+            // Arrange - create multiple jobs with different last modified times
+            var jobs = new List<SyncJob>
+            {
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                },
+                new SyncJob
+                {
+                    Id = Guid.NewGuid(),
+                    Status = SyncStatus.Idle.ToString(),
+                    Period = 6,
+                    LastRunTime = DateTime.UtcNow.AddHours(-5),
+                    LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                    StartDate = DateTime.UtcNow.AddDays(-2),
+                    ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                    MembershipType = MembershipTypes.GroupMembership.ToString(),
+                    StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                    Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+                }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(jobs.AsQueryable());
+
+            var groups = new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = jobs[0].Group.GroupId, Name = "Group A" },
+                new AzureADGroup { ObjectId = jobs[1].Group.GroupId, Name = "Group B" }
+            };
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(groups);
+
+            var earlierTime = DateTime.UtcNow.AddHours(-2);
+            var laterTime = DateTime.UtcNow.AddHours(-1);
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(jobs[0].Id))
+                                     .ReturnsAsync(new SyncJobChange { Id = Guid.NewGuid(), SyncJobId = jobs[0].Id, ChangeTime = earlierTime });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(jobs[1].Id))
+                                     .ReturnsAsync(new SyncJobChange { Id = Guid.NewGuid(), SyncJobId = jobs[1].Id, ChangeTime = laterTime });
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            // Create request with custom sort by lastModifiedTime descending
+            var request = new GetJobsRequest
+            {
+                CustomSortBy = "lastModifiedTime",
+                IsSortedDescending = true
+            };
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act
+            var response = await handler.ExecuteAsync(request);
+
+            // Assert
+            Assert.AreEqual(2, response.Model.Count);
+            Assert.AreEqual(laterTime, response.Model[0].LastModifiedTime, "Later modified job should be first when descending");
+            Assert.AreEqual(earlierTime, response.Model[1].LastModifiedTime, "Earlier modified job should be second when descending");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_SyncJobChangeRepository_Exception_Handled()
+        {
+            // Arrange - create job that will throw exception when fetching last modified time
+            var job = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { job }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup> { new AzureADGroup { ObjectId = job.Group.GroupId, Name = "TestGroup" } });
+
+            // Setup to throw exception
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(job.Id))
+                                     .ThrowsAsync(new Exception("Database error"));
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act
+            var response = await handler.ExecuteAsync(new GetJobsRequest());
+
+            // Assert - should handle exception gracefully and return null LastModifiedTime
+            Assert.AreEqual(1, response.Model.Count);
+            Assert.IsNull(response.Model[0].LastModifiedTime, "LastModifiedTime should be null when exception occurs");
+        }
+
+        [TestMethod]
+        public async Task GetJobs_TeamsChannelMembership_HandlesChannelGroupId()
+        {
+            // Arrange - create job with TeamsChannelMembership type
+            var job = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.TeamsChannelMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() },
+                Channel = new Channel { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid(), ChannelId = "channel123" }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { job }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup> { new AzureADGroup { ObjectId = job.Channel.GroupId, Name = "TeamsGroup" } });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(job.Id))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act
+            var response = await handler.ExecuteAsync(new GetJobsRequest());
+
+            // Assert
+            Assert.AreEqual(1, response.Model.Count);
+            Assert.AreEqual(job.Channel.GroupId, response.Model[0].TargetGroupId, "Should use Channel.GroupId for Teams membership");
+            Assert.AreEqual("TeamsGroup", response.Model[0].TargetGroupName);
+        }
+
+        [TestMethod]
+        public async Task GetJobs_CustomSort_TargetGroupName_TeamsChannelJobWithNullGroup_DoesNotThrow()
+        {
+            // Arrange - a Teams channel job stores its destination on Channel, so Group is null in the database.
+            // Sorting by target group name used to dereference Group.GroupId unconditionally and throw a
+            // NullReferenceException, failing the entire GetJobs request with an HTTP 500.
+            var groupJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            var teamsChannelJob = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.TeamsChannelMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = null,
+                Channel = new Channel { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid(), ChannelId = "channel123" }
+            };
+
+            // Sorting is done on the destination name cached in SQL.
+            groupJob.DestinationName = new DestinationName { Id = groupJob.Id, Name = "ZZZ Last Group" };
+            teamsChannelJob.DestinationName = new DestinationName { Id = teamsChannelJob.Id, Name = "AAA Teams Channel Group" };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { groupJob, teamsChannelJob }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup>
+                                 {
+                                     new AzureADGroup { ObjectId = groupJob.Group.GroupId, Name = "ZZZ Last Group" },
+                                     new AzureADGroup { ObjectId = teamsChannelJob.Channel.GroupId, Name = "AAA Teams Channel Group" }
+                                 });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(It.IsAny<Guid>()))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act
+            var response = await handler.ExecuteAsync(new GetJobsRequest
+            {
+                CustomSortBy = "targetGroupName",
+                IsSortedDescending = false
+            });
+
+            // Assert - the full list is returned and the channel job resolves its name via Channel.GroupId
+            Assert.AreEqual(2, response.Model.Count, "A Teams channel job must not fail the whole request");
+            Assert.AreEqual("AAA Teams Channel Group", response.Model[0].TargetGroupName);
+            Assert.AreEqual("ZZZ Last Group", response.Model[1].TargetGroupName);
+        }
+
+        [TestMethod]
+        public async Task GetJobs_NoQueryOptions_UsesDefaultSortAndPagination()
+        {
+            // Arrange
+            var job = new SyncJob
+            {
+                Id = Guid.NewGuid(),
+                Status = SyncStatus.Idle.ToString(),
+                Period = 6,
+                LastRunTime = DateTime.UtcNow.AddHours(-5),
+                LastSuccessfulRunTime = DateTime.UtcNow.AddHours(-6),
+                StartDate = DateTime.UtcNow.AddDays(-2),
+                ScheduledDate = DateTime.UtcNow.AddHours(-1),
+                MembershipType = MembershipTypes.GroupMembership.ToString(),
+                StatusDetails = new Status { Id = Guid.NewGuid(), Name = SyncStatus.Idle.ToString(), SortPriority = 1000 },
+                Group = new Group { SyncJobId = Guid.NewGuid(), GroupId = Guid.NewGuid() }
+            };
+
+            _databaseSyncJobsRepository.Setup(x => x.GetSyncJobs(It.IsAny<bool>()))
+                                       .Returns(new List<SyncJob> { job }.AsQueryable());
+
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                 .ReturnsAsync(new List<AzureADGroup> { new AzureADGroup { ObjectId = job.Group.GroupId, Name = "TestGroup" } });
+
+            _syncJobChangeRepository.Setup(x => x.GetLastSyncJobRecordBySyncJobIdAsync(job.Id))
+                                     .ReturnsAsync((SyncJobChange?)null);
+
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_READER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            // Act - no query options provided
+            var response = await handler.ExecuteAsync(new GetJobsRequest { QueryOptions = null });
+
+            // Assert
+            Assert.AreEqual(1, response.TotalItems);
+            Assert.AreEqual(1, response.TotalNumberOfPages);
+            Assert.AreEqual(1, response.CurrentPage);
+            Assert.AreEqual(1, response.Model.Count);
+        }
+
+        [TestMethod]
+        public async Task GetJobs_UserWithoutPermissions_ReturnsEmptyResults()
+        {
+            // Arrange - user without proper claims
+            var userContext = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, "SomeOtherRole")
+                // Missing objectidentifier claim
+            });
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(userContext);
+
+            var handler = new GetJobsHandler(NullLogger<GetJobsHandler>.Instance,
+                                             _databaseSyncJobsRepository.Object,
+                                             _graphGroupRepository.Object,
+                                             _httpContextAccessor.Object,
+                                             _syncJobChangeRepository.Object,
+                                             Mock.Of<ITeamsChannelRepository>());
+
+            var response = await handler.ExecuteAsync(new GetJobsRequest());
+
+            Assert.AreEqual(0, response.Model.Count, "Should return empty results for user without permissions");
+            Assert.AreEqual(0, response.TotalItems);
+        }
+
+        private async IAsyncEnumerable<T> ToAsyncEnumerable<T>(IEnumerable<T> input)
+        {
+            foreach (var value in await Task.FromResult(input))
+            {
+                yield return value;
+            }
+        }
+
+        private HttpContext CreateHttpContext(List<Claim> claims)
+        {
+            var identity = new ClaimsIdentity(claims, "TestAuthType");
+            var principal = new ClaimsPrincipal(identity);
+            var httpContext = new DefaultHttpContext();
+            httpContext.User = principal;
+
+            return httpContext;
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalEnabledAndValidGroups_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            // Setup groups with acceptable visibility (not HiddenMembership)
+            var groupId1 = Guid.NewGuid();
+            var groupId2 = Guid.NewGuid();
+            _groups.AddRange(new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = groupId1, Visibility = "Public" },
+                new AzureADGroup { ObjectId = groupId2, Visibility = "Private" }
+            });
+
+            // Setup sync job with GroupMembership query
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId1}\"}},{{\"type\":\"GroupMembership\",\"source\":\"{groupId2}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was created in PendingAutoApproval (awaiting AutoApprover evaluation)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+
+            _autoApproverQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApproverEnqueueFailure_RevertsJobToPendingReviewAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            var groupId1 = Guid.NewGuid();
+            _groups.Add(new AzureADGroup { ObjectId = groupId1, Visibility = "Public" });
+
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId1}\"}}]";
+
+            // Simulate the enqueue to the AutoApprover queue failing
+            _autoApproverQueueRepository.Setup(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()))
+                                        .ThrowsAsync(new Exception("Service Bus unavailable"));
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+
+            // The job was still created successfully, so a Created response is expected
+            Assert.IsNotNull(result);
+
+            // The enqueue was attempted but failed
+            _autoApproverQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()), Times.Once);
+
+            // The job must be reverted to PendingReview so a human reviewer can pick it up
+            _databaseSyncJobsRepository.Verify(x => x.UpdateSyncJobsAsync(
+                It.Is<IEnumerable<SyncJob>>(jobs => jobs.Any(job => job.Status == SyncStatus.PendingReview.ToString())),
+                It.IsAny<SyncStatus?>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalEnabledButHiddenMembershipGroup_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            // Setup groups with one having HiddenMembership visibility
+            var groupId1 = Guid.NewGuid();
+            var groupId2 = Guid.NewGuid();
+            _groups.AddRange(new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = groupId1, Visibility = "Public" },
+                new AzureADGroup { ObjectId = groupId2, Visibility = "HiddenMembership" }
+            });
+
+            // Setup sync job with GroupMembership query
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId1}\"}},{{\"type\":\"GroupMembership\",\"source\":\"{groupId2}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalDisabled_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to disabled (default)
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            // Setup groups with acceptable visibility
+            var groupId1 = Guid.NewGuid();
+            var groupId2 = Guid.NewGuid();
+            _groups.AddRange(new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = groupId1, Visibility = "Public" },
+                new AzureADGroup { ObjectId = groupId2, Visibility = "Private" }
+            });
+
+            // Setup sync job with GroupMembership query
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId1}\"}},{{\"type\":\"GroupMembership\",\"source\":\"{groupId2}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalEnabledButNonGroupMembershipQuery_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            // Setup sync job with non-GroupMembership query (e.g., SecurityGroup)
+            var groupId = Guid.NewGuid();
+            _newSyncJob.Query = $"[{{\"type\":\"SecurityGroup\",\"source\":\"{groupId}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        // New tests for org leader auto-approval scenarios
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalEnabledAndMatchingManagerId_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup group-based auto-approval setting to disabled (ensure it doesn't interfere)
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with onPremisesImmutableId matching manager ID
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with single SqlMembership query where manager ID matches user's onPremisesImmutableId
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{userOnPremisesImmutableId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was created in PendingAutoApproval (awaiting AutoApprover evaluation)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalEnabledButNonMatchingManagerId_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with onPremisesImmutableId different from manager ID
+            var userOnPremisesImmutableId = "12345";
+            var differentManagerId = "67890";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with single SqlMembership query where manager ID does NOT match user's onPremisesImmutableId
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{differentManagerId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalDisabled_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to disabled (default)
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            // Setup user with onPremisesImmutableId matching manager ID
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with single SqlMembership query where manager ID matches user's onPremisesImmutableId
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{userOnPremisesImmutableId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalEnabledButMultipleSqlMembershipQueries_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with onPremisesImmutableId
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with multiple SqlMembership queries (should not auto-approve)
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{userOnPremisesImmutableId}}}}}}},{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{userOnPremisesImmutableId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalEnabledButNonSqlMembershipQuery_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with onPremisesImmutableId
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with non-SqlMembership query (e.g., GroupMembership)
+            var groupId = Guid.NewGuid();
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalEnabledButUserWithoutOnPremisesImmutableId_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user without onPremisesImmutableId (null or empty)
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = null // User has no onPremisesImmutableId
+                                });
+
+            // Setup sync job with single SqlMembership query
+            var managerId = "12345";
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{managerId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithBothAutoApprovalSettingsEnabledButOnlyGroupBasedMatches_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup both auto-approval settings to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup groups with acceptable visibility
+            var groupId1 = Guid.NewGuid();
+            var groupId2 = Guid.NewGuid();
+            _groups.AddRange(new List<AzureADGroup>
+            {
+                new AzureADGroup { ObjectId = groupId1, Visibility = "Public" },
+                new AzureADGroup { ObjectId = groupId2, Visibility = "Private" }
+            });
+
+            // Setup user with onPremisesImmutableId
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserByUpnOrIdAsync(userUpn, false))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with GroupMembership query (should trigger group-based auto-approval)
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId1}\"}},{{\"type\":\"GroupMembership\",\"source\":\"{groupId2}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was created in PendingAutoApproval (awaiting AutoApprover evaluation)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job =>
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+
+            // Verify that the sync job change was saved with Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change =>
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithBothAutoApprovalSettingsEnabledButOnlyOrgLeaderMatches_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup both auto-approval settings to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with onPremisesImmutableId matching manager ID
+            var userOnPremisesImmutableId = "12345";
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = userOnPremisesImmutableId 
+                                });
+
+            // Setup sync job with single SqlMembership query where manager ID matches user's onPremisesImmutableId
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{userOnPremisesImmutableId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was created in PendingAutoApproval (awaiting AutoApprover evaluation)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job =>
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+
+            // Verify that the sync job change was saved with Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change =>
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalErrorDuringSettingsRetrieval_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup settings repository to throw exception
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ThrowsAsync(new Exception("Database error"));
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            // Setup sync job with GroupMembership query
+            var groupId = Guid.NewGuid();
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved due to settings error (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalErrorDuringGraphAPICall_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            // Setup Graph API to throw exception
+            var groupId = Guid.NewGuid();
+            _graphGroupRepository.Setup(x => x.GetGroupsAsync(It.IsAny<List<Guid>>()))
+                                .ThrowsAsync(new Exception("Graph API error"));
+
+            // Setup sync job with GroupMembership query
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved due to Graph API error (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalInvalidJSONQuery_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            // Setup required mocks for job creation
+            var destinationGuid = Guid.NewGuid();
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                                .ReturnsAsync(true);
+
+            _graphGroupRepository.Setup(x => x.GetGroupEmailAsync(It.IsAny<Guid>()))
+                                .ReturnsAsync("test@example.com");
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                      .ReturnsAsync(Guid.NewGuid());
+
+            // Setup sync job with valid destination but invalid JSON query
+            _newSyncJob = new NewSyncJobDTO
+            {
+                Destination = $"[{{\"value\":{{\"objectId\":\"{destinationGuid}\"}},\"type\":\"GroupMembership\"}}]",
+                Status = SyncStatus.PendingReview.ToString(),
+                Period = 24,
+                Query = "invalid json {", // Invalid JSON query
+                Requestor = "user@domain.com",
+                StartDate = DateTime.UtcNow.AddDays(-1).ToString(),
+                ThresholdPercentageForAdditions = 100,
+                ThresholdPercentageForRemovals = 20
+            };
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as ObjectResult;
+            
+            Assert.IsNotNull(result);
+            Assert.AreEqual(500, result.StatusCode);
+            
+            // Verify that the sync job repository was not called due to the JSON parsing exception
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()), Times.Never);
+            
+            // Verify that the sync job change repository was not called due to the JSON parsing exception
+            _syncJobChangeRepository.Verify(x => x.Save(It.IsAny<SyncJobChange>()), Times.Never);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalEmptyQueryArray_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "true" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            // Setup required mocks for job creation
+            var destinationGuid = Guid.NewGuid();
+            _graphGroupRepository.Setup(x => x.IsEmailRecipientOwnerOfGroupAsync(It.IsAny<string>(), It.IsAny<Guid>(), It.IsAny<bool>()))
+                                .ReturnsAsync(true);
+
+            _graphGroupRepository.Setup(x => x.GetGroupEmailAsync(It.IsAny<Guid>()))
+                                .ReturnsAsync("test@example.com");
+
+            _databaseSyncJobsRepository.Setup(x => x.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                      .ReturnsAsync(Guid.NewGuid());
+
+            // Setup sync job with valid destination but empty query array
+            _newSyncJob = new NewSyncJobDTO
+            {
+                Destination = $"[{{\"value\":{{\"objectId\":\"{destinationGuid}\"}},\"type\":\"GroupMembership\"}}]",
+                Status = SyncStatus.PendingReview.ToString(),
+                Period = 24,
+                Query = "[]", // Empty query array
+                Requestor = "user@domain.com",
+                StartDate = DateTime.UtcNow.AddDays(-1).ToString(),
+                ThresholdPercentageForAdditions = 100,
+                ThresholdPercentageForRemovals = 20
+            };
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved due to empty query (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalInvalidOnPremisesImmutableId_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user with non-numeric onPremisesImmutableId
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ReturnsAsync(new AzureADUser { 
+                                    UserPrincipalName = userUpn, 
+                                    OnPremisesImmutableId = "abc123" // Non-numeric value
+                                });
+
+            // Setup sync job with single SqlMembership query
+            var managerId = "12345";
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{managerId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved due to invalid onPremisesImmutableId (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithOrgLeaderAutoApprovalUserLookupError_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            var userUpn = "user@domain.com";
+            var userId = Guid.NewGuid().ToString();
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, userUpn),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", userId)
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup org leader auto-approval setting to enabled
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "true" });
+
+            // Setup user lookup to throw exception
+            _graphGroupRepository.Setup(x => x.GetUserWithOnPremisesImmutableIdAsync(userId, It.IsAny<Guid?>()))
+                                .ThrowsAsync(new Exception("User lookup error"));
+
+            // Setup sync job with single SqlMembership query
+            var managerId = "12345";
+            _newSyncJob.Query = $"[{{\"type\":\"SqlMembership\",\"source\":{{\"manager\":{{\"id\":{managerId}}}}}}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was created but NOT auto-approved due to the user lookup error
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular onboarding reason (not auto-approved)
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithAutoApprovalSettingNullValue_EnqueuesForAutoApproverAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup settings repository to return null setting
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync((Setting)null);
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync((Setting)null);
+
+            // Setup sync job with GroupMembership query
+            var groupId = Guid.NewGuid();
+            _newSyncJob.Query = $"[{{\"type\":\"GroupMembership\",\"source\":\"{groupId}\"}}]";
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            
+            Assert.IsNotNull(result);
+            
+            // Verify that the job was NOT auto-approved due to null settings (status should be PendingAutoApproval)
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job => 
+                job.Status == SyncStatus.PendingAutoApproval.ToString())), Times.Once);
+            
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change => 
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithPendingConfigurationEnabledTestAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup pending configuration to enabled
+            _pendingConfigurationConfig.Setup(x => x.PendingConfigurationIsEnabled).Returns(true);
+
+            // Setup auto-approval settings to disabled (ensure they don't interfere)
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+
+            Assert.IsNotNull(result);
+
+            // Verify that the job was set to PendingConfiguration status
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job =>
+                job.Status == SyncStatus.PendingConfiguration.ToString())), Times.Once);
+
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change =>
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+
+            // Verify that a message was sent to the service bus queue for configuration
+            _serviceBusQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task PostJobWithPendingConfigurationEnabledServiceBusExceptionTestAsync()
+        {
+            // Setup context
+            _context = CreateHttpContext(new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "user@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            });
+
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            // Setup pending configuration to enabled
+            _pendingConfigurationConfig.Setup(x => x.PendingConfigurationIsEnabled).Returns(true);
+
+            // Setup auto-approval settings to disabled (ensure they don't interfere)
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForGroupBasedSyncsEnabled, SettingValue = "false" });
+
+            _databaseSettingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled))
+                                      .ReturnsAsync(new Setting { SettingKey = SettingKey.IsAutoApprovalForRequestorIsOrgLeaderSyncsEnabled, SettingValue = "false" });
+
+            _serviceBusQueueRepository.Setup(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()))
+                                      .ThrowsAsync(new Exception("Service Bus error"));
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+
+            Assert.IsInstanceOfType(response, typeof(ObjectResult));
+            var result = response as ObjectResult;
+            Assert.IsNotNull(result);
+            Assert.AreEqual(StatusCodes.Status500InternalServerError, result.StatusCode);
+
+            // Verify that the job was set to PendingConfiguration status
+            _databaseSyncJobsRepository.Verify(x => x.CreateSyncJobAsync(It.Is<SyncJob>(job =>
+                job.Status == SyncStatus.PendingConfiguration.ToString())), Times.Once);
+
+            // Verify that the sync job change was saved with regular Onboarding reason
+            _syncJobChangeRepository.Verify(x => x.Save(It.Is<SyncJobChange>(change =>
+                change.ChangeReason == SyncJobChangeReason.Onboarding.ToString())), Times.Once);
+
+            // Verify that an attempt to send a message to the service bus queue for configuration was made
+            _serviceBusQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<ServiceBusMessage>()), Times.Once);
+        }
+
+        [TestMethod]
+        [DataRow(true)]
+        [DataRow(false)]
+        public async Task PostJobEmitsJobOnboardedEventOnSuccessAsync(bool onboardedUsingAIQB)
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _newSyncJob.OnboardedUsingAIQB = onboardedUsingAIQB;
+
+            var createdJobId = Guid.NewGuid();
+            _databaseSyncJobsRepository.Setup(repo => repo.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ReturnsAsync(createdJobId);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            var response = await _jobsController.PostJobAsync(_newSyncJob);
+            var result = response as CreatedResult;
+            Assert.IsNotNull(result);
+
+            var onboardedEvents = _capturingTelemetryChannel.GetEvents("JobOnboarded");
+            Assert.AreEqual(1, onboardedEvents.Count, "Expected exactly one JobOnboarded event to be emitted.");
+
+            var evt = onboardedEvents[0];
+            Assert.AreEqual(createdJobId.ToString(), evt.Properties["SyncJobId"]);
+            Assert.AreEqual(MembershipTypes.GroupMembership.ToString(), evt.Properties["MembershipType"]);
+            Assert.AreEqual(onboardedUsingAIQB.ToString(), evt.Properties["OnboardedUsingAIQB"]);
+            Assert.IsTrue(evt.Properties.ContainsKey("TargetOfficeGroupId"));
+            Assert.IsFalse(string.IsNullOrEmpty(evt.Properties["TargetOfficeGroupId"]));
+        }
+
+        [TestMethod]
+        public async Task PostJobDoesNotEmitJobOnboardedEventWhenCreateReturnsEmptyGuidAsync()
+        {
+            var claims = new List<Claim>
+            {
+                new Claim(ClaimTypes.Name, "testuser@domain.com"),
+                new Claim(ClaimTypes.Upn, "testuser@domain.com"),
+                new Claim(ClaimTypes.Role, Roles.JOB_TENANT_WRITER),
+                new Claim("http://schemas.microsoft.com/identity/claims/objectidentifier", Guid.NewGuid().ToString())
+            };
+
+            _context = CreateHttpContext(claims);
+            _httpContextAccessor.Setup(x => x.HttpContext).Returns(_context);
+
+            _newSyncJob.OnboardedUsingAIQB = true;
+
+            _databaseSyncJobsRepository.Setup(repo => repo.CreateSyncJobAsync(It.IsAny<SyncJob>()))
+                                       .ReturnsAsync(Guid.Empty);
+
+            _postJobHandler = new PostJobHandler(NullLogger<PostJobHandler>.Instance, _databaseSyncJobsRepository.Object,
+                                                 _destinationAttributesRepository.Object,
+                                                 _titlesRepository.Object,
+                                                 _graphGroupRepository.Object,
+                                                 _syncJobChangeRepository.Object,
+                                                 _databaseSettingsRepository.Object,
+                                                 _pendingConfigurationConfig.Object,
+                                                 _serviceBusQueueRepository.Object,
+                                                 _telemetryClient,
+                                                 _autoApproverQueueRepository.Object);
+
+            _jobsController = new JobsController(_getJobsHandler, _patchJobsHandler, _postJobHandler, _getJobDetailsHandler, _postResetRequestHandler, NullLogger<JobsController>.Instance);
+            _jobsController.ControllerContext = new ControllerContext
+            {
+                HttpContext = _context
+            };
+
+            await _jobsController.PostJobAsync(_newSyncJob);
+
+            var onboardedEvents = _capturingTelemetryChannel.GetEvents("JobOnboarded");
+            Assert.AreEqual(0, onboardedEvents.Count, "JobOnboarded event should not be emitted when job creation returns Guid.Empty.");
+        }
+
+        /// <summary>
+        /// Minimal ITelemetryChannel that captures EventTelemetry items in memory so tests
+        /// can assert which Track* events were emitted.
+        /// </summary>
+        private sealed class CapturingTelemetryChannel : ITelemetryChannel
+        {
+            private readonly List<EventTelemetry> _events = new();
+
+            public bool? DeveloperMode { get; set; }
+            public string EndpointAddress { get; set; } = string.Empty;
+
+            public void Send(ITelemetry item)
+            {
+                if (item is EventTelemetry eventTelemetry)
+                {
+                    _events.Add(eventTelemetry);
+                }
+            }
+
+            public IReadOnlyList<EventTelemetry> GetEvents(string name) =>
+                _events.Where(e => e.Name == name).ToList();
+
+            public void Flush() { }
+            public void Dispose() { }
+        }
+    }
+}

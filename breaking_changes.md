@@ -1,7 +1,295 @@
 # Breaking Changes
 
-10/27/2021
-## GMM now uses an application secret instead of a certificate 
+## Release 4/1/2025
+Disabled storage account access keys for all storage accounts.
+- Run PostDeployment.ps1 script to grant proper RBAC roles.
+
+## Release 3/1/2024
+
+Add the following secrets to prereqs keyvault if using TeamsChannel functionality:
+- teamsChannelAppCertificateName
+- teamsChannelAppClientId
+- teamsChannelAppClientSecret
+- teamsChannelAppTenantId
+
+## Release 9/10/2024
+
+New after  deployment step for new SignalR resource.
+ ```
+Go to the SignalR resource <solutionAbbreviation>-compute-<environmentAbbreviation>-signalr, it is located in your compute resource group, under the Settings -> CORS -> Add that URL as Allowed Origins -> Click Save.
+```
+Reference:
+https://github.com/microsoftgraph/group-membership-management/blob/main/UI/Documentation/UISetup.md
+
+## Release 7/25/2024
+
+### 1. Update your ADF pipeline to produce the destination table under the `users` schema and remove the `tbl` prefix from the table name.
+
+#### Setting the `users` schema: 
+- Find and open the dataset representing the destination table
+- Under Connection Settings, right before `Table Name`, set the schema to be `users`. 
+
+#### Removing the `tbl` prefix from the destnation table name. 
+- Anywhere in your ADF pipeline where the destination table is being referenced as `tbl<ADF_PIPELINE_RUN_ID>` needs to be updated to `<ADF_PIPELINE_RUN_ID>`.
+- The number of references will vary depending on the implementation, but there will most likely be a reference in the dataset of the destination table. 
+- GMM expects the destination table name to follow the format: `users.<ADF_PIPELINE_RUN_ID>`.
+
+#### Note: 
+- When deploying this release, stop JobTrigger and make these manual changes on your ADF resource. Turn JobTrigger on after the deployment is complete. 
+
+### 2. Follow the updated WebAPI setup documentation to set up the user roles for the WebAPI application. 
+- See the WebAPI setup documentation [here](https://github.com/microsoftgraph/group-membership-management/blob/main/Service/GroupMembershipManagement/Hosts/WebApi/Documentation/WebApiSetup.md).
+
+### 3. The storage of threshold notifications will be migrated from the current storage table to a SQL table. To accommodate this update, users will need to run the following script to migrate existing records.
+
+1. Export the existing storage table to a CSV file. This can be done using Azure Storage Explorer or any preferred tool for accessing Azure Storage.
+2. Run the Set-MigrateStorageTable.ps1 script to migrate existing records from the storage table to the SQL table.
+
+```
+. .\Set-MigrateStorageTable.ps1
+Set-MigrateStorageTable	-connectionString "<connectionString>"  `
+                        -notificationsCsvPath "<notificationsCsvPath>" `
+```
+
+## Release 5/1/2024
+
+Local auth has been disabled for App Configuration resource.
+Going forward, the service connection used to deploy GMM resources must have "Azure App Configuration Data Owner" RBAC permission, before deploying this version.
+
+To grant the permission run Set-ServicePrincipalManagedIdentityRoles script.
+```
+1. . .\Set-ServicePrincipalManagedIdentityRoles.ps1
+2. Set-ServicePrincipalManagedIdentityRoles -solutionAbbreviation <solution> -environmentAbbreviation <env>
+```
+Reference:
+https://github.com/Azure/AppConfiguration/issues/692#issuecomment-1991914653
+
+## Release 2/26/2024
+SyncJobs with SqlMembership source part need to be updated with a new JSON schema:
+
+Old format
+```
+[
+  {
+    "type": "SqlMembership",
+    "sources":
+     [
+       {
+         "ids": [1,2,3],
+         "depth": 2,
+         "filter": "filter statement"
+       }
+     ]
+  }
+]
+```
+
+New format
+```
+[
+  {
+    "type": "SqlMembership",
+    "source": {
+      "manager": {
+        "id": 1,
+        "depth": 2
+      },
+      "filter": "filter statement"
+    }
+  },
+  {
+    "type": "SqlMembership",
+    "source": {
+      "manager": {
+        "id": 2,
+        "depth": 2
+      },
+      "filter": "filter statement"
+    }
+  },
+  {
+    "type": "SqlMembership",
+    "source": {
+      "manager": {
+        "id": 3,
+        "depth": 2
+      },
+      "filter": "filter statement"
+    }
+  }
+]
+```
+
+With this new schema, only one manager id is supported per source part.
+
+A powershell script has been added to help convert all existing SqlMembership jobs to the new format.
+Script can be found here [Set-UpdateSqlMembershipQuery.ps1](
+https://github.com/microsoftgraph/group-membership-management/tree/main/Service/GroupMembershipManagement/Hosts/SqlMembershipObtainer/Scripts/Set-UpdateSqlMembershipQuery.ps1).
+
+    1. . ./Set-UpdateSqlMembershipQuery.ps1
+    2. Set-UpdateSqlMembershipQuery -ConnectionString "<sqlDatabaseConnectionString>"
+
+## Release 8/1/2023
+SecurityGroup function has been renamed to GroupMembershipObtainer.
+SecurityGroup service bus topic has been renamed to GroupMembership.
+
+SyncJob must set the type to GroupMembership in their query.
+```
+[
+    {
+        "type": "GroupMembership",
+        "source": "<guid-group-objet-id-1>"
+    }
+]
+```
+
+Existing jobs will need to be updated to use the new type.
+To manually update the type, you can use the following T-SQL statement.
+```
+UPDATE SyncJobs SET Query = REPLACE(Query, 'SecurityGroup', 'GroupMembership') WHERE Query LIKE '%SecurityGroup%'
+```
+Once the renamed function is deployed, you can remove the old "SecurityGroup" function.
+
+## Release 7/26/2023
+### Create the jobs table in SQL database
+
+* Go to https://`<solutionAbbreviation>`-compute-`<environmentAbbreviation>`-webapi.azurewebsites.net/swagger/index.html
+* Hit the endpoint `admin/databaseMigration`. This will create the jobs table in `<solutionAbbreviation>`-data-`<environmentAbbreviation>`-jobs database
+* A successful deployment to your environment will copy the jobs from storage account to sql database
+
+## Release 11/23/2022
+
+### Updated keyVaultReaders_nonprod and keyVaultReaders_prod JSON schema
+
+See section [Create an Azure DevOps pipeline](README.md#create-an-azure-devops-pipeline) for more information.
+
+Previously only one set of permissions were supported, these were assigned to KeyVault 'secrets'.  
+With this change it now supports KeyVault 'secrets' and 'certificates' permissions.
+
+Old schema:
+```
+[
+    {
+        "objectId": "<user-object-id>",
+        "permissions": [ "get", "set", "list" ]
+    }
+]
+```
+New schema:
+```
+[
+    {
+        "objectId": "<user-object-id>",
+        "secrets": [ "get", "set", "list" ],
+        "certificates": [ "get", "set", "list" ]
+    }
+]
+```
+
+If no certificate permissions are needed, you can omit the 'certificates' property.
+```
+[
+    {
+        "objectId": "<user-object-id>",
+        "secrets": [ "get", "set", "list" ]
+    }
+]
+```
+
+Existing GMM pipelines will need to update these variables:
+- keyVaultReaders_nonprod
+- keyVaultReaders_prod
+
+## Release 09/22/2022
+
+### - SecurityGroup query format has changed to JSON
+SecurityGroup query format has been updated to provide a single way to specify hybrid sync jobs.
+
+Previous query format sample.
+```
+[
+    {
+        "type": "SecurityGroup",
+        "sources":
+        [
+            "a167b6c1-a2b3-4e16-aa8b-0ad0de5f44d9",
+            "04a8c19e-96a4-4570-b946-befd5bedca0e"
+        ]
+    }
+]
+```
+New query format sample:
+```
+[
+    {
+        "type": "SecurityGroup",
+        "source": "a167b6c1-a2b3-4e16-aa8b-0ad0de5f44d9"
+    },
+    {
+        "type": "SecurityGroup",
+        "source": "04a8c19e-96a4-4570-b946-befd5bedca0e"
+    }
+]
+```
+
+A powershell script has been added to help convert all existing SecurityGroup jobs to the new format.
+Script can be found here [Set-UpdateSecurityGroupQuery.ps1](
+Service\GroupMembershipManagement\Hosts\SecurityGroup\Scripts\Set-UpdateSecurityGroupQuery.ps1).
+
+    1. . ./Set-UpdateSecurityGroupQuery.ps1
+    2. Set-UpdateSecurityGroupQuery	-SubscriptionName "<SubscriptionName>" `
+                                    -SolutionAbbreviation "<SolutionAbbreviation>" `
+							        -EnvironmentAbbreviation "<EnvironmentAbbreviation>" `
+							        -Verbose
+
+
+## Release 05/02/2022
+
+### - SecurityGroup query format has changed to JSON
+SecurityGroup query format has been updated in order to support hybrid sync jobs. List of semicolon separated group ids list has been replaced by a JSON query.
+
+Previous query format sample, list of group ids separated by semicolon.  
+```
+a167b6c1-a2b3-4e16-aa8b-0ad0de5f44d9;04a8c19e-96a4-4570-b946-befd5bedca0e
+```
+
+New query format sample:
+```
+[
+    {
+        "type": "SecurityGroup",
+        "sources":
+        [
+            "a167b6c1-a2b3-4e16-aa8b-0ad0de5f44d9",
+            "04a8c19e-96a4-4570-b946-befd5bedca0e"
+        ]
+    }
+]
+```
+
+A powershell script has been added to help convert all existing SecurityGroup jobs to the new format.
+Script can be found here [Set-UpdateSecurityGroupQuery.ps1](
+Service\GroupMembershipManagement\Hosts\SecurityGroup\Scripts\Set-UpdateSecurityGroupQuery.ps1).
+
+    1. . ./Set-UpdateSecurityGroupQuery.ps1
+    2. Set-UpdateSecurityGroupQuery	-SubscriptionName "<SubscriptionName>" `
+                                    -SolutionAbbreviation "<SolutionAbbreviation>" `
+							        -EnvironmentAbbreviation "<EnvironmentAbbreviation>" `
+							        -Verbose
+
+### - Type field has been removed.
+
+## Release 3/28/2022
+### Send group membership via blobs instead of queue
+
+GMM has been updated to send group membership through blobs instead of queues. So the 'membership' queue has been removed from the ARM templates and is not longer used by the code.
+
+See section [Grant SecurityGroup, GraphUpdater function access to storage account](README.md#grant-securitygroup-graphupdater-function-access-to-storage-account) for more information.
+
+Once these changes are deployed successfully to your enviroment it will be safe to delete the 'membership' queue from your Azure Resources.
+
+## Release 10/27/2021
+### GMM now uses an application secret instead of a certificate 
 
 We have updated `Set-GraphCredentialsAzureADApplication.ps1` script to generate and store a client secret when creating `<solutionAbbreviation>`-Graph-`<environmentAbbreviation>` application.
 

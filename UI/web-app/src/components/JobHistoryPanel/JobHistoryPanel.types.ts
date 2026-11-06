@@ -1,0 +1,92 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+import {
+    type IStyle,
+    type IStyleFunctionOrObject,
+    type ITheme,
+} from '@fluentui/react';
+import type React from 'react';
+
+export interface IJobHistoryPanelStyles {
+    root: IStyle;
+    headerDivider: IStyle;
+    container: IStyle;
+    header: IStyle;
+    dateTimeContainer: IStyle;
+    dateText: IStyle;
+    timeText: IStyle;
+    changeReasonContainer: IStyle;
+    changeTypeIndicator: IStyle;
+    changeTypeRejected: IStyle;
+    changeTypeApproved: IStyle;
+    changeTypeUpdate: IStyle;
+    changeTypeGroupSettings: IStyle;
+    changeTypeDefault: IStyle;
+    syncFiltersContainer: IStyle;
+    statusFilter: IStyle;
+    statusCellThresholdExceeded: IStyle;
+    statusCellThresholdApproved: IStyle;
+    statusCellContainer: IStyle;
+    userSearchField: IStyle;
+    userSearchLabel: IStyle;
+    userSearchInputWrapper: IStyle;
+    userSearchInputShell: IStyle;
+    userSearchPicker: IStyle;
+    userSearchPickerText: IStyle;
+    userSearchPickerItemsWrapper: IStyle;
+    userSearchIcon: IStyle;
+    userSearchTrailingIcon: IStyle;
+    userSuggestionList: IStyle;
+    userSuggestionItem: IStyle;
+    userSuggestionRow: IStyle;
+    userSuggestionPrimaryText: IStyle;
+    userSuggestionSecondaryText: IStyle;
+    highlightedAddedCell: IStyle;
+    highlightedRemovedCell: IStyle;
+    pendingMarker: IStyle;
+    pendingCell: IStyle;
+    matchingRow?: IStyle;
+    userSearchBanner: IStyle;
+    userSearchBannerWarning: IStyle;
+    userSearchBannerIcon: IStyle;
+    userSearchBannerIconSuccess: IStyle;
+    userSearchBannerIconWarning: IStyle;
+    userSearchBannerText: IStyle;
+    userSearchBannerNote: IStyle;
+    eventTypeFilterField: IStyle;
+    filterActionsBar: IStyle;
+    clearFiltersLink: IStyle;
+    clearFiltersLinkDisabled: IStyle;
+    clearFiltersIconWrapper: IStyle;
+    clearFiltersBaseIcon: IStyle;
+    clearFiltersBadgeIcon: IStyle;
+    configurationActionsRow: IStyle;
+    configurationQueryAction: IStyle;
+    reviewThresholdCallout: IStyle;
+    reviewThresholdCalloutText: IStyle;
+    inlineErrorText: IStyle;
+}
+
+export interface IJobHistoryPanelStyleProps {
+    className?: string;
+    theme: ITheme;
+}
+
+export interface IJobHistoryPanelProps extends React.AllHTMLAttributes<HTMLElement> {
+    /**
+     * Optional className to apply to the root of the component.
+     */
+    className?: string;
+    /**
+     * Call to provide customized styling that will layer on top of the variant rules.
+     */
+    styles?: IStyleFunctionOrObject<IJobHistoryPanelStyleProps, IJobHistoryPanelStyles>;
+    isOpen: boolean;
+    dismissPanel: () => void;
+    jobId: string;
+    onEditThreshold?: (thresholdData: { additionsExceeded: boolean; removalsExceeded: boolean }) => void;
+    onEditRules?: () => void;
+    /** Auto-open the latest threshold-exceeded run's take-action panel (email deep link). */
+    autoOpenThresholdAction?: boolean;
+};

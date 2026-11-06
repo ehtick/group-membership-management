@@ -1,0 +1,341 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+using Azure;
+using Microsoft.Extensions.Logging;
+using Microsoft.Graph;
+using Microsoft.Graph.Models;
+using Microsoft.Graph.Models.ODataErrors;
+using Microsoft.Kiota.Abstractions;
+using Models;
+using Models.Entities;
+using Repositories.Contracts;
+using Repositories.Contracts.Helpers;
+using System;
+using System.Collections;
+using System.Collections.Generic;
+using System.Collections.Immutable;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Threading.Tasks;
+using static Microsoft.Graph.CoreConstants;
+
+namespace Repositories.GraphGroups
+{
+    internal class GraphGroupOwnerReader : GraphGroupRepositoryBase
+    {
+        private readonly ILogger<GraphGroupOwnerReader> _graphGroupOwnerReaderLogger;
+
+        public GraphGroupOwnerReader(GraphServiceClient graphServiceClient,
+                                     GraphGroupMetricTracker graphGroupMetricTracker,
+                                     ILogger<GraphGroupOwnerReader> graphGroupOwnerReaderLogger)
+                                     : base(graphServiceClient, graphGroupOwnerReaderLogger, graphGroupMetricTracker)
+        {
+            _graphGroupOwnerReaderLogger = graphGroupOwnerReaderLogger ?? throw new ArgumentNullException(nameof(graphGroupOwnerReaderLogger));
+        }
+
+        public async Task<bool> IsAppIDOwnerOfGroupAsync(string appId, Guid groupObjectId, Guid? runId)
+        {
+            // get the service principal ID by its app ID
+            var nativeResponseHandler = new NativeResponseHandler();
+            var response = new DirectoryObjectCollectionResponse();
+
+            IDictionary<string, IEnumerable<string>> headers = null;
+
+            await _graphServiceClient.ServicePrincipals
+                                        .GetAsync(requestConfiguration =>
+                                        {
+                                            requestConfiguration
+                                                .QueryParameters
+                                                .Filter = $"appId eq '{appId}'";
+
+                                            requestConfiguration
+                                                .Options
+                                                .Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                                        });
+
+            var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+            if (nativeResponse.IsSuccessStatusCode)
+            {
+                response = await DeserializeResponseAsync(nativeResponse,
+                                                          DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+
+                headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+
+                if (!response.Value.Any())
+                    return false;
+
+                var servicePrincipal = response.Value.First();
+
+                await _graphGroupMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, $"Checking if app ID {appId} (service principal with object ID {servicePrincipal.Id}) owns the group {groupObjectId}.");
+
+                return await IsGroupOwnerAsync($"id eq '{servicePrincipal.Id}'", groupObjectId, runId);
+            }
+
+            return false;
+        }
+
+        public async Task<bool> IsServiceAccountOwnerOfGroupAsync(Guid serviceAccountObjectId, Guid groupObjectId, Guid? runId)
+        {
+            return await IsGroupOwnerAsync($"id eq '{serviceAccountObjectId}'", groupObjectId, runId);
+        }
+
+        public async Task<List<AzureADUser>> GetGroupOwnersAsync(Guid groupObjectId, Guid? runId, int top = 0)
+        {
+            _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, $"Getting owners of group {groupObjectId}.");
+
+            var owners = new List<User>();
+
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var groupOwnersResponse = new DirectoryObjectCollectionResponse();
+
+                await _graphServiceClient.Groups[groupObjectId.ToString()].Owners.GetAsync(requestConfiguration =>
+                {
+                    requestConfiguration.QueryParameters.Top = top > 0 ? top : null;
+                    requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse.IsSuccessStatusCode)
+                {
+                    groupOwnersResponse = await DeserializeResponseAsync(nativeResponse,
+                                                                         DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+
+                    var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+
+                    owners.AddRange(groupOwnersResponse.Value.OfType<User>());
+                    await _graphGroupMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                    _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, $"Retrieved{(top > 0 ? " top " : " ")}{owners.Count} owners of group {groupObjectId}.");
+
+                    return owners.Select(x => new AzureADUser
+                    {
+                        ObjectId = Guid.Parse(x.Id),
+                        DisplayName = x.DisplayName,
+                        Mail = x.Mail
+                    })
+                    .ToList();
+                }
+
+                _graphGroupOwnerReaderLogger.LogWarningWithRunId(runId, $"Failed to retrieve owners of group {groupObjectId}. StatusCode {nativeResponse.StatusCode}");
+
+                return new List<AzureADUser>();
+
+            }
+            catch (ODataError ex)
+            {
+                _graphGroupOwnerReaderLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+        }
+
+        public async Task<bool> IsEmailRecipientOwnerOfGroupAsync(string userIdentifier, Guid groupObjectId, Guid? runId)
+        {
+            _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, $"Checking on user existence for user identifier to determine if it is an owner of group {groupObjectId}.");
+
+            Guid userId;
+
+            var identifierIsObjectId = Guid.TryParse(userIdentifier, out userId);
+
+            if (!identifierIsObjectId)
+            {
+                _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, "Getting user information for email.");
+
+                User user = null;
+                var nativeResponseHandler = new NativeResponseHandler();
+                var userByMailResponse = new UserCollectionResponse();
+
+                try
+                {
+
+                    await _graphServiceClient.Users.GetAsync(requestConfiguration =>
+                    {
+                        requestConfiguration.QueryParameters.Filter = $"Mail eq '{userIdentifier}' or UserPrincipalName eq '{userIdentifier}'";
+                        requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                    });
+
+                    var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                    if (nativeResponse.IsSuccessStatusCode)
+                    {
+                        userByMailResponse = await DeserializeResponseAsync(nativeResponse, UserCollectionResponse.CreateFromDiscriminatorValue);
+
+                        if (userByMailResponse.Value.Count == 0)
+                        {
+                            _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, "No user was found when checking for user with email.");
+
+                            return false;
+                        }
+
+                        user = userByMailResponse.Value[0];
+                        Guid.TryParse(user.Id, out userId);
+                    }
+                    else
+                    {
+                        throw new Exception($"Unable to verify group ownership at this time.");
+                    }
+
+                }
+                catch (Exception ex)
+                {
+                    _graphGroupOwnerReaderLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                    throw;
+                }
+            }
+            else
+            {
+                _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, "User identifier is already an object id.");
+            }
+
+            _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId, $"Checking if email recipient owns the group {groupObjectId}.");
+
+            return await IsGroupOwnerAsync($"id eq '{userId}'", groupObjectId, runId);
+
+        }
+
+        private async Task<bool> IsGroupOwnerAsync(string query, Guid groupObjectId, Guid? runId)
+        {
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var groupOwnersResponse = new DirectoryObjectCollectionResponse();
+
+                await _graphServiceClient.Groups[groupObjectId.ToString()]
+                                            .Owners.GetAsync(requestConfiguration =>
+                                            {
+                                                requestConfiguration.QueryParameters.Filter = query;
+                                                requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                                            });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse.IsSuccessStatusCode)
+                {
+                    groupOwnersResponse = await DeserializeResponseAsync(nativeResponse, DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+                }
+
+                var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+                await _graphGroupMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                return groupOwnersResponse.Value?.Any() ?? false;
+            }
+            catch (ODataError ex)
+            {
+                if (ex.ResponseStatusCode == (int)HttpStatusCode.NotFound)
+                    return false;
+
+                _graphGroupOwnerReaderLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+
+                throw;
+            }
+        }
+
+        public async Task<List<Guid>> GetGroupIdsOwnedByServicePrincipalAsync(Guid servicePrincipalObjectId, Guid? runId)
+        {
+            var groupIds = new List<Guid>();
+
+            try
+            {
+                var nativeResponseHandler = new NativeResponseHandler();
+                var ownedObjectsResponse = new DirectoryObjectCollectionResponse();
+
+                await _graphServiceClient.ServicePrincipals[servicePrincipalObjectId.ToString()]
+                    .OwnedObjects.GetAsync(requestConfiguration =>
+                    {
+                        requestConfiguration.QueryParameters.Select = new[] { "id" };
+                        requestConfiguration.QueryParameters.Top = 999;
+                        requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nativeResponseHandler });
+                    });
+
+                var nativeResponse = nativeResponseHandler.Value as HttpResponseMessage;
+
+                if (nativeResponse.IsSuccessStatusCode)
+                {
+                    ownedObjectsResponse = await DeserializeResponseAsync(nativeResponse,
+                                                                          DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+
+                    var headers = nativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+                    await _graphGroupMetricTracker.TrackMetricsAsync(headers, QueryType.Other, runId);
+
+                    foreach (var obj in ownedObjectsResponse.Value)
+                    {
+                        if (obj.OdataType != null && obj.OdataType.Contains("#microsoft.graph.group", StringComparison.OrdinalIgnoreCase))
+                        {
+                            if (Guid.TryParse(obj.Id, out var groupId))
+                            {
+                                groupIds.Add(groupId);
+                            }
+                        }
+                    }
+
+                    // Handle pagination
+                    var nextLink = ownedObjectsResponse.OdataNextLink;
+                    while (!string.IsNullOrEmpty(nextLink))
+                    {
+                        var nextNativeResponseHandler = new NativeResponseHandler();
+
+                        await _graphServiceClient.ServicePrincipals[servicePrincipalObjectId.ToString()]
+                            .OwnedObjects.WithUrl(nextLink).GetAsync(requestConfiguration =>
+                            {
+                                requestConfiguration.Options.Add(new ResponseHandlerOption { ResponseHandler = nextNativeResponseHandler });
+                            });
+
+                        var nextNativeResponse = nextNativeResponseHandler.Value as HttpResponseMessage;
+
+                        if (nextNativeResponse.IsSuccessStatusCode)
+                        {
+                            var nextPage = await DeserializeResponseAsync(nextNativeResponse,
+                                                                          DirectoryObjectCollectionResponse.CreateFromDiscriminatorValue);
+
+                            var nextHeaders = nextNativeResponse.Headers.ToImmutableDictionary(x => x.Key, x => x.Value);
+                            await _graphGroupMetricTracker.TrackMetricsAsync(nextHeaders, QueryType.Other, runId);
+
+                            foreach (var obj in nextPage.Value)
+                            {
+                                if (obj.OdataType != null && obj.OdataType.Contains("#microsoft.graph.group", StringComparison.OrdinalIgnoreCase))
+                                {
+                                    if (Guid.TryParse(obj.Id, out var groupId))
+                                    {
+                                        groupIds.Add(groupId);
+                                    }
+                                }
+                            }
+
+                            nextLink = nextPage.OdataNextLink;
+                        }
+                        else
+                        {
+                            _graphGroupOwnerReaderLogger.LogWarningWithRunId(runId,
+                                $"Failed to retrieve next page of owned objects for service principal {servicePrincipalObjectId}. StatusCode {nextNativeResponse.StatusCode}");
+                            break;
+                        }
+                    }
+                }
+                else
+                {
+                    _graphGroupOwnerReaderLogger.LogWarningWithRunId(runId,
+                        $"Failed to retrieve owned objects for service principal {servicePrincipalObjectId}. StatusCode {nativeResponse.StatusCode}");
+                }
+            }
+            catch (ODataError ex)
+            {
+                _graphGroupOwnerReaderLogger.LogErrorWithRunId(runId, ex.GetBaseException().ToString(), ex);
+                throw;
+            }
+
+            _graphGroupOwnerReaderLogger.LogInformationWithRunId(runId,
+                $"Service principal {servicePrincipalObjectId} owns {groupIds.Count} group(s).");
+
+            return groupIds;
+        }
+
+    }
+}

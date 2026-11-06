@@ -6,6 +6,7 @@ name: $(major).$(minor).$(Date:yyMM).$(Rev:r)
 
 trigger:
 - develop
+- main
 - master
 - users/*
 
@@ -35,4 +36,4 @@ stages:
     functionApps:
     - name: 'JobTrigger'
     - name: 'GraphUpdater'
-    - name: 'SecurityGroup'
+    - name: 'GroupMembershipObtainer'

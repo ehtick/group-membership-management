@@ -1,0 +1,761 @@
+// Copyright (c) Microsoft Corporation.
+// Licensed under the MIT license.
+
+using DIConcreteTypes;
+using Hosts.Notifier;
+using Microsoft.ApplicationInsights;
+using Microsoft.ApplicationInsights.Channel;
+using Microsoft.ApplicationInsights.DataContracts;
+using Microsoft.ApplicationInsights.Extensibility;
+using Microsoft.Extensions.Localization;
+using Microsoft.Extensions.Logging.Abstractions;
+using Microsoft.Extensions.Options;
+using Microsoft.Graph;
+using Microsoft.Kiota.Abstractions;
+using Microsoft.VisualStudio.TestTools.UnitTesting;
+using Models;
+using Models.Notifications;
+using Models.ThresholdNotifications;
+using Moq;
+using Repositories.Contracts;
+using Repositories.Contracts.InjectConfig;
+using Repositories.Localization;
+using Repositories.Mail;
+using Repositories.Mocks;
+using Repositories.RetryPolicyProvider;
+using Services.Tests;
+using System;
+using System.Collections.Generic;
+using System.Linq;
+using System.Net;
+using System.Net.Http;
+using System.Net.Http.Headers;
+using System.Text.Json;
+using System.Threading;
+using System.Threading.Tasks;
+
+namespace Services.Notifier.Tests
+{
+    [TestClass]
+    public class NotifierServiceTests
+    {
+        private const string GRAPH_API_V1_BASE_URL = "https://graph.microsoft.com/v1.0";
+        private const string GroupMembership = "GroupMembership";
+
+        private Group _group;
+        private Mock<IGMMResources> _gmmResources;
+        private Mock<IGraphGroupRepository> _graphGroupRepository;
+        private Mock<IJobNotificationsRepository> _jobNotificationRepository;
+        private ILocalizationRepository _localizationRepository;
+        private Mock<IEmailSenderRecipient> _mailAddresses;
+        private Mock<IMailRepository> _mailRepository;
+        private IMailConfig _mailConfig;
+        private ThresholdNotification _notification;
+        private Mock<INotificationRepository> _notificationRepository;
+        private Mock<INotificationTypesRepository> _notificationTypesRepository;
+        private NotifierService _notifierService;
+        private Mock<IRequestAdapter> _requestAdapter;
+        private Guid _targetOfficeGroupId;
+        private TelemetryClient _telemetryClient;
+        private CapturingTelemetryChannel _telemetryChannel;
+        private Mock<IThresholdConfig> _thresholdConfig;
+        private List<AzureADUser> _users;
+        private Mock<IServiceBusQueueRepository> _serviceBusQueueRepository;
+        private Mock<IDatabaseGroupsRepository> _groupsRepository = null;
+        private Mock<IDatabaseChannelsRepository> _channelsRepository = null;
+        private Mock<IDatabaseSettingsRepository> _settingsRepository = null;
+
+
+        [TestMethod]
+        public async Task CreateActionableNotificationFromContentAsync_ShouldCreateOrUpdateNotification()
+        {
+            SyncJob job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+
+            var thresholdResult = new ThresholdResult
+            {
+                IncreaseThresholdPercentage = 10.0,
+                DecreaseThresholdPercentage = 5.0,
+                DeltaToAddCount = 5,
+                DeltaToRemoveCount = 5,
+                IsAdditionsThresholdExceeded = true,
+                IsRemovalsThresholdExceeded = false
+            };
+
+            bool sendDisableJobNotification = true;
+
+            var messageContent = new
+            {
+                ThresholdResult = thresholdResult,
+                SyncJob = job,
+                SendDisableJobNotification = sendDisableJobNotification
+            };
+            string serializedMessageContent = JsonSerializer.Serialize(messageContent);
+
+            OrchestratorRequest request = new OrchestratorRequest
+            {
+                MessageType = nameof(NotificationMessageType.ThresholdNotification),
+                MessageBody = serializedMessageContent
+            };
+
+            _notificationRepository.Setup(x => x.GetThresholdNotificationBySyncJobIdAsync(It.IsAny<Guid>()))
+                .ReturnsAsync((ThresholdNotification)null);
+
+            ThresholdNotification savedNotification = null;
+            _notificationRepository.Setup(x => x.SaveNotificationAsync(It.IsAny<ThresholdNotification>()))
+                .Callback<ThresholdNotification>(n => savedNotification = n)
+                .Returns(Task.CompletedTask);
+
+            var result = await _notifierService.CreateActionableNotificationFromContentAsync(request.MessageBody);
+
+            Assert.IsNotNull(result);
+            _notificationRepository.Verify(x => x.SaveNotificationAsync(It.IsAny<ThresholdNotification>()), Times.Once);
+            // First violation persists the row directly in the DisabledCard state (immediate disable).
+            Assert.IsNotNull(savedNotification);
+            Assert.AreEqual(ThresholdNotificationCardState.DisabledCard, savedNotification.CardState);
+        }
+
+        [TestMethod]
+        public async Task CreateActionableNotificationFromContentAsync_InFlightFalseFlag_StillCreatesDisabledCard()
+        {
+            SyncJob job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+
+            var thresholdResult = new ThresholdResult
+            {
+                IncreaseThresholdPercentage = 10.0,
+                DecreaseThresholdPercentage = 5.0,
+                DeltaToAddCount = 5,
+                DeltaToRemoveCount = 5,
+                IsAdditionsThresholdExceeded = true,
+                IsRemovalsThresholdExceeded = false
+            };
+
+            // Simulates an in-flight message enqueued by an older MembershipAggregator during a rolling deploy.
+            bool sendDisableJobNotification = false;
+
+            var messageContent = new
+            {
+                ThresholdResult = thresholdResult,
+                SyncJob = job,
+                SendDisableJobNotification = sendDisableJobNotification
+            };
+            string serializedMessageContent = JsonSerializer.Serialize(messageContent);
+
+            _notificationRepository.Setup(x => x.GetThresholdNotificationBySyncJobIdAsync(It.IsAny<Guid>()))
+                .ReturnsAsync((ThresholdNotification)null);
+
+            ThresholdNotification savedNotification = null;
+            _notificationRepository.Setup(x => x.SaveNotificationAsync(It.IsAny<ThresholdNotification>()))
+                .Callback<ThresholdNotification>(n => savedNotification = n)
+                .Returns(Task.CompletedTask);
+
+            var result = await _notifierService.CreateActionableNotificationFromContentAsync(serializedMessageContent);
+
+            Assert.IsNotNull(result);
+            _notificationRepository.Verify(x => x.SaveNotificationAsync(It.IsAny<ThresholdNotification>()), Times.Once);
+            // Even a false (legacy) flag renders safely against the retained DisabledCard template.
+            Assert.IsNotNull(savedNotification);
+            Assert.AreEqual(ThresholdNotificationCardState.DisabledCard, savedNotification.CardState);
+        }
+
+        [TestMethod]
+        public async Task CreateActionableNotificationFromContentAsync_MissingSyncJob_ThrowsJsonException()
+        {
+            var messageContent = new
+            {
+                ThresholdResult = new ThresholdResult(),
+                SendDisableJobNotification = true
+            };
+
+            var serializedMessageContent = JsonSerializer.Serialize(messageContent);
+
+            var exception = await Assert.ThrowsExceptionAsync<JsonException>(() =>
+                _notifierService.CreateActionableNotificationFromContentAsync(serializedMessageContent));
+
+            StringAssert.Contains(exception.Message, "SyncJob");
+        }
+
+        [TestMethod]
+        public async Task SendNormalThresholdEmailAsync_SendsEmail_WithExpectedParameters()
+        {
+            var messageBody = "{\"SyncJob\": {\"Id\": \"12345678-1234-1234-1234-1234567890ab\", \"TargetOfficeGroupId\": \"12345678-1234-1234-1234-1234567890ab\"}, \"ThresholdResult\": {\"IncreaseThresholdPercentage\": 10.0}, \"SendDisableJobNotification\": false, \"GroupName\": \"Test Group\"}";
+            await _notifierService.SendNormalThresholdEmailAsync(messageBody);
+            _mailRepository.Verify(x => x.SendMailAsync(It.IsAny<EmailMessage>(), It.IsAny<Guid?>()), Times.Once());
+
+        }
+        private NotifierService CreateNotifierService(IMailConfig mailConfig)
+        {
+            return new NotifierService(NullLogger<NotifierService>.Instance,
+                _mailRepository.Object,
+                mailConfig,
+                _mailAddresses.Object,
+                _localizationRepository,
+                _notificationRepository.Object,
+                _graphGroupRepository.Object,
+                _notificationTypesRepository.Object,
+                _jobNotificationRepository.Object,
+                _thresholdConfig.Object,
+                _gmmResources.Object,
+                _serviceBusQueueRepository.Object,
+                new MockDestinationResolver(_groupsRepository.Object, _channelsRepository.Object),
+                _settingsRepository.Object,
+                _telemetryClient);
+        }
+
+        [TestInitialize]
+        public void SetupTest()
+        {
+            _graphGroupRepository = new Mock<IGraphGroupRepository>();
+            _mailRepository = new Mock<IMailRepository>();
+            _notificationRepository = new Mock<INotificationRepository>();
+            _mailAddresses = new Mock<IEmailSenderRecipient>();
+            _users = new List<AzureADUser>();
+            _notificationTypesRepository = new Mock<INotificationTypesRepository>();
+            _jobNotificationRepository = new Mock<IJobNotificationsRepository>();
+            _thresholdConfig = new Mock<IThresholdConfig>();
+            _serviceBusQueueRepository = new Mock<IServiceBusQueueRepository>();
+            _groupsRepository = new Mock<IDatabaseGroupsRepository>();
+            _channelsRepository = new Mock<IDatabaseChannelsRepository>();
+            _settingsRepository = new Mock<IDatabaseSettingsRepository>();
+            _settingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.UIUrl))
+                .ReturnsAsync(new Setting { SettingKey = SettingKey.UIUrl, SettingValue = "https://gmm.example.com" });
+            _gmmResources = new Mock<IGMMResources>();
+            _notification = new ThresholdNotification
+            {
+                Id = Guid.NewGuid(),
+                ChangePercentageForAdditions = 1,
+                ChangePercentageForRemovals = 1,
+                CreatedTime = DateTime.UtcNow,
+                Resolution = ThresholdNotificationResolution.Unresolved,
+                ResolvedBy = string.Empty,
+                ResolvedTime = DateTime.UtcNow,
+                Status = ThresholdNotificationStatus.Unknown,
+                CardState = ThresholdNotificationCardState.DisabledCard,
+                TargetOfficeGroupId = _targetOfficeGroupId,
+                ThresholdPercentageForAdditions = -1,
+                ThresholdPercentageForRemovals = -1,
+            };
+            _group = new Group
+            {
+                GroupId = Guid.NewGuid(),
+                SyncJobId = Guid.NewGuid()
+            };
+            _telemetryChannel = new CapturingTelemetryChannel();
+            _telemetryClient = new TelemetryClient(new TelemetryConfiguration
+            {
+                TelemetryChannel = _telemetryChannel,
+                ConnectionString = "InstrumentationKey=00000000-0000-0000-0000-000000000000"
+            });
+
+            for (int i = 0; i < 2; i++)
+            {
+                var user = new AzureADUser
+                {
+                    Mail = $"owner_{i}@email.com"
+                };
+                _users.Add(user);
+            }
+            _groupsRepository.Setup(x => x.GetGroupUsingSyncJobIdAsync(It.IsAny<Guid>())).ReturnsAsync(() => _group);
+            _graphGroupRepository.Setup(x => x.GetGroupOwnersAsync(_targetOfficeGroupId, 0)).Returns(() => Task.FromResult(_users));
+            _graphGroupRepository.Setup(x => x.GetGroupNameAsync(It.Is<Guid>(id => id == _targetOfficeGroupId))).ReturnsAsync($"Test Group with id {_targetOfficeGroupId}");
+
+            var options = Options.Create(new LocalizationOptions { ResourcesPath = "Resources" });
+            var factory = new ResourceManagerStringLocalizerFactory(options, NullLoggerFactory.Instance);
+            var localizer = new StringLocalizer<LocalizationRepository>(factory);
+            _localizationRepository = new LocalizationRepository(localizer);
+
+            _mailConfig = new MailConfig(false, "not-set", false);
+            _notifierService = CreateNotifierService(_mailConfig);
+            _requestAdapter = new Mock<IRequestAdapter>();
+            _requestAdapter.SetupProperty(x => x.BaseUrl).SetReturnsDefault(GRAPH_API_V1_BASE_URL);
+
+            string requestUrl = null;
+            HttpMethod requestMethod = null;
+            _requestAdapter.Setup(x => x.ConvertToNativeRequestAsync<HttpRequestMessage>(It.IsAny<RequestInformation>(), It.IsAny<CancellationToken>()))
+                .Callback<object, object>((r, t) =>
+                {
+                    var request = r as RequestInformation;
+                    requestUrl = request.URI.ToString();
+                    requestMethod = new HttpMethod(request.HttpMethod.ToString());
+                })
+               .ReturnsAsync(() => new HttpRequestMessage(HttpMethod.Get, requestUrl));
+        }
+
+        [TestMethod]
+        public async Task TestSendEmailAsync()
+        {
+            SyncJob job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+            var notificationTypeId = 1;
+
+            string[] additionalContentParameters = new string[] { "Param1", "Param2" };
+            var messageContent = new Dictionary<string, Object>
+            {
+                { "SyncJob", job },
+                { "AdditionalContentParameters", additionalContentParameters }
+            };
+            string subjectTemplate = "DisabledJobEmailSubject";
+            string contentTemplate = "SyncDisabledNoGroupEmailBody";
+            _notificationTypesRepository.Setup(repo => repo.GetNotificationTypeByNotificationTypeNameAsync(NotificationMessageType.SyncStartedNotification))
+                .ReturnsAsync(new NotificationType { Id = notificationTypeId, Name = NotificationMessageType.SyncStartedNotification, Disabled = false });
+
+            _jobNotificationRepository.Setup(repo => repo.IsNotificationDisabledForJobAsync(job.Id, notificationTypeId))
+                .ReturnsAsync(false);
+
+            string serializedMessageContent = JsonSerializer.Serialize(messageContent);
+            OrchestratorRequest request = new OrchestratorRequest
+            {
+                MessageType = nameof(NotificationMessageType.SyncStartedNotification),
+                MessageBody = serializedMessageContent,
+                SubjectTemplate = subjectTemplate,
+                ContentTemplate = contentTemplate
+            };
+
+            await _notifierService.SendEmailAsync(request.MessageType, request.MessageBody, request.MessageTitle, request.SubjectTemplate, request.ContentTemplate);
+            _mailRepository.Verify(x => x.SendMailAsync(It.IsAny<EmailMessage>(), It.IsAny<Guid?>()), Times.Once());
+        }
+        [TestMethod]
+        public async Task TestSendEmailServiceUnavailableAsync()
+
+        {
+            var retryRepo = new RetryPolicyProvider(NullLogger<RetryPolicyProvider>.Instance, new GraphServiceAttemptsValue { MaxExceptionHandlingAttempts = 2, MaxRetryAfterAttempts = 4 });
+            var runId = Guid.NewGuid();
+            var retryAfterPolicy = retryRepo.CreateRetryAfterPolicy(runId);
+            var exceptionHandlingPolicy = retryRepo.CreateExceptionHandlingPolicy(runId);
+            var policy = retryAfterPolicy.WrapAsync(exceptionHandlingPolicy);
+            var retryAttempt = 0;
+            var testLimit = 10;
+            var invalidCode = HttpStatusCode.ServiceUnavailable;
+            var validCode = HttpStatusCode.OK;
+
+            var response = await policy.ExecuteAsync(async () =>
+            {
+                return await SendMailRetryAsync(retryAttempt++, testLimit, invalidCode, validCode);
+            });
+            Assert.AreEqual(invalidCode, response.StatusCode);
+            Assert.AreEqual(3, retryAttempt);
+        }
+        [TestMethod]
+        public async Task TestSendEmailTooManyRequestsAsync()
+
+        {
+            var retryRepo = new RetryPolicyProvider(NullLogger<RetryPolicyProvider>.Instance, new GraphServiceAttemptsValue { MaxExceptionHandlingAttempts = 2, MaxRetryAfterAttempts = 4 });
+            var runId = Guid.NewGuid();
+            var retryAfterPolicy = retryRepo.CreateRetryAfterPolicy(runId);
+            var exceptionHandlingPolicy = retryRepo.CreateExceptionHandlingPolicy(runId);
+            var policy = retryAfterPolicy.WrapAsync(exceptionHandlingPolicy);
+            var retryAttempt = 0;
+            var testLimit = 10;
+            var invalidCode = HttpStatusCode.TooManyRequests;
+            var validCode = HttpStatusCode.OK;
+
+            var response = await policy.ExecuteAsync(async () =>
+            {
+                return await SendMailRetryAsync(retryAttempt++, testLimit, invalidCode, validCode);
+            });
+            Assert.AreEqual(invalidCode, response.StatusCode);
+            Assert.AreEqual(5, retryAttempt);
+        }
+        [TestMethod]
+        public async Task TestSendEmailRetryAsync()
+
+        {
+            var retryRepo = new RetryPolicyProvider(NullLogger<RetryPolicyProvider>.Instance, new GraphServiceAttemptsValue { MaxExceptionHandlingAttempts = 2, MaxRetryAfterAttempts = 4 });
+            var runId = Guid.NewGuid();
+            var retryAfterPolicy = retryRepo.CreateRetryAfterPolicy(runId);
+            var exceptionHandlingPolicy = retryRepo.CreateExceptionHandlingPolicy(runId);
+            var policy = retryAfterPolicy.WrapAsync(exceptionHandlingPolicy);
+            var retryAttempt = 0;
+            var testLimit = 2;
+            var invalidCode = HttpStatusCode.ServiceUnavailable;
+            var validCode = HttpStatusCode.OK;
+
+            var response = await policy.ExecuteAsync(async () =>
+            {
+                return await SendMailRetryAsync(retryAttempt++, testLimit, invalidCode, validCode);
+            });
+            Assert.AreEqual(validCode, response.StatusCode);
+            Assert.AreEqual(3, retryAttempt);
+        }
+        private async Task<HttpResponseMessage> SendMailRetryAsync(int retryAttempt, int testLimit, HttpStatusCode invalidCode, HttpStatusCode validCode)
+        {
+            var httpStatusCode = (retryAttempt < testLimit) ? invalidCode : validCode;
+            var response = new HttpResponseMessage(httpStatusCode);
+
+            if (httpStatusCode == HttpStatusCode.TooManyRequests)
+            {
+                response.Headers.RetryAfter = new RetryConditionHeaderValue(DateTime.UtcNow);
+            }
+            return await Task.FromResult(response);
+        }
+        [TestMethod]
+        public async Task TestSendThresholdEmail()
+        {
+            EmailMessage capturedMessage = null;
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .Callback<EmailMessage, Guid?>((m, _) => capturedMessage = m);
+
+            _notification.SyncJobId = Guid.NewGuid();
+
+            await _notifierService.SendThresholdEmailAsync(_notification);
+
+            _mailRepository.Verify(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null), Times.Once());
+            Assert.IsNotNull(capturedMessage);
+            StringAssert.Contains(capturedMessage.Content,
+                $"<a href=\"https://gmm.example.com/jobdetails/{_notification.SyncJobId}/history\">View in GMM UI</a>");
+        }
+
+        [TestMethod]
+        public async Task TestSendThresholdEmail_MissingUIUrl_DoesNotIncludeRelativeHistoryUrl()
+        {
+            EmailMessage capturedMessage = null;
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .Callback<EmailMessage, Guid?>((m, _) => capturedMessage = m);
+            _settingsRepository.Setup(x => x.GetSettingByKeyAsync(SettingKey.UIUrl))
+                .ReturnsAsync((Setting)null);
+            _notification.SyncJobId = Guid.NewGuid();
+
+            await _notifierService.SendThresholdEmailAsync(_notification);
+
+            Assert.IsNotNull(capturedMessage);
+            Assert.IsFalse(capturedMessage.Content.Contains(
+                $"/jobdetails/{_notification.SyncJobId}/history",
+                StringComparison.Ordinal));
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_DisabledCard_UsesStyledEmail()
+        {
+            EmailMessage capturedMessage = null;
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .Callback<EmailMessage, Guid?>((m, _) => capturedMessage = m);
+            _mailRepository.Setup(x => x.BuildStyledFallbackEmailHtmlAsync(It.IsAny<EmailMessage>()))
+                .ReturnsAsync("<p>STYLED THRESHOLD EMAIL</p>");
+
+            _notification.SyncJobId = Guid.NewGuid();
+            _notification.CardState = ThresholdNotificationCardState.DisabledCard;
+
+            var service = CreateNotifierService(new MailConfig(false, "not-set", false));
+            await service.SendThresholdEmailAsync(_notification);
+
+            _mailRepository.Verify(x => x.BuildStyledFallbackEmailHtmlAsync(It.IsAny<EmailMessage>()), Times.Once());
+            Assert.IsNotNull(capturedMessage);
+            StringAssert.Contains(capturedMessage.Content, "STYLED THRESHOLD EMAIL");
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_DisabledCard_UsesPlainFallback_WhenStyledBuilderReturnsNull()
+        {
+            EmailMessage capturedMessage = null;
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .Callback<EmailMessage, Guid?>((m, _) => capturedMessage = m);
+            _mailRepository.Setup(x => x.BuildStyledFallbackEmailHtmlAsync(It.IsAny<EmailMessage>()))
+                .ReturnsAsync((string)null);
+
+            _notification.SyncJobId = Guid.NewGuid();
+            _notification.CardState = ThresholdNotificationCardState.DisabledCard;
+
+            var service = CreateNotifierService(new MailConfig(false, "not-set", false));
+            await service.SendThresholdEmailAsync(_notification);
+
+            _mailRepository.Verify(x => x.BuildStyledFallbackEmailHtmlAsync(It.IsAny<EmailMessage>()), Times.Once());
+            Assert.IsNotNull(capturedMessage);
+            StringAssert.Contains(capturedMessage.Content, "View in GMM UI");
+            Assert.IsFalse(capturedMessage.Content.Contains("adaptivecard+json"), "Fallback must not embed an Outlook Actionable Message card.");
+            Assert.IsFalse(capturedMessage.Content.Contains("Outlook Actionable Messages"), "Fallback must not reference Outlook Actionable Messages.");
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_PlainFallback_EncodesGroupNameAndKeepsLink()
+        {
+            EmailMessage capturedMessage = null;
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .Callback<EmailMessage, Guid?>((m, _) => capturedMessage = m);
+            _graphGroupRepository.Setup(x => x.GetGroupNameAsync(It.IsAny<Guid>()))
+                .ReturnsAsync("<img src=x onerror=alert(1)>");
+
+            _notification.SyncJobId = Guid.NewGuid();
+            _notification.CardState = ThresholdNotificationCardState.DisabledCard;
+
+            var service = CreateNotifierService(new MailConfig(true, "not-set", false));
+            await service.SendThresholdEmailAsync(_notification);
+
+            Assert.IsNotNull(capturedMessage);
+            Assert.IsFalse(capturedMessage.Content.Contains("<img src=x", StringComparison.Ordinal), "Group name markup must be HTML-encoded.");
+            StringAssert.Contains(capturedMessage.Content, "&lt;img src=x");
+            StringAssert.Contains(capturedMessage.Content, "<a href=");
+            StringAssert.Contains(capturedMessage.Content, "View in GMM UI");
+        }
+
+        [TestMethod]
+        public async Task GetStyledMessageAsync_MissingUIUrl_PassesEmptyHistoryUrlToStyledFallback()
+        {
+            var requestAdapter = new Mock<IRequestAdapter>();
+            requestAdapter.SetupProperty(x => x.BaseUrl).SetReturnsDefault(GRAPH_API_V1_BASE_URL);
+            var graphServiceClient = new Mock<GraphServiceClient>(requestAdapter.Object, GRAPH_API_V1_BASE_URL);
+            var retryRepo = new RetryPolicyProvider(
+                NullLogger<RetryPolicyProvider>.Instance,
+                new GraphServiceAttemptsValue { MaxExceptionHandlingAttempts = 2, MaxRetryAfterAttempts = 4 });
+            var settingsRepository = new Mock<IDatabaseSettingsRepository>();
+            var mailFallbackBuilder = new Mock<IMailFallbackBuilder>();
+            string capturedHistoryUrl = null;
+            mailFallbackBuilder
+                .Setup(x => x.BuildSyncStartedFallbackAsync(
+                    It.IsAny<EmailMessage>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>(),
+                    It.IsAny<string>()))
+                .Callback<EmailMessage, string, string, string, string>((_, _, _, url, _) => capturedHistoryUrl = url)
+                .ReturnsAsync("<p>Fallback</p>");
+
+            var mailRepository = new MailRepository(
+                graphServiceClient.Object,
+                new MailConfig(false, "not-set", false),
+                _localizationRepository,
+                NullLogger<MailRepository>.Instance,
+                _graphGroupRepository.Object,
+                settingsRepository.Object,
+                retryRepo,
+                _telemetryClient,
+                mailFallbackBuilder.Object);
+            var emailMessage = new EmailMessage
+            {
+                Subject = "OnboardingCompleteEmailTitle",
+                Content = "SyncStartedEmailBody",
+                AdditionalContentParams = new[]
+                {
+                    Guid.NewGuid().ToString(),
+                    "Test Group",
+                    string.Empty,
+                    string.Empty,
+                    "requestor@example.com"
+                },
+                SyncJobId = Guid.NewGuid()
+            };
+
+            await mailRepository.GetStyledMessageAsync(emailMessage);
+
+            Assert.AreEqual(string.Empty, capturedHistoryUrl);
+        }
+
+        [TestMethod]
+        public async Task TestUpdateNotificationStatus()
+        {
+            await _notifierService.UpdateNotificationStatusAsync(_notification, ThresholdNotificationStatus.Queued);
+            _notificationRepository.Verify(x => x.UpdateNotificationStatusAsync(It.IsAny<ThresholdNotification>(), It.IsAny<ThresholdNotificationStatus>()), Times.Once());
+        }
+        [TestMethod]
+        public async Task VerifyEmailNotSentIfDisabled()
+        {
+            var job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+            var notificationTypeId = 1;
+            var notificationName = "SyncStartedEmailBody";
+
+            _notificationTypesRepository.Setup(repo => repo.GetNotificationTypeByNotificationTypeNameAsync(NotificationMessageType.SyncStartedNotification))
+                .ReturnsAsync(new NotificationType { Id = notificationTypeId, Name = NotificationMessageType.SyncStartedNotification, Disabled = false });
+
+            _jobNotificationRepository.Setup(repo => repo.IsNotificationDisabledForJobAsync(job.Id, notificationTypeId))
+                .ReturnsAsync(true);
+
+            bool result = await _notifierService.IsNotificationDisabledAsync(job.Id, NotificationMessageType.SyncStartedNotification);
+            Assert.IsTrue(result);
+
+        }
+
+        [TestMethod]
+        public async Task VerifyEmailNotSentIfGloballyDisabled()
+        {
+            var job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+            var notificationTypeId = 1;
+            var notificationName = "SyncStartedEmailBody";
+
+            _notificationTypesRepository.Setup(repo => repo.GetNotificationTypeByNotificationTypeNameAsync(NotificationMessageType.SyncStartedNotification))
+                .ReturnsAsync(new NotificationType { Id = notificationTypeId, Name = NotificationMessageType.SyncStartedNotification, Disabled = true });
+
+            _jobNotificationRepository.Setup(repo => repo.IsNotificationDisabledForJobAsync(job.Id, notificationTypeId))
+                .ReturnsAsync(false);
+
+            // Global suppression (Disabled=true) is now handled by StarterFunction via message deferral,
+            // not by IsNotificationDisabledAsync which only checks per-job suppression.
+            bool result = await _notifierService.IsNotificationDisabledAsync(job.Id, NotificationMessageType.SyncStartedNotification);
+            Assert.IsFalse(result);
+
+        }
+        [TestMethod]
+        public async Task SendEmailAsync_ShouldHandleNonOKResponse()
+        {
+            var job = new SyncJob { Id = Guid.NewGuid(), RunId = Guid.NewGuid(), Requestor = "requestor@example.com"};
+            job.Group = new Group
+            {
+                SyncJobId = job.Id,
+                GroupId = Guid.NewGuid()
+            };
+            var messageBody = JsonSerializer.Serialize(new { SyncJob = job });
+            var messageType = NotificationMessageType.SyncStartedNotification.ToString();
+            var messageTitle = "OnboardingStartedEmailTitle";
+            var subjectTemplate = "TestSubjectTemplate";
+            var contentTemplate = "SyncDisabledNoGroupEmailBody";
+
+            var responseMessage = new HttpResponseMessage(HttpStatusCode.TooManyRequests)
+            {
+                ReasonPhrase = "Too Many Requests"
+            };
+
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), It.IsAny<Guid?>()))
+                .ReturnsAsync(responseMessage);
+            await _notifierService.SendEmailAsync(messageType, messageBody, messageTitle, subjectTemplate, contentTemplate);
+
+            _mailRepository.Verify(x => x.SendMailAsync(It.IsAny<EmailMessage>(), It.IsAny<Guid?>()), Times.Once);
+
+            var messageContent = new Dictionary<string, Object>
+            {
+                { "MessageBody", messageBody },
+                { "MessageType", messageType },
+                { "HttpStatusCode", responseMessage.StatusCode.ToString() },
+                { "ReasonPhrase", responseMessage.ReasonPhrase.ToString() }
+            };
+            var body = System.Text.Encoding.UTF8.GetBytes(JsonSerializer.Serialize(messageContent));
+            var failedMessage = new Models.ServiceBus.ServiceBusMessage
+            {
+                MessageId = $"{job.Id}_{job.RunId}_{messageType}",
+                Body = body
+            };
+
+            _serviceBusQueueRepository.Verify(x => x.SendMessageAsync(It.Is<Models.ServiceBus.ServiceBusMessage>(m =>
+                m.MessageId == failedMessage.MessageId &&
+                m.Body.SequenceEqual(failedMessage.Body)
+            )), Times.Once);
+        }
+
+        [TestMethod]
+        public async Task SendEmailWhenEmailsHaveBeenDisabled()
+        {
+
+            var requestAdapter = new Mock<IRequestAdapter>();
+            requestAdapter.SetupProperty(x => x.BaseUrl).SetReturnsDefault("https://graph.microsoft.com/v1.0");
+            var graphServiceClient = new Mock<GraphServiceClient>(requestAdapter.Object, "https://graph.microsoft.com/v1.0");
+            var retryRepo = new RetryPolicyProvider(NullLogger<RetryPolicyProvider>.Instance, new GraphServiceAttemptsValue { MaxExceptionHandlingAttempts = 2, MaxRetryAfterAttempts = 4 });
+
+            var mailConfig = new MailConfig(false, "not-set", true);
+            var mailRepository = new MailRepository(graphServiceClient.Object,
+                                                    mailConfig,
+                                                    _localizationRepository,
+                                                    NullLogger<MailRepository>.Instance,
+                                                    _graphGroupRepository.Object,
+                                                    new Mock<IDatabaseSettingsRepository>().Object,
+                                                    retryRepo,
+                                                    _telemetryClient,
+                                                    new Mock<IMailFallbackBuilder>().Object);
+
+            _notifierService = new NotifierService(NullLogger<NotifierService>.Instance,
+                                    mailRepository,
+                                    mailConfig,
+                                    _mailAddresses.Object,
+                                    _localizationRepository,
+                                    _notificationRepository.Object,
+                                    _graphGroupRepository.Object,
+                                    _notificationTypesRepository.Object,
+                                    _jobNotificationRepository.Object,
+                                    _thresholdConfig.Object,
+                                    _gmmResources.Object,
+                                    _serviceBusQueueRepository.Object,
+                                    new MockDestinationResolver(_groupsRepository.Object, _channelsRepository.Object),
+                                    _settingsRepository.Object,
+                                    _telemetryClient
+                                    );
+
+            SyncJob job = SampleDataHelper.CreateSampleSyncJobs(1, GroupMembership).First();
+            var notificationTypeId = 1;
+
+            string[] additionalContentParameters = new string[] { "Param1", "Param2" };
+            var messageContent = new Dictionary<string, Object>
+            {
+                { "SyncJob", job },
+                { "AdditionalContentParameters", additionalContentParameters }
+            };
+            string subjectTemplate = "DisabledJobEmailSubject";
+            string contentTemplate = "SyncDisabledNoGroupEmailBody";
+            _notificationTypesRepository.Setup(repo => repo.GetNotificationTypeByNotificationTypeNameAsync(NotificationMessageType.SyncStartedNotification))
+                .ReturnsAsync(new NotificationType { Id = notificationTypeId, Name = NotificationMessageType.SyncStartedNotification, Disabled = false });
+
+            _jobNotificationRepository.Setup(repo => repo.IsNotificationDisabledForJobAsync(job.Id, notificationTypeId))
+                .ReturnsAsync(false);
+
+            string serializedMessageContent = JsonSerializer.Serialize(messageContent);
+            OrchestratorRequest request = new OrchestratorRequest
+            {
+                MessageType = nameof(NotificationMessageType.SyncStartedNotification),
+                MessageBody = serializedMessageContent,
+                SubjectTemplate = subjectTemplate,
+                ContentTemplate = contentTemplate
+            };
+
+            await _notifierService.SendEmailAsync(request.MessageType, request.MessageBody, request.MessageTitle, request.SubjectTemplate, request.ContentTemplate);
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_Accepted_TracksNotificationSentOnce()
+        {
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.Accepted));
+
+            await _notifierService.SendThresholdEmailAsync(_notification);
+
+            var events = _telemetryChannel.GetEvents("NotificationSent");
+            Assert.AreEqual(1, events.Count, "A single accepted send must emit exactly one NotificationSent event.");
+            Assert.AreEqual(_notification.TargetOfficeGroupId.ToString(), events[0].Properties["TargetGroupId"]);
+            _serviceBusQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<Models.ServiceBus.ServiceBusMessage>()), Times.Never());
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_NotAccepted_DoesNotTrackNotificationSent()
+        {
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.InternalServerError) { ReasonPhrase = "boom" });
+
+            await _notifierService.SendThresholdEmailAsync(_notification);
+
+            Assert.AreEqual(0, _telemetryChannel.GetEvents("NotificationSent").Count,
+                "A failed send must not be counted as a sent notification.");
+            _serviceBusQueueRepository.Verify(x => x.SendMessageAsync(It.IsAny<Models.ServiceBus.ServiceBusMessage>()), Times.Once());
+        }
+
+        [TestMethod]
+        public async Task SendThresholdEmail_SkipEmailNotifications_DoesNotTrackNotificationSent()
+        {
+            _mailRepository.Setup(x => x.SendMailAsync(It.IsAny<EmailMessage>(), null))
+                .ReturnsAsync(new HttpResponseMessage(HttpStatusCode.Accepted));
+
+            var service = CreateNotifierService(new MailConfig(false, "not-set", true));
+            await service.SendThresholdEmailAsync(_notification);
+
+            Assert.AreEqual(0, _telemetryChannel.GetEvents("NotificationSent").Count,
+                "No email leaves the system when notifications are skipped, so nothing must be counted as sent.");
+        }
+
+        /// <summary>
+        /// Minimal ITelemetryChannel that captures EventTelemetry items in memory so tests
+        /// can assert which Track* events fired.
+        /// </summary>
+        private sealed class CapturingTelemetryChannel : ITelemetryChannel
+        {
+            private readonly List<EventTelemetry> _events = new();
+
+            public bool? DeveloperMode { get; set; }
+            public string EndpointAddress { get; set; }
+
+            public void Send(ITelemetry item)
+            {
+                if (item is EventTelemetry eventTelemetry)
+                {
+                    _events.Add(eventTelemetry);
+                }
+            }
+
+            public IReadOnlyList<EventTelemetry> GetEvents(string name) =>
+                _events.Where(e => e.Name == name).ToList();
+
+            public void Flush() { }
+            public void Dispose() { }
+        }
+    }
+}

@@ -1,17 +1,14 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using System;
+using Models;
+using Services.Entities;
 
 namespace Hosts.GraphUpdater
 {
-    public class JobStatusUpdaterRequest
+    public class JobStatusUpdaterRequest : GraphUpdaterRequestBase
     {
-        public Guid RunId { get; set; }
-        public string JobPartitionKey { get; set; }
-        public string JobRowKey { get; set; }
         public SyncStatus Status { get; set; }
-        public bool IsDryRun { get; set; }
-        public int ThresholdViolations { get; set; }
+        public int UsersAdded { get; set; } = 0;
+        public int UsersRemoved { get; set; } = 0;
     }
 }

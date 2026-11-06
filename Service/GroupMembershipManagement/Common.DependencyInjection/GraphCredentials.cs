@@ -3,13 +3,44 @@
 namespace Common.DependencyInjection
 {
     public class GraphCredentials
-	{
-		public string TenantId { get; set; }
-		public string ClientId { get; set; }
+    {
+        public string TenantId { get; set; }
+        public string ClientId { get; set; }
         public string ClientSecret { get; set; }
-        public string CertificateName { get; set; }
-		public string RedirectURI { get; set; }
+        public string ClientCertificateName { get; set; }
+        public string RedirectURI { get; set; }
         public string KeyVaultName { get; set; }
-		public string KeyVaultTenantId { get; set; }
-	}
+        public string KeyVaultTenantId { get; set; }
+        public string ServiceAccountUserName { get; set; }
+        public string ServiceAccountPassword { get; set; }
+        public string UserAssignedManagedIdentityClientId { get; set; }
+        public AuthenticationType AuthenticationType { get; set; }
+        public string AppRegistrationName { get; set; }
+        public string UAMIName { get; set; }
+        public string GMMOwnerAppId
+        {
+            get
+            {
+                return AuthenticationType switch
+                {
+                    AuthenticationType.ClientSecret or AuthenticationType.Certificate => ClientId,
+                    AuthenticationType.UserAssignedManagedIdentity => UserAssignedManagedIdentityClientId,
+                    _ => ClientId
+                };
+            }
+        }
+
+        public string GMMOwnerAppName
+        {
+            get
+            {
+                return AuthenticationType switch
+                {
+                    AuthenticationType.ClientSecret or AuthenticationType.Certificate => AppRegistrationName,
+                    AuthenticationType.UserAssignedManagedIdentity => UAMIName,
+                    _ => AppRegistrationName
+                };
+            }
+        }
+    }
 }

@@ -18,18 +18,25 @@ param location string
 @description('Key vault tenant id.')
 param tenantId string
 
-resource keyVault 'Microsoft.KeyVault/vaults@2019-09-01' = {
+resource keyVault 'Microsoft.KeyVault/vaults@2023-07-01' = {
   name: name
   location: location
   properties: {
     enabledForDeployment: true
     enabledForTemplateDeployment: true
     enabledForDiskEncryption: true
+    enableSoftDelete: true
+    enablePurgeProtection: true
+    enableRbacAuthorization: true
     sku: {
       name: skuName
       family: skuFamily
     }
     tenantId: tenantId
-    accessPolicies: []
+    publicNetworkAccess: 'Enabled'
+    networkAcls: {
+      bypass: 'AzureServices'
+      defaultAction: 'Deny'
+    }
   }
 }

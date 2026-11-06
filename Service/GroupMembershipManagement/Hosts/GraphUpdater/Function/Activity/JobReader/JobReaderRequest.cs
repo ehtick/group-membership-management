@@ -1,14 +1,10 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-
-using System;
+using Services.Entities;
 
 namespace Hosts.GraphUpdater
 {
-    public class JobReaderRequest
+    public class JobReaderRequest : GraphUpdaterRequestBase
     {
-        public string JobPartitionKey { get; set; }
-        public string JobRowKey { get; set; }
-        public Guid RunId { get; set; }
     }
 }

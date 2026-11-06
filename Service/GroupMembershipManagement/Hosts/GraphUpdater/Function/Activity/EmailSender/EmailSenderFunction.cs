@@ -1,10 +1,7 @@
 // Copyright (c) Microsoft Corporation.
 // Licensed under the MIT license.
-using Entities;
-using Microsoft.Azure.WebJobs;
-using Microsoft.Azure.WebJobs.Extensions.DurableTask;
+using Microsoft.Azure.Functions.Worker;
 using Microsoft.Extensions.Logging;
-using Repositories.Contracts;
 using Services.Contracts;
 using System;
 using System.Threading.Tasks;
@@ -13,21 +10,22 @@ namespace Hosts.GraphUpdater
 {
     public class EmailSenderFunction
     {
-        private readonly ILoggingRepository _loggingRepository;
+        private readonly ILogger<EmailSenderFunction> _logger;
         private readonly IGraphUpdaterService _graphUpdaterService;
 
-        public EmailSenderFunction(ILoggingRepository loggingRepository, IGraphUpdaterService graphUpdaterService)
+        public EmailSenderFunction(ILogger<EmailSenderFunction> logger, IGraphUpdaterService graphUpdaterService)
         {
-            _loggingRepository = loggingRepository ?? throw new ArgumentNullException(nameof(loggingRepository));
-            _graphUpdaterService = graphUpdaterService ?? throw new ArgumentNullException(nameof(graphUpdaterService)); ;
+            _logger = logger ?? throw new ArgumentNullException(nameof(logger));
+            _graphUpdaterService = graphUpdaterService ?? throw new ArgumentNullException(nameof(graphUpdaterService));
         }
 
-        [FunctionName(nameof(EmailSenderFunction))]
-        public async Task SendEmailAsync([ActivityTrigger] EmailSenderRequest request, ILogger log)
+        [Function(nameof(EmailSenderFunction))]
+        public async Task SendEmailAsync([ActivityTrigger] EmailSenderRequest request)
         {
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(EmailSenderFunction)} function started", RunId = request.RunId });
-            await _graphUpdaterService.SendEmailAsync(request.ToEmail, request.ContentTemplate, request.AdditionalContentParams, request.RunId, request.CcEmail);
-            await _loggingRepository.LogMessageAsync(new LogMessage { Message = $"{nameof(EmailSenderFunction)} function completed", RunId = request.RunId });
+            using var scope = _logger.BeginGraphUpdaterScope(request);
+            _logger.FunctionStarted(nameof(EmailSenderFunction));
+            await _graphUpdaterService.SendEmailAsync(request.SyncJob, request.NotificationType, request.AdditionalContentParams);
+            _logger.FunctionCompleted(nameof(EmailSenderFunction));
         }
     }
 }

@@ -1,0 +1,392 @@
+import { Group } from '../../models/Group';
+import { IFilterPart } from '../../models/IFilterPart';
+
+const SINGLE_QUOTE_LITERAL_PATTERN = /'(?:''|[^'])*'/g;
+const DOUBLE_QUOTE_LITERAL_PATTERN = /"(?:""|[^"])*"/g;
+
+export function stripQuotedContent(filter: string): string {
+  if (!filter) {
+    return filter;
+  }
+
+  return filter
+    .replace(SINGLE_QUOTE_LITERAL_PATTERN, (match) => ' '.repeat(match.length))
+    .replace(DOUBLE_QUOTE_LITERAL_PATTERN, (match) => ' '.repeat(match.length));
+}
+
+export function containsSqlExpression(filter: string): boolean {
+  const sqlExpressions = [' BETWEEN ', ' LIKE ', ' NOT LIKE ', ' IS ', ' IS NOT '];
+  const regex = new RegExp(`(${sqlExpressions.join('|').trim()})`, 'i');
+  return regex.test(filter);
+};
+
+export function countOccurrences(str: string, subStr: string): number {
+  let count = 0;
+  let pos = str.indexOf(subStr);
+  while (pos !== -1) {
+      count++;
+      pos = str.indexOf(subStr, pos + subStr.length);
+  }
+  return count;
+}
+
+// Parses the individual keys out of a filter value fragment. Handles single values
+// ('FTE') as well as IN-clause lists such as ('FTE', 'Intern') or [FTE, Intern].
+// Parsing is quote-aware: commas inside a quoted value are preserved (e.g. 'A,B')
+// and SQL-escaped apostrophes are decoded (e.g. 'O''Brien' -> O'Brien) so that
+// values are never split or mangled.
+export function getSelectedKeys(input: string): string[] {
+  const trimmed = input.trim();
+  if (!trimmed) {
+    return [];
+  }
+
+  // Unwrap a single enclosing (...) or [...] list if present.
+  const isWrapped =
+    (trimmed.startsWith('(') && trimmed.endsWith(')')) ||
+    (trimmed.startsWith('[') && trimmed.endsWith(']'));
+  const content = isWrapped ? trimmed.slice(1, -1) : trimmed;
+
+  // Match either a SQL single-quoted literal (allowing doubled '' escapes) or a
+  // bare, unquoted token. Commas/whitespace outside quotes act as separators.
+  const tokens = content.match(/'(?:''|[^'])*'|[^,\s]+/g);
+  if (!tokens) {
+    return [];
+  }
+
+  return tokens
+    .map(token => token.trim())
+    .filter(token => token.length > 0)
+    .map(token => {
+      if (token.length >= 2 && token.startsWith("'") && token.endsWith("'")) {
+        // Strip the surrounding quotes and decode doubled apostrophes.
+        return token.slice(1, -1).replace(/''/g, "'");
+      }
+      return token;
+    });
+}
+
+// Computes the new set of selected keys for an IN / NOT IN clause when a value option is
+// toggled. The previous selections are derived exclusively from the current row's value
+// (existingValues) so that selections made on one attribute row can never leak into a
+// different attribute row. `selected` reflects the option's state AFTER the toggle.
+export function computeInClauseSelection(
+  existingValues: string | undefined,
+  itemKey: string,
+  selected: boolean | undefined
+): string[] {
+  const prevSelectedKeys = existingValues && existingValues.length > 0 ? getSelectedKeys(existingValues) : [];
+  const withoutCurrent = prevSelectedKeys.filter(key => key !== itemKey);
+  return selected ? [...withoutCurrent, itemKey] : withoutCurrent;
+}
+
+export function joinFilterSegments(segments: string[]): string {
+  return segments.map(segment => segment.trim()).join(' ');
+}
+
+export function stringifyGroup(group: Group, isChild?: boolean, childIndex?: number, childrenLength?: number): string {
+
+    let result = '(';
+    result += `${group.items.map((item, index) => {
+      if (index < group.items.length - 1) {
+          return item.attribute + ' ' + item.equalityOperator + ' ' + item.value + ' ' + item.andOr;
+      } else {
+          return item.attribute + ' ' + item.equalityOperator + ' ' + item.value;
+      }
+    }).join(' ')}`;
+
+    if (group.children.length === 0) {
+      result += ')';
+    }
+
+    if (isChild) {
+      if (childrenLength && childIndex !== childrenLength-1) result += ` ${group.andOr} `;
+    }
+    else {
+      result += ` ${group.andOr} `;
+    }
+
+    group.children.forEach((child, index) => {
+        result += stringifyGroup(child, true, index, group.children.length);
+        if (index < group.children.length - 1) {
+            result += ' ';
+        }
+    });
+
+    if (group.children.length > 0) {
+      result += ')';
+      result += ` ${group.children[group.children.length-1].andOr} `;
+    }
+
+    result = result.includes(" IN ") || result.includes(" NOT IN ") ? replaceBracketsWithParentheses(result) : result;
+    return result;
+}
+
+function replaceBracketsWithParentheses(input: string): string {
+  return input.replace(/\[/g, '(').replace(/\]/g, ')');
+};
+
+function replaceInClause(input: string): string {
+  // Handle both quoted strings and numeric values in IN clauses
+  const regex = /(NOT\s+)?IN\s*\(\s*([^)]+)\s*\)/gi;
+  return input.replace(regex, (match) => {
+      return match.replace('(', '[').replace(')', ']');
+  });
+};
+
+export function stringifyGroups(groups: Group[]): string {
+    let result = '';
+
+    groups.forEach((group, index) => {
+        result += stringifyGroup(group);
+        if (index < groups.length - 1) {
+            result += ' ';
+        }
+    });
+
+    return result;
+}
+
+function parseFilterPart(part: string): IFilterPart {
+  const operators = ["NOT IN", "<=", ">=", "<>", "=", ">", "<", "IS", "IN"];
+  let operatorFound = '';
+  let operatorIndex = -1;
+
+  // Sort operators by length (longest first) to match "NOT IN" before "IN"
+  const sortedOperators = [...operators].sort((a, b) => b.length - a.length);
+
+  let matchedString = "";
+  for (const operator of sortedOperators) {
+    const regex = new RegExp(`\\s+${operator.replace(/\s+/g, '\\s+')}\\s+`, 'i');
+    const match = part.match(regex);
+    if (match) {
+      operatorFound = operator;
+      operatorIndex = match.index!;
+      matchedString = match[0];
+      break;
+    }
+  }
+
+  if (operatorIndex === -1) {
+    return {
+      attribute : "",
+      equalityOperator: "invalid",
+      value: "",
+      andOr: ""
+    };
+  }
+  const attribute = part.slice(0, operatorIndex).trim();
+  const value = part.slice(operatorIndex + matchedString.length).trim();
+
+  const result = {
+    attribute,
+    equalityOperator: operatorFound,
+    value,
+    andOr: ""
+  };
+  return result;
+}
+
+function findPartsOfString(string: string, substringArray: { currentSegment: string, start: number; end: number }[]): { currentSegment: string, start: number; end: number, andOr: string }[] {
+  const output: { currentSegment: string, start: number; end: number, andOr: "" }[] = [];
+  let lastEnd = 0;
+
+  for (const substringInfo of substringArray) {
+      const { currentSegment, start, end } = substringInfo;
+      if (start > lastEnd) {
+        output.push({
+            currentSegment: string.substring(lastEnd, start),
+            start: lastEnd,
+            end: start - 1,
+            andOr: ""
+        });
+      }
+      output.push({ currentSegment, start, end, andOr: "" });
+      lastEnd = end + 1;
+  }
+  if (lastEnd < string.length) {
+      output.push({
+          currentSegment: string.substring(lastEnd),
+          start: lastEnd,
+          end: string.length - 1,
+          andOr: ""
+      });
+  }
+  return output;
+}
+
+function appendAndOr(allParts: { currentSegment: string; start: number; end: number; andOr: string; }[]) {
+  allParts.forEach((segment, index) => {
+    let modifiedSegment = segment.currentSegment.trim();
+    let startWord = '';
+    let endWord = '';
+
+    const lowerCaseSegment = modifiedSegment.toLowerCase();
+
+    if (lowerCaseSegment.startsWith('and ')) {
+        startWord = 'And';
+        modifiedSegment = modifiedSegment.substring(4).trim();
+    } else if (lowerCaseSegment.startsWith('or ')) {
+        startWord = 'Or';
+        modifiedSegment = modifiedSegment.substring(3).trim();
+    }
+
+    if (lowerCaseSegment.endsWith(' and')) {
+        endWord = 'And';
+        modifiedSegment = modifiedSegment.substring(0, modifiedSegment.length - 4).trim();
+    } else if (lowerCaseSegment.endsWith(' or')) {
+        endWord = 'Or';
+        modifiedSegment = modifiedSegment.substring(0, modifiedSegment.length - 3).trim();
+    }
+
+    if (lowerCaseSegment === 'and') {
+      startWord = 'And';
+      modifiedSegment = '';
+    } else if (lowerCaseSegment === 'or') {
+      startWord = 'Or';
+      modifiedSegment = '';
+    }
+
+    if (startWord !== '') {
+      allParts[index-1].andOr = startWord;
+    }
+    if (endWord !== '') {
+      allParts[index].andOr = endWord;
+    }
+
+    allParts[index].currentSegment = modifiedSegment;
+
+    allParts[index].currentSegment = modifiedSegment;
+  });
+  // Filter out empty segments after processing
+  return allParts.filter(part => part.currentSegment.trim() !== '');
+}
+
+export function parseGroup(input: string, hasInClause: boolean): Group[] {
+  input = hasInClause ? replaceInClause(input) : input;
+  const groups: Group[] = [];
+  let subStrings: { currentSegment: string, start: number; end: number}[] = [];
+  let depth = 0;
+  let currentSegment = '';
+  let operators: string[] = [];
+
+  input = input.trim();
+  let start: number = 0;
+  let end: number = input.length - 1;
+
+  for (let i = 0; i < input.length; i++) {
+    const char = input[i];
+
+    if (char === '(') {
+        if (depth > 0) {
+            currentSegment += char;
+        }
+        depth++;
+        if (depth === 1) start = i;
+    } else if (char === ')') {
+        depth--;
+        if (depth === 0) {
+            end = i;
+            subStrings.push({ currentSegment, start, end});
+            currentSegment = '';
+        } else {
+            currentSegment += char;
+        }
+    } else if (depth === 0 && (input.substring(i, i + 4).toLowerCase() === ' and' || input.substring(i, i + 3).toLowerCase() === ' or')) {
+        const isAnd = input.substring(i, i + 4).toLowerCase() === ' and';
+        const operatorText = isAnd ? input.substring(i, i + 4) : input.substring(i, i + 3);
+        operators.push(operatorText.trim());
+        i += operatorText.length - 1;
+    } else if (depth > 0) {
+        currentSegment += char;
+    }
+  }
+
+  const allParts = findPartsOfString(input, subStrings);
+  const allPartsWithAndOr = appendAndOr(allParts);
+  let invalid = false;
+
+  allPartsWithAndOr.forEach((currentSegment, i) => {
+    const result = parseSegment(currentSegment.currentSegment);
+    if ((result.name === "invalid") || (result.children.length > 0 && result.children.some(childItem => childItem.name === "invalid"))) {
+      invalid = true;
+    }
+    else {
+      groups.push(result);
+      // Use the just-pushed group, not groups[i]: skipped invalid segments desync i from groups and make groups[i] undefined.
+      const currentGroup = groups[groups.length - 1];
+      const lastChild = currentGroup.children.length > 0 ? currentGroup.children[currentGroup.children.length - 1] : undefined;
+      if (lastChild && lastChild.andOr !== null) {
+        lastChild.andOr = allPartsWithAndOr[i].andOr;
+      }
+      else if (allPartsWithAndOr[i].andOr !== '') currentGroup.andOr = allPartsWithAndOr[i].andOr;
+    }
+  });
+  return invalid ? [] : groups;
+}
+
+function parseSegment(segment: string, groupOperator?: string): Group {
+  if (segment.includes('(') && segment.includes(')')) {
+    let children: Group[] = [];
+      const innerSegments = segment.match(/\((.*?)\)/g)?.map(innerSegment => innerSegment.replace(/^\(|\)$/g, ''));
+      const contentOutsideParentheses = segment.replace(/\s*\([^)]*\)\s*/g, '||').split('||');
+        if (innerSegments) {
+          innerSegments.forEach((innerSegment, index) => {
+            const childGroup = parseSegment(innerSegment, contentOutsideParentheses && contentOutsideParentheses.length >= 0 ? contentOutsideParentheses[index+1].trim().split(/\s+/)[0] : "");
+            children.push(childGroup);
+          });
+        }
+        let remainingSegment = "";
+        contentOutsideParentheses.forEach((content) => {
+          const trimmedItem = content.trim();
+          if (trimmedItem !== "" && trimmedItem.toLowerCase() !== "or" && trimmedItem.toLowerCase() !== "and") {
+            if (trimmedItem.toLowerCase().trim().startsWith("or") || trimmedItem.toLowerCase().trim().startsWith("and")) {
+              remainingSegment = remainingSegment.toLowerCase().trim().endsWith("or") || remainingSegment.toLowerCase().trim().endsWith("and") ? remainingSegment.trim().replace(/(?:Or|And)$/i, '') : remainingSegment;
+            }
+            remainingSegment += trimmedItem + " ";
+          }
+        });
+        const matchOperator  = remainingSegment.match(/^\s*(Or|And)|\s*(Or|And)\s*$/gi);
+        const operator = matchOperator ? matchOperator[0].trim() : null;
+        remainingSegment = remainingSegment.replace(/^\s*(Or|And)|\s*(Or|And)\s*$/gi, '').trim();
+        if (remainingSegment) {
+          return {
+              name: '',
+              items: parseSegment(remainingSegment).items,
+              children: children,
+              andOr: operator ?? ''
+          };
+      }
+      // Handle case where we only have children without remaining content
+      return {
+          name: '',
+          items: [],
+          children: children,
+          andOr: operator ?? ''
+      };
+  }
+  const items = segment.split(/\s+(?:and|or)\s+/gi).map(parseFilterPart);
+  if (items.some(item => item.equalityOperator === "invalid")) {
+    return {
+      name: 'invalid',
+      items : [],
+      children: [],
+      andOr: ''
+    };
+  }
+  else {
+    const operators = segment.match(/\s+(and|or)\s+/gi) || [];
+    items.forEach((item, index) => {
+        if (index < items.length - 1) {
+            item.andOr = operators[index].trim();
+        }
+    });
+    const result = {
+        name: '',
+        items,
+        children: [],
+        andOr: groupOperator ?? ''
+    };
+    return result;
+  }
+};

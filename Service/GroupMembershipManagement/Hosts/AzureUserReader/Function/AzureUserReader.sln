@@ -1,4 +1,4 @@
-﻿
+
 Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.32112.339
@@ -17,8 +17,6 @@ Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Entities", "..\..\..\Entiti
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Repositories.GraphAzureADUsers", "..\..\..\Repositories.GraphUsers\Repositories.GraphAzureADUsers.csproj", "{C9B0E939-0951-44D0-B40B-621F628DC28A}"
 EndProject
-Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Repositories.Logging", "..\..\..\Repositories.Logging\Repositories.Logging.csproj", "{4A65AAD9-F67C-4718-88A4-D1DB410D828F}"
-EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Services", "..\Services\Services.csproj", "{4161CF62-F27B-4DFC-8CDE-70DF48B17F72}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Services.Contracts", "..\Services.Contracts\Services.Contracts.csproj", "{A18CEB22-BB14-433B-88F6-ECA6C9BF2D80}"
@@ -26,6 +24,8 @@ EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Services.Entities", "..\Services.Entities\Services.Entities.csproj", "{0AC3B028-E754-40B7-9283-3453C3F2F57D}"
 EndProject
 Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Services.Tests", "..\Services.Tests\Services.Tests.csproj", "{4DCCFBC7-DDF6-49FE-8FAD-505425ABA2F8}"
+EndProject
+Project("{9A19103F-16F7-4668-BE54-9A1E7A4F7556}") = "Models", "..\..\..\Models\Models.csproj", "{B0DF872A-A0A8-460B-92FB-12400658D173}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -61,10 +61,6 @@ Global
 		{C9B0E939-0951-44D0-B40B-621F628DC28A}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{C9B0E939-0951-44D0-B40B-621F628DC28A}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{C9B0E939-0951-44D0-B40B-621F628DC28A}.Release|Any CPU.Build.0 = Release|Any CPU
-		{4A65AAD9-F67C-4718-88A4-D1DB410D828F}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{4A65AAD9-F67C-4718-88A4-D1DB410D828F}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{4A65AAD9-F67C-4718-88A4-D1DB410D828F}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{4A65AAD9-F67C-4718-88A4-D1DB410D828F}.Release|Any CPU.Build.0 = Release|Any CPU
 		{4161CF62-F27B-4DFC-8CDE-70DF48B17F72}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{4161CF62-F27B-4DFC-8CDE-70DF48B17F72}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4161CF62-F27B-4DFC-8CDE-70DF48B17F72}.Release|Any CPU.ActiveCfg = Release|Any CPU
@@ -81,6 +77,10 @@ Global
 		{4DCCFBC7-DDF6-49FE-8FAD-505425ABA2F8}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{4DCCFBC7-DDF6-49FE-8FAD-505425ABA2F8}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{4DCCFBC7-DDF6-49FE-8FAD-505425ABA2F8}.Release|Any CPU.Build.0 = Release|Any CPU
+		{B0DF872A-A0A8-460B-92FB-12400658D173}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
+		{B0DF872A-A0A8-460B-92FB-12400658D173}.Debug|Any CPU.Build.0 = Debug|Any CPU
+		{B0DF872A-A0A8-460B-92FB-12400658D173}.Release|Any CPU.ActiveCfg = Release|Any CPU
+		{B0DF872A-A0A8-460B-92FB-12400658D173}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE
